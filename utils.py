@@ -52,11 +52,12 @@ def edge_addition(adj, add_r):
 
 
 def get_feat_mask(features, mask_rate):
+    device = features.device
     feat_node = features.shape[1]
-    mask = torch.zeros(features.shape)
+    mask = torch.zeros(features.shape, device=device)
     samples = np.random.choice(feat_node, size=int(feat_node * mask_rate), replace=False)
     mask[:, samples] = 1
-    return mask.cuda(), samples
+    return mask, samples
 
 
 def accuracy(preds, labels):
@@ -145,13 +146,14 @@ def top_k(raw_graph, K):
 
 
 def knn_fast(X, k, b):
+    device = X.device
     X = F.normalize(X, dim=1, p=2)
     index = 0
-    values = torch.zeros(X.shape[0] * (k + 1)).cuda()
-    rows = torch.zeros(X.shape[0] * (k + 1)).cuda()
-    cols = torch.zeros(X.shape[0] * (k + 1)).cuda()
-    norm_row = torch.zeros(X.shape[0]).cuda()
-    norm_col = torch.zeros(X.shape[0]).cuda()
+    values = torch.zeros(X.shape[0] * (k + 1), device=device)
+    rows = torch.zeros(X.shape[0] * (k + 1), device=device)
+    cols = torch.zeros(X.shape[0] * (k + 1), device=device)
+    norm_row = torch.zeros(X.shape[0], device=device)
+    norm_col = torch.zeros(X.shape[0], device=device)
     while index < X.shape[0]:
         if (index + b) > (X.shape[0]):
             end = X.shape[0]
@@ -162,7 +164,7 @@ def knn_fast(X, k, b):
         vals, inds = similarities.topk(k=k + 1, dim=-1)
         values[index * (k + 1):(end) * (k + 1)] = vals.view(-1)
         cols[index * (k + 1):(end) * (k + 1)] = inds.view(-1)
-        rows[index * (k + 1):(end) * (k + 1)] = torch.arange(index, end).view(-1, 1).repeat(1, k + 1).view(-1)
+        rows[index * (k + 1):(end) * (k + 1)] = torch.arange(index, end, device=device).view(-1, 1).repeat(1, k + 1).view(-1)
         norm_row[index: end] = torch.sum(vals, dim=1)
         norm_col.index_add_(-1, inds.view(-1), vals.view(-1))
         index += b
@@ -188,8 +190,9 @@ def torch_sparse_to_dgl_graph(torch_sparse_mx):
     indices = torch_sparse_mx.indices()
     values = torch_sparse_mx.values()
     rows_, cols_ = indices[0,:], indices[1,:]
-    dgl_graph = dgl.graph((rows_, cols_), num_nodes=torch_sparse_mx.shape[0], device='cuda')
-    dgl_graph.edata['w'] = values.detach().cuda()
+    device = values.device  # Get the device from the input tensor
+    dgl_graph = dgl.graph((rows_, cols_), num_nodes=torch_sparse_mx.shape[0], device=device)
+    dgl_graph.edata['w'] = values.detach()  # Remove .cuda() since we'll use the same device as input
     return dgl_graph
 
 
@@ -202,8 +205,9 @@ def dgl_graph_to_torch_sparse(dgl_graph):
 
 
 def torch_sparse_eye(num_nodes):
-    indices = torch.arange(num_nodes).repeat(2, 1)
-    values = torch.ones(num_nodes)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    indices = torch.arange(num_nodes, device=device).repeat(2, 1)
+    values = torch.ones(num_nodes, device=device)
     return torch.sparse.FloatTensor(indices, values)
 
 

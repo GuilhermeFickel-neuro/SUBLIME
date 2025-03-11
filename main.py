@@ -6,21 +6,22 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from data_loader import load_data
 from model import GCN, GCL
 from graph_learners import *
 from utils import *
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, davies_bouldin_score
 import dgl
 
 import random
+import os
 
 EOS = 1e-10
 
 class Experiment:
-    def __init__(self):
+    def __init__(self, device=None):
         super(Experiment, self).__init__()
-
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def setup_seed(self, seed):
         torch.manual_seed(seed)
@@ -31,7 +32,6 @@ class Experiment:
         dgl.seed(seed)
         dgl.random.seed(seed)
 
-
     def loss_cls(self, model, mask, features, labels):
         logits = model(features)
         logp = F.log_softmax(logits, 1)
@@ -39,9 +39,7 @@ class Experiment:
         accu = accuracy(logp[mask], labels[mask])
         return loss, accu
 
-
-    def loss_gcl(self, model, graph_learner, features, anchor_adj):
-
+    def loss_gcl(self, model, graph_learner, features, anchor_adj, args):
         # view 1: anchor graph
         if args.maskfeat_rate_anchor:
             mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
@@ -68,7 +66,6 @@ class Experiment:
         # compute loss
         if args.contrast_batch_size:
             node_idxs = list(range(features.shape[0]))
-            # random.shuffle(node_idxs)
             batches = split_batch(node_idxs, args.contrast_batch_size)
             loss = 0
             for batch in batches:
@@ -79,9 +76,7 @@ class Experiment:
 
         return loss, learned_adj
 
-
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
-
         model = GCN(in_channels=nfeats, hidden_channels=args.hidden_dim_cls, out_channels=nclasses, num_layers=args.nlayers_cls,
                     dropout=args.dropout_cls, dropout_adj=args.dropedge_cls, Adj=Adj, sparse=args.sparse)
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr_cls, weight_decay=args.w_decay_cls)
@@ -90,20 +85,18 @@ class Experiment:
         best_val = 0
         best_model = None
 
-        if torch.cuda.is_available():
-            model = model.cuda()
-            train_mask = train_mask.cuda()
-            val_mask = val_mask.cuda()
-            test_mask = test_mask.cuda()
-            features = features.cuda()
-            labels = labels.cuda()
+        model = model.to(self.device)
+        train_mask = train_mask.to(self.device)
+        val_mask = val_mask.to(self.device)
+        test_mask = test_mask.to(self.device)
+        features = features.to(self.device)
+        labels = labels.to(self.device)
 
         for epoch in range(1, args.epochs_cls + 1):
             model.train()
             loss, accu = self.loss_cls(model, train_mask, features, labels)
             optimizer.zero_grad()
             loss.backward()
-
             optimizer.step()
 
             if epoch % 10 == 0:
@@ -118,19 +111,27 @@ class Experiment:
 
                 if bad_counter >= args.patience_cls:
                     break
+
         best_model.eval()
         test_loss, test_accu = self.loss_cls(best_model, test_mask, features, labels)
         return best_val, test_accu, best_model
 
-
-    def train(self, args):
-
-        torch.cuda.set_device(args.gpu)
-
+    def train(self, args, load_data_fn=None):
+        """
+        Train the model
+        
+        Args:
+            args: Arguments for training
+            load_data_fn: Function to load the dataset. Should return:
+                (features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj)
+        """
+        if load_data_fn is None:
+            raise ValueError("Must provide a data loading function")
+            
         if args.gsl_mode == 'structure_refinement':
-            features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj_original = load_data(args)
+            features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj_original = load_data_fn(args)
         elif args.gsl_mode == 'structure_inference':
-            features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, _ = load_data(args)
+            features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, _ = load_data_fn(args)
 
         if args.downstream_task == 'classification':
             test_accuracies = []
@@ -140,20 +141,18 @@ class Experiment:
             args.ntrials = 1
 
         for trial in range(args.ntrials):
-
             self.setup_seed(trial)
 
             if args.gsl_mode == 'structure_inference':
                 if args.sparse:
                     anchor_adj_raw = torch_sparse_eye(features.shape[0])
                 else:
-                    anchor_adj_raw = torch.eye(features.shape[0])
+                    anchor_adj_raw = torch.eye(features.shape[0]).to(self.device)
             elif args.gsl_mode == 'structure_refinement':
                 if args.sparse:
                     anchor_adj_raw = adj_original
                 else:
-                    anchor_adj_raw = torch.from_numpy(adj_original)
-
+                    anchor_adj_raw = torch.from_numpy(adj_original).to(self.device)
 
             anchor_adj = normalize(anchor_adj_raw, 'sym', args.sparse)
 
@@ -180,17 +179,17 @@ class Experiment:
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
 
-
-            if torch.cuda.is_available():
-                model = model.cuda()
-                graph_learner = graph_learner.cuda()
-                train_mask = train_mask.cuda()
-                val_mask = val_mask.cuda()
-                test_mask = test_mask.cuda()
-                features = features.cuda()
-                labels = labels.cuda()
-                if not args.sparse:
-                    anchor_adj = anchor_adj.cuda()
+            model = model.to(self.device)
+            graph_learner = graph_learner.to(self.device)
+            features = features.to(self.device)
+            if labels is not None:
+                labels = labels.to(self.device)
+            if train_mask is not None:
+                train_mask = train_mask.to(self.device)
+            if val_mask is not None:
+                val_mask = val_mask.to(self.device)
+            if test_mask is not None:
+                test_mask = test_mask.to(self.device)
 
             if args.downstream_task == 'classification':
                 best_val = 0
@@ -198,11 +197,10 @@ class Experiment:
                 best_epoch = 0
 
             for epoch in range(1, args.epochs + 1):
-
                 model.train()
                 graph_learner.train()
 
-                loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj)
+                loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
                 optimizer_cl.zero_grad()
                 optimizer_learner.zero_grad()
@@ -245,20 +243,96 @@ class Experiment:
                         model.eval()
                         graph_learner.eval()
                         _, embedding = model(features, Adj)
+                        
                         embedding = embedding.cpu().detach().numpy()
 
-                        acc_mr, nmi_mr, f1_mr, ari_mr = [], [], [], []
-                        for clu_trial in range(n_clu_trials):
-                            kmeans = KMeans(n_clusters=nclasses, random_state=clu_trial).fit(embedding)
+                        # For unlabeled data, we'll use unsupervised metrics
+                        if labels is None:
+                            # Compute silhouette score to measure cluster quality
+                            print(f"Embedding shape: {embedding.shape}")
+                            kmeans = KMeans(n_clusters=nclasses, random_state=0).fit(embedding)
+                            
                             predict_labels = kmeans.predict(embedding)
-                            cm_all = clustering_metrics(labels.cpu().numpy(), predict_labels)
-                            acc_, nmi_, f1_, ari_ = cm_all.evaluationClusterModelFromLabel(print_results=False)
-                            acc_mr.append(acc_)
-                            nmi_mr.append(nmi_)
-                            f1_mr.append(f1_)
-                            ari_mr.append(ari_)
-
-                        acc, nmi, f1, ari = np.mean(acc_mr), np.mean(nmi_mr), np.mean(f1_mr), np.mean(ari_mr)
+                            
+                            # Silhouette score: higher is better (-1 to 1)
+                            sil_score = silhouette_score(embedding, predict_labels)
+                            
+                            # Davies-Bouldin score: lower is better
+                            db_score = davies_bouldin_score(embedding, predict_labels)
+                            
+                            # Inertia (within-cluster sum of squares): lower is better
+                            inertia = kmeans.inertia_
+                            
+                            # Get cluster sizes
+                            unique, counts = np.unique(predict_labels, return_counts=True)
+                            cluster_sizes = dict(zip(unique, counts))
+                            
+                            print("\nClustering Evaluation:")
+                            print(f"Silhouette Score: {sil_score:.4f} (higher is better, range: -1 to 1)")
+                            print(f"Davies-Bouldin Score: {db_score:.4f} (lower is better)")
+                            print(f"Inertia: {inertia:.4f} (lower is better)")
+                            print(f"Cluster sizes: {cluster_sizes}")
+                            
+                            # Calculate cluster statistics
+                            cluster_stats = {}
+                            all_distances = []
+                            for cluster_id in unique:
+                                cluster_mask = predict_labels == cluster_id
+                                cluster_points = embedding[cluster_mask]
+                                
+                                cluster_center = kmeans.cluster_centers_[cluster_id]
+                                
+                                # Calculate mean distance to center
+                                distances = np.linalg.norm(cluster_points - cluster_center, axis=1)
+                                all_distances.extend(distances)
+                                
+                                mean_dist = distances.mean()
+                                std_dist = distances.std()
+                                
+                                cluster_stats[cluster_id] = {
+                                    'size': counts[cluster_id],
+                                    'mean_distance_to_center': mean_dist,
+                                    'std_distance_to_center': std_dist
+                                }
+                            
+                            # Calculate overall statistics
+                            avg_cluster_size = np.mean(counts)
+                            std_cluster_size = np.std(counts)
+                            min_cluster_size = np.min(counts)
+                            max_cluster_size = np.max(counts)
+                            
+                            avg_distance = np.mean(all_distances)
+                            std_distance = np.std(all_distances)
+                            
+                            # Print condensed summary
+                            print("\nCluster Statistics Summary:")
+                            print(f"Number of clusters: {len(unique)}")
+                            print(f"Cluster sizes: min={min_cluster_size}, max={max_cluster_size}, avg={avg_cluster_size:.2f}, std={std_cluster_size:.2f}")
+                            print(f"Distance to center: avg={avg_distance:.4f}, std={std_distance:.4f}")
+                            
+                            # Print size distribution
+                            print("\nCluster size distribution:")
+                            for cluster_id, count in sorted(zip(unique, counts), key=lambda x: x[1], reverse=True):
+                                print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                        
+                        else:
+                            # Original code for labeled data
+                            acc_mr, nmi_mr, f1_mr, ari_mr = [], [], [], []
+                            for clu_trial in range(n_clu_trials):
+                                kmeans = KMeans(n_clusters=nclasses, random_state=clu_trial).fit(embedding)
+                                predict_labels = kmeans.predict(embedding)
+                                cm_all = clustering_metrics(labels.cpu().numpy(), predict_labels)
+                                acc_, nmi_, f1_, ari_ = cm_all.evaluationClusterModelFromLabel(print_results=False)
+                                acc_mr.append(acc_)
+                                nmi_mr.append(nmi_)
+                                f1_mr.append(f1_)
+                                ari_mr.append(ari_)
+                            
+                            acc, nmi, f1, ari = np.mean(acc_mr), np.mean(nmi_mr), np.mean(f1_mr), np.mean(ari_mr)
+                            print("Final ACC: ", acc)
+                            print("Final NMI: ", nmi)
+                            print("Final F-score: ", f1)
+                            print("Final ARI: ", ari)
 
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val.item())
@@ -267,14 +341,14 @@ class Experiment:
                 print("Best val ACC: ", best_val.item())
                 print("Best test ACC: ", best_val_test.item())
             elif args.downstream_task == 'clustering':
-                print("Final ACC: ", acc)
-                print("Final NMI: ", nmi)
-                print("Final F-score: ", f1)
-                print("Final ARI: ", ari)
+                if labels is not None:
+                    print("Final ACC: ", acc)
+                    print("Final NMI: ", nmi)
+                    print("Final F-score: ", f1)
+                    print("Final ARI: ", ari)
 
         if args.downstream_task == 'classification' and trial != 0:
             self.print_results(validation_accuracies, test_accuracies)
-
 
     def print_results(self, validation_accu, test_accu):
         s_val = "Val accuracy: {:.4f} +/- {:.4f}".format(np.mean(validation_accu), np.std(validation_accu))
@@ -286,8 +360,8 @@ class Experiment:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # Experimental setting
-    parser.add_argument('-dataset', type=str, default='cora',
-                        choices=['cora', 'citeseer', 'pubmed'])
+    parser.add_argument('-dataset', type=str, default='person_data.csv',
+                        help='Path to the dataset file')
     parser.add_argument('-ntrials', type=int, default=5)
     parser.add_argument('-sparse', type=int, default=0)
     parser.add_argument('-gsl_mode', type=str, default="structure_inference",
