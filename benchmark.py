@@ -5,6 +5,7 @@ import csv
 import psutil
 import argparse
 import itertools
+import threading
 from datetime import datetime
 
 # Try to import GPU monitoring - if not available, use dummy values
@@ -16,6 +17,11 @@ try:
         nvidia_smi.nvmlInit()
 except (ImportError, ModuleNotFoundError):
     HAS_GPU = False
+
+# Global variables for memory tracking
+peak_cpu_memory = 0
+peak_gpu_memory = 0
+stop_monitoring = False
 
 def get_gpu_memory_usage():
     """Get GPU memory usage in MB"""
@@ -29,59 +35,96 @@ def get_gpu_memory_usage():
     except:
         return 0
 
+def memory_monitor(process_id):
+    """Monitor memory usage in a separate thread"""
+    global peak_cpu_memory, peak_gpu_memory, stop_monitoring
+    
+    while not stop_monitoring:
+        try:
+            # Get current system-wide memory usage instead of just the process
+            system_memory = psutil.virtual_memory()
+            current_cpu_mem = system_memory.used / (1024 * 1024)  # MB
+            peak_cpu_memory = max(peak_cpu_memory, current_cpu_mem)
+            
+            # Get current GPU memory usage
+            if HAS_GPU:
+                current_gpu_mem = get_gpu_memory_usage()
+                peak_gpu_memory = max(peak_gpu_memory, current_gpu_mem)
+                
+            # Sleep to avoid excessive CPU usage
+            time.sleep(1)
+        except:
+            # Process might have ended
+            break
+
 def run_benchmark(n_samples, n_features, sparse, n_clusters, output_file):
     """Run a single benchmark with the given parameters"""
+    global peak_cpu_memory, peak_gpu_memory, stop_monitoring
     
-    # First generate the sample data
-    start_time = time.time()
-    subprocess.run([
-        "python", "create_sample_data.py",
-        "--n_samples", str(n_samples),
-        "--n_features", str(n_features)
-    ], check=True)
-    data_gen_time = time.time() - start_time
+    # Reset peak memory values
+    peak_cpu_memory = 0
+    peak_gpu_memory = 0
+    stop_monitoring = False
     
-    # Get initial memory usage
-    process = psutil.Process(os.getpid())
-    initial_cpu_mem = process.memory_info().rss / (1024 * 1024)  # MB
-    initial_gpu_mem = get_gpu_memory_usage()
+    # Start memory monitoring thread
+    monitor_thread = threading.Thread(
+        target=memory_monitor, 
+        args=(os.getpid(),),
+        daemon=True
+    )
+    monitor_thread.start()
     
-    # Run the training script
-    start_time = time.time()
-    subprocess.run([
-        "python", "train_person_data.py",
-        "-dataset", "person_data.csv",
-        "-sparse", str(sparse),
-        "-n_clusters", str(n_clusters)
-    ], check=True)
-    training_time = time.time() - start_time
+    try:
+        # First generate the sample data
+        start_time = time.time()
+        subprocess.run([
+            "python", "create_sample_data.py",
+            "--n_samples", str(n_samples),
+            "--n_features", str(n_features)
+        ], check=True)
+        data_gen_time = time.time() - start_time
+        
+        # Run the training script
+        start_time = time.time()
+        subprocess.run([
+            "python", "train_person_data.py",
+            "-dataset", "person_data.csv",
+            "-sparse", str(sparse),
+            "-n_clusters", str(n_clusters)
+        ], check=True)
+        training_time = time.time() - start_time
+        
+        # Stop memory monitoring
+        stop_monitoring = True
+        monitor_thread.join(timeout=1.0)
+        
+        # Record results
+        result = {
+            'n_samples': n_samples,
+            'n_features': n_features,
+            'sparse': sparse,
+            'n_clusters': n_clusters,
+            'data_generation_time_s': round(data_gen_time, 2),
+            'training_time_s': round(training_time, 2),
+            'peak_cpu_memory_mb': round(peak_cpu_memory, 2),
+            'peak_gpu_memory_mb': round(peak_gpu_memory, 2),
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # Write to CSV
+        file_exists = os.path.isfile(output_file)
+        with open(output_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=result.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(result)
+        
+        return result
     
-    # Get peak memory usage
-    peak_cpu_mem = process.memory_info().rss / (1024 * 1024) - initial_cpu_mem  # MB
-    peak_gpu_mem = get_gpu_memory_usage() - initial_gpu_mem  # MB
-    
-    # Record results
-    result = {
-        'n_samples': n_samples,
-        'n_features': n_features,
-        'sparse': sparse,
-        'n_clusters': n_clusters,
-        'data_generation_time_s': round(data_gen_time, 2),
-        'training_time_s': round(training_time, 2),
-        'peak_cpu_memory_mb': round(peak_cpu_mem, 2),
-        'peak_gpu_memory_mb': round(peak_gpu_mem, 2),
-        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    
-    # Write to CSV
-    file_exists = os.path.isfile(output_file)
-    with open(output_file, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=result.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(result)
-    
-    return result
+    finally:
+        # Ensure monitoring is stopped even if an exception occurs
+        stop_monitoring = True
+        monitor_thread.join(timeout=1.0)
 
 def main():
     parser = argparse.ArgumentParser(description='Run benchmarks for SUBLIME on person data')
@@ -94,7 +137,7 @@ def main():
     # Define parameter grid
     n_samples_list = [10000, 100000, 500000, 1000000]
     n_features_list = [100, 200, 500, 1000]
-    sparse_list = [0]
+    sparse_list = [0, 1]
     n_clusters_list = [100, 1000]
     
     # Generate all combinations

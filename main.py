@@ -271,7 +271,6 @@ class Experiment:
                             print(f"Silhouette Score: {sil_score:.4f} (higher is better, range: -1 to 1)")
                             print(f"Davies-Bouldin Score: {db_score:.4f} (lower is better)")
                             print(f"Inertia: {inertia:.4f} (lower is better)")
-                            print(f"Cluster sizes: {cluster_sizes}")
                             
                             # Calculate cluster statistics
                             cluster_stats = {}
@@ -310,10 +309,36 @@ class Experiment:
                             print(f"Cluster sizes: min={min_cluster_size}, max={max_cluster_size}, avg={avg_cluster_size:.2f}, std={std_cluster_size:.2f}")
                             print(f"Distance to center: avg={avg_distance:.4f}, std={std_distance:.4f}")
                             
-                            # Print size distribution
-                            print("\nCluster size distribution:")
-                            for cluster_id, count in sorted(zip(unique, counts), key=lambda x: x[1], reverse=True):
-                                print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                            # Replace detailed distribution with condensed statistics
+                            sorted_clusters = sorted(zip(unique, counts), key=lambda x: x[1], reverse=True)
+                            
+                            # Only show top 3 and bottom 3 clusters if there are more than 6 clusters
+                            if len(unique) > 6:
+                                print("\nLargest clusters:")
+                                for cluster_id, count in sorted_clusters[:3]:
+                                    print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                                
+                                print("\nSmallest clusters:")
+                                for cluster_id, count in sorted_clusters[-3:]:
+                                    print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                                
+                                # Add size distribution histogram using text-based visualization
+                                print("\nCluster size distribution (text histogram):")
+                                bin_count = min(10, len(unique))  # Use at most 10 bins
+                                hist, bin_edges = np.histogram(counts, bins=bin_count)
+                                max_bar_length = 40  # Maximum length of histogram bars
+                                
+                                for i in range(len(hist)):
+                                    bin_start = int(bin_edges[i])
+                                    bin_end = int(bin_edges[i+1])
+                                    bar_length = int((hist[i] / max(hist)) * max_bar_length)
+                                    bar = '█' * bar_length
+                                    print(f"  {bin_start:4d}-{bin_end:<4d} | {bar} ({hist[i]})")
+                            else:
+                                # If few clusters, show all of them
+                                print("\nCluster size distribution:")
+                                for cluster_id, count in sorted_clusters:
+                                    print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
                         
                         else:
                             # Original code for labeled data
