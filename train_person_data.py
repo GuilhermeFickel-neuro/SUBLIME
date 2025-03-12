@@ -2,7 +2,9 @@ import argparse
 import torch
 import pandas as pd
 import numpy as np
+import scipy.sparse as sp
 from main import Experiment
+from utils import sparse_mx_to_torch_sparse_tensor
 
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -15,30 +17,43 @@ def load_person_data(args):
         args: Arguments containing dataset path
     
     Returns:
-        Tuple of (features, nfeats, None, n_clusters, None, None, None, adj)
-        where None values represent unused label-related data
+        Tuple of (features, nfeats, labels, n_clusters, train_mask, val_mask, test_mask, adj)
+        matching the structure of load_citation_network
     """
     # Load data
     df = pd.read_csv(args.dataset)
     
-    # Convert features to torch tensor and move to device
-    features = torch.FloatTensor(df.values).to(device)
-    
     # Get dimensions
-    nfeats = features.shape[1]
-    n_samples = features.shape[0]
+    n_samples = df.shape[0]
     
-    # For initial adjacency, we return identity matrix (no edges)
-    # SUBLIME will learn the graph structure
+    # Convert features to sparse matrix first for consistency
+    features = sp.lil_matrix(df.values, dtype=np.float32)
+    
+    # Create empty labels (since this is unsupervised)
+    labels = None
+    
+    # Create empty masks (not used in unsupervised setting but needed for consistency)
+    train_mask = torch.zeros(n_samples, dtype=torch.bool)
+    val_mask = torch.zeros(n_samples, dtype=torch.bool)
+    test_mask = torch.zeros(n_samples, dtype=torch.bool)
+    
+    # Handle adjacency matrix
     if args.sparse:
-        from utils import torch_sparse_eye
-        adj = torch_sparse_eye(n_samples)
+        # Create sparse identity matrix using scipy first
+        identity = sp.eye(n_samples, dtype=np.float32)
+        # Convert to torch sparse tensor using the same method as in citation network
+        adj = sparse_mx_to_torch_sparse_tensor(identity)
     else:
         adj = torch.eye(n_samples).to(device)
     
-    # Return None for all label-related data since we're doing self-supervised learning
-    # For clustering, we need to specify the number of clusters
-    return features, nfeats, None, args.n_clusters, None, None, None, adj
+    # Convert features to dense torch tensor
+    features = torch.FloatTensor(features.todense())
+    
+    # Get feature dimension
+    nfeats = features.shape[1]
+    
+    # Return in the same format as load_citation_network
+    return features, nfeats, labels, args.n_clusters, train_mask, val_mask, test_mask, adj
 
 def main():
     # Parse arguments (using same defaults as original code)

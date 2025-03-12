@@ -1,11 +1,13 @@
 import numpy as np
 import scipy.sparse as sp
+from scipy.sparse import csr_matrix
 import torch
 import torch.nn.functional as F
 from sklearn.neighbors import kneighbors_graph
 import dgl
 from sklearn import metrics
 from munkres import Munkres
+import faiss
 
 EOS = 1e-10
 
@@ -64,6 +66,68 @@ def accuracy(preds, labels):
     pred_class = torch.max(preds, 1)[1]
     return torch.sum(torch.eq(pred_class, labels)).float() / labels.shape[0]
 
+def get_memory_usage():
+    import psutil
+    import os
+    """Return the current memory usage in GB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024 * 1024)  # Convert bytes to GB
+
+
+def faiss_kneighbors_graph(X, k, metric='l2'):
+    # Convert to numpy if tensor
+    if torch.is_tensor(X):
+        X = X.detach().cpu().numpy()
+    
+    # Ensure correct data type and contiguity
+    X = np.ascontiguousarray(X.astype('float32'))
+    
+    n_samples, n_features = X.shape
+    
+    # Use a more memory-efficient index for medium-sized datasets
+    if metric == 'l2':
+        # For 100k points, a basic flat index should be fine
+        index = faiss.IndexFlatL2(n_features)
+    elif metric == 'ip' or metric == 'cosine':
+        if metric == 'cosine':
+            # Normalize in-place to save memory
+            faiss.normalize_L2(X)
+        index = faiss.IndexFlatIP(n_features)
+    else:
+        raise ValueError(f"Metric {metric} not supported")
+    
+    # Batch processing to reduce peak memory usage
+    batch_size = 10000  # Process in smaller chunks
+    rows_list = []
+    cols_list = []
+    
+    for i in range(0, n_samples, batch_size):
+        end_idx = min(i + batch_size, n_samples)
+        batch = X[i:end_idx]
+        
+        # Search for nearest neighbors for this batch
+        distances, indices = index.search(batch, k + 1)
+        
+        # Store row and column indices for sparse matrix
+        batch_rows = np.repeat(np.arange(i, end_idx), k)
+        batch_cols = indices[:, 1:k+1].flatten()  # Skip the first column (self)
+        
+        rows_list.append(batch_rows)
+        cols_list.append(batch_cols)
+
+        if (i // batch_size) % 5 == 0:
+            print(f"Processed {end_idx}/{n_samples} samples. Memory: {get_memory_usage():.2f} GB")
+    
+    # Combine all batches
+    rows = np.concatenate(rows_list)
+    cols = np.concatenate(cols_list)
+    data = np.ones_like(cols)
+    
+    # Create sparse matrix
+    from scipy.sparse import csr_matrix
+    graph = csr_matrix((data, (rows, cols)), shape=(n_samples, n_samples))
+    
+    return graph
 
 def nearest_neighbors(X, k, metric):
     adj = kneighbors_graph(X, k, metric=metric)
@@ -90,11 +154,36 @@ def nearest_neighbors_pre_exp(X, k, metric, i):
 
 
 def nearest_neighbors_pre_elu(X, k, metric, i):
-    adj = kneighbors_graph(X, k, metric=metric)
+    adj = faiss_kneighbors_graph(X, k, metric=metric)
     adj = np.array(adj.todense(), dtype=np.float32)
     adj += np.eye(adj.shape[0])
     adj = adj * i - i
     return adj
+
+def nearest_neighbors_pre_elu_sparse(X, k, metric, i):
+    # Get sparse adjacency matrix from FAISS
+    adj_sparse = faiss_kneighbors_graph(X, k, metric=metric)
+    
+    # Add self-loops while keeping it sparse
+    n = X.shape[0]
+    eye_indices = np.stack([np.arange(n), np.arange(n)])
+    eye_values = np.ones(n)
+    
+    # Get existing indices and values
+    adj_coo = adj_sparse.tocoo()
+    indices = np.vstack([adj_coo.row, adj_coo.col])
+    values = adj_coo.data
+    
+    # Combine existing edges and self-loops
+    indices = np.hstack([indices, eye_indices])
+    values = np.hstack([values, eye_values])
+    
+    # Apply the transformation to the values only
+    values = values * i - i
+    
+    # Return in COO format for easy conversion to PyTorch sparse tensor
+    shape = (n, n)
+    return indices, values, shape
 
 
 def normalize(adj, mode, sparse=False):

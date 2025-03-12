@@ -6,6 +6,70 @@ from layers import Attentive, GCNConv_dense, GCNConv_dgl
 from utils import *
 
 
+# class FGP_learner(nn.Module):
+#     def __init__(self, features, k, knn_metric, i, sparse):
+#         super(FGP_learner, self).__init__()
+
+#         self.k = k
+#         self.knn_metric = knn_metric
+#         self.i = i
+#         self.sparse = sparse
+
+#         self.Adj = nn.Parameter(
+#             torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i)))
+
+#     def forward(self, h):
+#         if not self.sparse:
+#             Adj = F.elu(self.Adj) + 1
+#         else:
+#             Adj = self.Adj.coalesce()
+#             Adj.values = F.elu(Adj.values()) + 1
+#         return Adj
+
+# class FGP_learner(nn.Module):
+#     def __init__(self, features, k, knn_metric, i, sparse):
+#         super(FGP_learner, self).__init__()
+
+#         self.k = k
+#         self.knn_metric = knn_metric
+#         self.i = i
+#         self.sparse = sparse
+
+#         # Initialize as a regular dense parameter
+#         adjacency = torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i))
+#         self.Adj = nn.Parameter(adjacency)
+
+#     def forward(self, h):
+#         if not self.sparse:
+#             # Dense mode
+#             Adj = F.elu(self.Adj) + 1
+#             return Adj
+#         else:
+#             # Sparse mode - convert dense to sparse first
+#             # Create a sparse tensor from the dense parameter
+#             dense_adj = self.Adj
+            
+#             # Debug: Check the device and shape
+#             print("Dense Adj device:", dense_adj.device)
+#             print("Dense Adj shape:", dense_adj.shape)
+            
+#             # Get indices of non-zero elements
+#             indices = torch.nonzero(dense_adj, as_tuple=True)
+#             values = dense_adj[indices]
+            
+#             # Debug: Check indices and values 
+#             print("Number of non-zero elements:", values.size(0))
+            
+#             # Apply ELU and add 1
+#             values = F.elu(values) + 1
+            
+#             # Create DGL graph
+#             src, dst = indices
+#             adj = dgl.graph((src, dst), num_nodes=dense_adj.shape[0], device=dense_adj.device)
+#             adj.edata['w'] = values
+            
+#             return adj
+
 class FGP_learner(nn.Module):
     def __init__(self, features, k, knn_metric, i, sparse):
         super(FGP_learner, self).__init__()
@@ -15,16 +79,51 @@ class FGP_learner(nn.Module):
         self.i = i
         self.sparse = sparse
 
-        self.Adj = nn.Parameter(
-            torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i)))
+        
+        if self.sparse:
+            # Get indices, values and shape directly in sparse format
+            indices, values, size = nearest_neighbors_pre_elu_sparse(features, self.k, self.knn_metric, self.i)
+            indices = torch.from_numpy(indices)
+            values = torch.from_numpy(values).to(torch.float32)
+            # Create sparse tensor directly
+            sparse_adj = torch.sparse_coo_tensor(indices, values, size).coalesce()
+            self.Adj = nn.Parameter(sparse_adj)
+        else:
+            # Only convert to dense if needed
+            adj_dense = torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i))
+            self.Adj = nn.Parameter(adj_dense)
 
     def forward(self, h):
         if not self.sparse:
+            # For dense mode
             Adj = F.elu(self.Adj) + 1
+            return Adj
         else:
+            # For sparse mode - ensure the tensor is coalesced
             Adj = self.Adj.coalesce()
-            Adj.values = F.elu(Adj.values()) + 1
-        return Adj
+            
+            # Debug info
+            print("Is sparse tensor:", Adj.is_sparse)
+            print("Is coalesced:", Adj.is_coalesced())
+            
+            # Get indices and values
+            indices = Adj._indices()
+            values = Adj._values()
+            
+            # Apply ELU and add 1
+            new_values = F.elu(values) + 1
+            
+            # Create new sparse tensor with processed values
+            processed_adj = torch.sparse_coo_tensor(
+                indices, new_values, Adj.size(), device=Adj.device
+            )
+            
+            # For DGL graph creation
+            src, dst = indices[0], indices[1]
+            graph = dgl.graph((src, dst), num_nodes=Adj.size(0), device=Adj.device)
+            graph.edata['w'] = new_values
+            
+            return graph
 
 
 class ATT_learner(nn.Module):

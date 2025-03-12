@@ -12,6 +12,7 @@ from utils import *
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 import dgl
+from data_loader import load_data
 
 import random
 import os
@@ -218,7 +219,7 @@ class Experiment:
                     else:
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
-                print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()))
+                print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()), args.downstream_task)
 
                 if epoch % args.eval_freq == 0:
                     if args.downstream_task == 'classification':
@@ -436,4 +437,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     experiment = Experiment()
-    experiment.train(args)
+    experiment.train(args, load_data)
