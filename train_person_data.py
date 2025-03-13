@@ -74,7 +74,7 @@ def main():
     parser.add_argument('-rep_dim', type=int, default=64)
     parser.add_argument('-proj_dim', type=int, default=64)
     parser.add_argument('-dropout', type=float, default=0.5)
-    parser.add_argument('-contrast_batch_size', type=int, default=0)
+    parser.add_argument('-contrast_batch_size', type=int, default=10000)
     parser.add_argument('-nlayers', type=int, default=2)
     
     # GCL Module -Augmentation
