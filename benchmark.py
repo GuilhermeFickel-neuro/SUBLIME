@@ -136,9 +136,9 @@ def main():
     
     # Define parameter grid
     n_samples_list = [10000, 100000, 500000, 1000000]
-    n_features_list = [100, 200, 500, 1000]
-    sparse_list = [0, 1]
-    n_clusters_list = [100, 1000]
+    n_features_list = [100, 500, 1000]
+    sparse_list = [1]
+    n_clusters_list = [20]
     
     # Generate all combinations
     configurations = list(itertools.product(
