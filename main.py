@@ -117,6 +117,276 @@ class Experiment:
         test_loss, test_accu = self.loss_cls(best_model, test_mask, features, labels)
         return best_val, test_accu, best_model
 
+    def save_model(self, model, graph_learner, features, adj, sparse, output_dir='saved_models'):
+        """
+        Save model, graph learner, features and adjacency matrix
+        
+        Args:
+            model: The GCL model
+            graph_learner: The graph learner model
+            features: Node features
+            adj: Adjacency matrix
+            sparse: Whether the adjacency matrix is sparse
+            output_dir: Directory to save models
+        """
+        # Create directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save models
+        torch.save(model.state_dict(), os.path.join(output_dir, 'model.pt'))
+        torch.save(graph_learner.state_dict(), os.path.join(output_dir, 'graph_learner.pt'))
+        
+        # Save features
+        torch.save(features.cpu(), os.path.join(output_dir, 'features.pt'))
+        
+        # Save adjacency matrix based on sparse/dense format
+        if sparse:
+            if isinstance(adj, dgl.DGLGraph):
+                # For DGL graph, save edges and weights
+                torch.save({
+                    'edges': adj.edges(),
+                    'weights': adj.edata['w'],
+                    'num_nodes': adj.num_nodes()
+                }, os.path.join(output_dir, 'adjacency.pt'))
+            else:
+                # For torch sparse tensor
+                torch.save(adj, os.path.join(output_dir, 'adjacency.pt'))
+        else:
+            # For dense adjacency
+            torch.save(adj.cpu(), os.path.join(output_dir, 'adjacency.pt'))
+        
+        # Save a config file with important parameters
+        with open(os.path.join(output_dir, 'config.txt'), 'w') as f:
+            f.write(f'sparse: {sparse}\n')
+            f.write(f'feature_dim: {features.shape[1]}\n')
+            f.write(f'num_nodes: {features.shape[0]}\n')
+            
+        print(f"Model, graph learner, features and adjacency saved to {output_dir}")
+
+    def load_model(self, model_params, input_dir='saved_models'):
+        """
+        Load a saved model, graph learner, features and adjacency matrix
+        
+        Args:
+            model_params: Dictionary containing model parameters (nlayers, in_dim, hidden_dim, etc.)
+            input_dir: Directory where models are saved
+            
+        Returns:
+            tuple: (model, graph_learner, features, adj, sparse)
+        """
+        # Load config
+        config = {}
+        with open(os.path.join(input_dir, 'config.txt'), 'r') as f:
+            for line in f:
+                key, value = line.strip().split(': ')
+                if key == 'sparse':
+                    config[key] = value.lower() == 'true'
+                else:
+                    try:
+                        config[key] = int(value)
+                    except:
+                        config[key] = value
+        
+        sparse = config['sparse']
+        
+        # Load features
+        features = torch.load(os.path.join(input_dir, 'features.pt')).to(self.device)
+        
+        # Initialize models
+        model = GCL(nlayers=model_params['nlayers'], 
+                   in_dim=features.shape[1], 
+                   hidden_dim=model_params['hidden_dim'],
+                   emb_dim=model_params['emb_dim'], 
+                   proj_dim=model_params['proj_dim'],
+                   dropout=model_params['dropout'], 
+                   dropout_adj=model_params['dropout_adj'], 
+                   sparse=sparse)
+        
+        # Determine type of graph learner from saved file
+        if os.path.exists(os.path.join(input_dir, 'graph_learner.pt')):
+            learner_state = torch.load(os.path.join(input_dir, 'graph_learner.pt'))
+            
+            # Check which type of learner it is
+            if 'Adj' in learner_state:
+                # FGP learner
+                graph_learner = FGP_learner(features.cpu(), model_params['k'], 
+                                          model_params['sim_function'], 6, sparse)
+            elif any('layers.0.weight' in key for key in learner_state.keys()):
+                # Determine if it's MLP, ATT, or GNN
+                if any('w' in key for key in learner_state.keys()):
+                    # ATT learner
+                    graph_learner = ATT_learner(2, features.shape[1], model_params['k'], 
+                                             model_params['sim_function'], 6, sparse,
+                                             model_params['activation_learner'])
+                else:
+                    # Check if it's a GNN (need to load adjacency first)
+                    # For now, assume MLP as default
+                    graph_learner = MLP_learner(2, features.shape[1], model_params['k'], 
+                                             model_params['sim_function'], 6, sparse,
+                                             model_params['activation_learner'])
+        else:
+            # Default to FGP learner if no specific model is found
+            graph_learner = FGP_learner(features.cpu(), model_params['k'], 
+                                      model_params['sim_function'], 6, sparse)
+        
+        # Load model weights
+        model.load_state_dict(torch.load(os.path.join(input_dir, 'model.pt')))
+        graph_learner.load_state_dict(torch.load(os.path.join(input_dir, 'graph_learner.pt')))
+        
+        # Load adjacency matrix
+        adj_data = torch.load(os.path.join(input_dir, 'adjacency.pt'))
+        
+        if sparse:
+            if isinstance(adj_data, dict):
+                # This is a saved DGL graph
+                edges = adj_data['edges']
+                weights = adj_data['weights']
+                num_nodes = adj_data['num_nodes']
+                
+                # Recreate DGL graph
+                adj = dgl.graph(edges, num_nodes=num_nodes, device=self.device)
+                adj.edata['w'] = weights
+            else:
+                # This is a torch sparse tensor
+                adj = adj_data.to(self.device)
+        else:
+            adj = adj_data.to(self.device)
+        
+        # Move models to device
+        model = model.to(self.device)
+        graph_learner = graph_learner.to(self.device)
+        
+        return model, graph_learner, features, adj, sparse
+
+    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse):
+        """
+        Process a new data point by adding it to the graph and extracting its features
+        
+        Args:
+            new_point: Tensor of shape [feature_dim] containing the new point features
+            model: The trained GCL model
+            graph_learner: The trained graph learner
+            features: The existing node features
+            adj: The current adjacency matrix
+            sparse: Whether the adjacency is sparse
+            
+        Returns:
+            tuple: (new_embedding, new_representation, connections)
+            - new_embedding: The node embedding for the new point
+            - new_representation: The projected representation for the new point
+            - connections: Information about how the new node connects to existing nodes
+        """
+        # Ensure models are in evaluation mode
+        model.eval()
+        graph_learner.eval()
+        
+        # Reshape new point if needed
+        if len(new_point.shape) == 1:
+            new_point = new_point.unsqueeze(0)  # Add batch dimension
+        
+        # Move to appropriate device
+        new_point = new_point.to(self.device)
+        
+        # Add the new point to features
+        updated_features = torch.cat([features, new_point], dim=0)
+        original_node_count = features.shape[0]
+        
+        # Use graph learner to determine connections for the new node
+        with torch.no_grad():
+            # Get the updated adjacency with the new node's connections
+            updated_adj = graph_learner(updated_features)
+            
+            # Extract just the connections for the new node
+            if sparse:
+                # For DGL sparse graphs
+                if isinstance(updated_adj, dgl.DGLGraph):
+                    # Get the edges connected to the new node (which is the last node)
+                    new_node_idx = original_node_count
+                    # Find edges where either source or destination is the new node
+                    edges = updated_adj.edges()
+                    src, dst = edges[0], edges[1]
+                    
+                    # Get indices where the new node is connected
+                    connected_node_indices = []
+                    connection_weights = []
+                    
+                    # Check new node as source
+                    src_mask = (src == new_node_idx)
+                    if src_mask.any():
+                        # Get destination nodes
+                        connected_dst = dst[src_mask]
+                        connected_node_indices.extend(connected_dst.tolist())
+                        # Get corresponding weights
+                        connection_weights.extend(updated_adj.edata['w'][src_mask].tolist())
+                    
+                    # Check new node as destination
+                    dst_mask = (dst == new_node_idx)
+                    if dst_mask.any():
+                        # Get source nodes
+                        connected_src = src[dst_mask]
+                        connected_node_indices.extend(connected_src.tolist())
+                        # Get corresponding weights
+                        connection_weights.extend(updated_adj.edata['w'][dst_mask].tolist())
+                    
+                    # Create a dictionary of node connections with their weights
+                    connections = {
+                        'indices': torch.tensor(connected_node_indices),
+                        'weights': torch.tensor(connection_weights)
+                    }
+                else:
+                    # For torch sparse tensor
+                    indices = updated_adj._indices()
+                    values = updated_adj._values()
+                    
+                    # Get connections to the new node (which is the last node)
+                    new_node_idx = original_node_count
+                    src_mask = (indices[0] == new_node_idx)
+                    dst_mask = (indices[1] == new_node_idx)
+                    
+                    # Extract connected nodes
+                    connected_src = indices[1][src_mask]  # When new node is source, get destinations
+                    connected_dst = indices[0][dst_mask]  # When new node is destination, get sources
+                    
+                    # Extract weights
+                    weights_src = values[src_mask]
+                    weights_dst = values[dst_mask]
+                    
+                    connections = {
+                        'src_indices': connected_src,
+                        'dst_indices': connected_dst,
+                        'src_weights': weights_src,
+                        'dst_weights': weights_dst
+                    }
+            else:
+                # For dense adjacency matrix
+                # Get the connections from the new node to all other nodes
+                new_node_idx = original_node_count
+                new_node_connections = updated_adj[new_node_idx, :original_node_count]
+                # And connections from other nodes to the new node
+                other_to_new = updated_adj[:original_node_count, new_node_idx]
+                
+                # Find indices where connection strength is above some threshold
+                threshold = 1e-6  # Small value to avoid numerical issues
+                connected_from_new = torch.nonzero(new_node_connections > threshold).squeeze()
+                connected_to_new = torch.nonzero(other_to_new > threshold).squeeze()
+                
+                connections = {
+                    'from_new': connected_from_new,
+                    'to_new': connected_to_new,
+                    'from_new_weights': new_node_connections[connected_from_new],
+                    'to_new_weights': other_to_new[connected_to_new]
+                }
+            
+            # Extract embeddings for the new node using the full graph
+            # We can't avoid computing all embeddings due to how GNNs work with message passing
+            z, embedding = model(updated_features, updated_adj)
+        
+        # Only return the embedding for the new node (last node)
+        new_embedding = embedding[-1].detach()  # The node embedding
+        new_representation = z[-1].detach()     # The projected representation
+        
+        return new_embedding, new_representation, connections
+
     def train(self, args, load_data_fn=None):
         """
         Train the model
@@ -373,6 +643,12 @@ class Experiment:
                     print("Final F-score: ", f1)
                     print("Final ARI: ", ari)
 
+            # After training completes
+            if args.save_model:
+                # Save model, graph learner, features and final adjacency matrix
+                self.save_model(model, graph_learner, features, anchor_adj, args.sparse, 
+                               output_dir=args.output_dir)
+
         if args.downstream_task == 'classification' and trial != 0:
             self.print_results(validation_accuracies, test_accuracies)
 
@@ -433,6 +709,10 @@ if __name__ == '__main__':
     # Structure Bootstrapping
     parser.add_argument('-tau', type=float, default=1)
     parser.add_argument('-c', type=int, default=0)
+
+    # New arguments for saving model
+    parser.add_argument('-save_model', type=int, default=0)
+    parser.add_argument('-output_dir', type=str, default='saved_models')
 
     args = parser.parse_args()
 
