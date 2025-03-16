@@ -86,7 +86,6 @@ def faiss_kneighbors_graph(X, k, metric='l2'):
     
     # Use a more memory-efficient index for medium-sized datasets
     if metric == 'l2':
-        # For 100k points, a basic flat index should be fine
         index = faiss.IndexFlatL2(n_features)
     elif metric == 'ip' or metric == 'cosine':
         if metric == 'cosine':
@@ -95,6 +94,9 @@ def faiss_kneighbors_graph(X, k, metric='l2'):
         index = faiss.IndexFlatIP(n_features)
     else:
         raise ValueError(f"Metric {metric} not supported")
+    
+    # Add data to the index
+    index.add(X)
     
     # Batch processing to reduce peak memory usage
     batch_size = 10000  # Process in smaller chunks
@@ -108,17 +110,28 @@ def faiss_kneighbors_graph(X, k, metric='l2'):
         # Search for nearest neighbors for this batch
         distances, indices = index.search(batch, k + 1)
         
-        # Store row and column indices for sparse matrix
-        batch_rows = np.repeat(np.arange(i, end_idx), k)
-        batch_cols = indices[:, 1:k+1].flatten()  # Skip the first column (self)
+        # Filter out any invalid indices (should not happen with proper index)
+        valid_mask = indices >= 0
+        valid_mask &= indices < n_samples
         
-        rows_list.append(batch_rows)
-        cols_list.append(batch_cols)
+        for j in range(indices.shape[0]):
+            row_idx = i + j
+            valid_neighbors = indices[j, 1:][valid_mask[j, 1:]]  # Skip self (first column)
+            
+            if len(valid_neighbors) > 0:
+                batch_rows = np.full(len(valid_neighbors), row_idx)
+                batch_cols = valid_neighbors
+                
+                rows_list.append(batch_rows)
+                cols_list.append(batch_cols)
 
         if (i // batch_size) % 5 == 0:
             print(f"Processed {end_idx}/{n_samples} samples. Memory: {get_memory_usage():.2f} GB")
     
     # Combine all batches
+    if not rows_list:  # Handle empty case
+        return csr_matrix((n_samples, n_samples))
+        
     rows = np.concatenate(rows_list)
     cols = np.concatenate(cols_list)
     data = np.ones_like(cols)
