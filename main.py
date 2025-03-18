@@ -206,9 +206,7 @@ class Experiment:
                 f.write(f'sim_function: {graph_learner.knn_metric}\n')
             if hasattr(graph_learner, 'mlp_act'):
                 f.write(f'activation_learner: {graph_learner.mlp_act}\n')
-            
-        print(f"Model, graph learner, features and adjacency saved to {output_dir}")
-
+        
     def load_model(self, model_params=None, input_dir='saved_models'):
         """
         Load a saved model, graph learner, features and adjacency matrix
@@ -494,7 +492,8 @@ class Experiment:
                     else:
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
-                print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()), args.downstream_task)
+                if args.verbose:
+                    print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()), args.downstream_task)
 
                 if epoch % args.eval_freq == 0:
                     if args.downstream_task == 'classification':
@@ -525,7 +524,8 @@ class Experiment:
                         # For unlabeled data, we'll use unsupervised metrics
                         if labels is None:
                             # Compute silhouette score to measure cluster quality
-                            print(f"Embedding shape: {embedding.shape}")
+                            if args.verbose:
+                                print(f"Embedding shape: {embedding.shape}")
                             kmeans = KMeans(n_clusters=nclasses, random_state=0).fit(embedding)
                             
                             predict_labels = kmeans.predict(embedding)
@@ -543,10 +543,11 @@ class Experiment:
                             unique, counts = np.unique(predict_labels, return_counts=True)
                             cluster_sizes = dict(zip(unique, counts))
                             
-                            print("\nClustering Evaluation:")
-                            print(f"Silhouette Score: {sil_score:.4f} (higher is better, range: -1 to 1)")
-                            print(f"Davies-Bouldin Score: {db_score:.4f} (lower is better)")
-                            print(f"Inertia: {inertia:.4f} (lower is better)")
+                            if args.verbose:
+                                print("\nClustering Evaluation:")
+                                print(f"Silhouette Score: {sil_score:.4f} (higher is better, range: -1 to 1)")
+                                print(f"Davies-Bouldin Score: {db_score:.4f} (lower is better)")
+                                print(f"Inertia: {inertia:.4f} (lower is better)")
                             
                             # Calculate cluster statistics
                             cluster_stats = {}
@@ -580,41 +581,42 @@ class Experiment:
                             std_distance = np.std(all_distances)
                             
                             # Print condensed summary
-                            print("\nCluster Statistics Summary:")
-                            print(f"Number of clusters: {len(unique)}")
-                            print(f"Cluster sizes: min={min_cluster_size}, max={max_cluster_size}, avg={avg_cluster_size:.2f}, std={std_cluster_size:.2f}")
-                            print(f"Distance to center: avg={avg_distance:.4f}, std={std_distance:.4f}")
-                            
-                            # Replace detailed distribution with condensed statistics
-                            sorted_clusters = sorted(zip(unique, counts), key=lambda x: x[1], reverse=True)
-                            
-                            # Only show top 3 and bottom 3 clusters if there are more than 6 clusters
-                            if len(unique) > 6:
-                                print("\nLargest clusters:")
-                                for cluster_id, count in sorted_clusters[:3]:
-                                    print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                            if args.verbose:
+                                print("\nCluster Statistics Summary:")
+                                print(f"Number of clusters: {len(unique)}")
+                                print(f"Cluster sizes: min={min_cluster_size}, max={max_cluster_size}, avg={avg_cluster_size:.2f}, std={std_cluster_size:.2f}")
+                                print(f"Distance to center: avg={avg_distance:.4f}, std={std_distance:.4f}")
                                 
-                                print("\nSmallest clusters:")
-                                for cluster_id, count in sorted_clusters[-3:]:
-                                    print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                                # Replace detailed distribution with condensed statistics
+                                sorted_clusters = sorted(zip(unique, counts), key=lambda x: x[1], reverse=True)
                                 
-                                # Add size distribution histogram using text-based visualization
-                                print("\nCluster size distribution (text histogram):")
-                                bin_count = min(10, len(unique))  # Use at most 10 bins
-                                hist, bin_edges = np.histogram(counts, bins=bin_count)
-                                max_bar_length = 40  # Maximum length of histogram bars
-                                
-                                for i in range(len(hist)):
-                                    bin_start = int(bin_edges[i])
-                                    bin_end = int(bin_edges[i+1])
-                                    bar_length = int((hist[i] / max(hist)) * max_bar_length)
-                                    bar = '█' * bar_length
-                                    print(f"  {bin_start:4d}-{bin_end:<4d} | {bar} ({hist[i]})")
-                            else:
-                                # If few clusters, show all of them
-                                print("\nCluster size distribution:")
-                                for cluster_id, count in sorted_clusters:
-                                    print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                                # Only show top 3 and bottom 3 clusters if there are more than 6 clusters
+                                if len(unique) > 6:
+                                    print("\nLargest clusters:")
+                                    for cluster_id, count in sorted_clusters[:3]:
+                                        print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                                    
+                                    print("\nSmallest clusters:")
+                                    for cluster_id, count in sorted_clusters[-3:]:
+                                        print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                                    
+                                    # Add size distribution histogram using text-based visualization
+                                    print("\nCluster size distribution (text histogram):")
+                                    bin_count = min(10, len(unique))  # Use at most 10 bins
+                                    hist, bin_edges = np.histogram(counts, bins=bin_count)
+                                    max_bar_length = 40  # Maximum length of histogram bars
+                                    
+                                    for i in range(len(hist)):
+                                        bin_start = int(bin_edges[i])
+                                        bin_end = int(bin_edges[i+1])
+                                        bar_length = int((hist[i] / max(hist)) * max_bar_length)
+                                        bar = '█' * bar_length
+                                        print(f"  {bin_start:4d}-{bin_end:<4d} | {bar} ({hist[i]})")
+                                else:
+                                    # If few clusters, show all of them
+                                    print("\nCluster size distribution:")
+                                    for cluster_id, count in sorted_clusters:
+                                        print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
                         
                         else:
                             # Original code for labeled data
@@ -630,29 +632,34 @@ class Experiment:
                                 ari_mr.append(ari_)
                             
                             acc, nmi, f1, ari = np.mean(acc_mr), np.mean(nmi_mr), np.mean(f1_mr), np.mean(ari_mr)
-                            print("Final ACC: ", acc)
-                            print("Final NMI: ", nmi)
-                            print("Final F-score: ", f1)
-                            print("Final ARI: ", ari)
+                            if args.verbose:
+                                print("Final ACC: ", acc)
+                                print("Final NMI: ", nmi)
+                                print("Final F-score: ", f1)
+                                print("Final ARI: ", ari)
 
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val.item())
                 test_accuracies.append(best_val_test.item())
-                print("Trial: ", trial + 1)
-                print("Best val ACC: ", best_val.item())
-                print("Best test ACC: ", best_val_test.item())
+                if args.verbose:
+                    print("Trial: ", trial + 1)
+                    print("Best val ACC: ", best_val.item())
+                    print("Best test ACC: ", best_val_test.item())
             elif args.downstream_task == 'clustering':
                 if labels is not None:
-                    print("Final ACC: ", acc)
-                    print("Final NMI: ", nmi)
-                    print("Final F-score: ", f1)
-                    print("Final ARI: ", ari)
+                    if args.verbose:
+                        print("Final ACC: ", acc)
+                        print("Final NMI: ", nmi)
+                        print("Final F-score: ", f1)
+                        print("Final ARI: ", ari)
 
             # After training completes
             if args.save_model:
                 # Save model, graph learner, features and final adjacency matrix
                 self.save_model(model, graph_learner, features, anchor_adj, args.sparse, 
                                output_dir=args.output_dir)
+                if args.verbose:
+                    print(f"Model saved to {args.output_dir}")
 
         if args.downstream_task == 'classification' and trial != 0:
             self.print_results(validation_accuracies, test_accuracies)
@@ -677,6 +684,8 @@ if __name__ == '__main__':
     parser.add_argument('-downstream_task', type=str, default='classification',
                         choices=['classification', 'clustering'])
     parser.add_argument('-gpu', type=int, default=0)
+    parser.add_argument('-verbose', type=int, default=1, 
+                       help='Control verbosity: 1 to show all prints, 0 to show only final results')
 
     # GCL Module - Framework
     parser.add_argument('-epochs', type=int, default=1000)
