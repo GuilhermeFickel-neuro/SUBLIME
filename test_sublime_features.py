@@ -338,6 +338,17 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
     """
     results = {}
     
+    # Suppress Optuna logging
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    
+    # Create concatenated features (original + SUBLIME)
+    train_concat = np.hstack((X_train, train_embeddings))
+    test_concat = np.hstack((X_test, test_embeddings))
+    
+    print(f"Original features shape: {X_train.shape}")
+    print(f"SUBLIME features shape: {train_embeddings.shape}")
+    print(f"Concatenated features shape: {train_concat.shape}")
+    
     # Define Optuna objective for original features
     def original_objective(trial):
         param = {
@@ -368,6 +379,21 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
         model = XGBClassifier(**param)
         return cross_val_score(model, train_embeddings, y_train, cv=5, scoring='accuracy').mean()
     
+    # Define Optuna objective for concatenated features
+    def concat_objective(trial):
+        param = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'random_state': 42
+        }
+        model = XGBClassifier(**param)
+        return cross_val_score(model, train_concat, y_train, cv=5, scoring='accuracy').mean()
+    
     # Tune hyperparameters for original features
     study_original = optuna.create_study(direction='maximize')
     study_original.optimize(original_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=False)
@@ -382,8 +408,6 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
     original_preds = original_clf.predict(X_test)
     original_acc = accuracy_score(y_test, original_preds)
     print(f"Original features accuracy: {original_acc:.4f}")
-    # print("Classification report (original features):")
-    # print(classification_report(y_test, original_preds))
     
     # Tune hyperparameters for SUBLIME features
     study_sublime = optuna.create_study(direction='maximize')
@@ -399,8 +423,21 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
     sublime_preds = sublime_clf.predict(test_embeddings)
     sublime_acc = accuracy_score(y_test, sublime_preds)
     print(f"SUBLIME features accuracy: {sublime_acc:.4f}")
-    # print("Classification report (SUBLIME features):")
-    # print(classification_report(y_test, sublime_preds))
+    
+    # Tune hyperparameters for concatenated features
+    study_concat = optuna.create_study(direction='maximize')
+    study_concat.optimize(concat_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=False)
+    
+    best_params_concat = study_concat.best_params
+    
+    # Train XGBoost on concatenated features with tuned hyperparameters
+    concat_clf = XGBClassifier(**best_params_concat)
+    concat_clf.fit(train_concat, y_train)
+    
+    # Evaluate on concatenated features
+    concat_preds = concat_clf.predict(test_concat)
+    concat_acc = accuracy_score(y_test, concat_preds)
+    print(f"Concatenated features accuracy: {concat_acc:.4f}")
     
     # Create output directory for plots
     os.makedirs('plots', exist_ok=True)
@@ -417,6 +454,12 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
     plt.title(f"Feature Importance (SUBLIME Features) - {dataset_name}")
     plt.savefig(f"plots/{dataset_name}_sublime_feature_importance.png")
     
+    # Feature importance for concatenated features
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(concat_clf.feature_importances_)), concat_clf.feature_importances_)
+    plt.title(f"Feature Importance (Concatenated Features) - {dataset_name}")
+    plt.savefig(f"plots/{dataset_name}_concat_feature_importance.png")
+    
     # Save hyperparameter tuning visualization
     try:
         fig = optuna.visualization.plot_param_importances(study_original)
@@ -424,6 +467,9 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
         
         fig = optuna.visualization.plot_param_importances(study_sublime)
         fig.write_image(f"plots/{dataset_name}_sublime_param_importance.png")
+        
+        fig = optuna.visualization.plot_param_importances(study_concat)
+        fig.write_image(f"plots/{dataset_name}_concat_param_importance.png")
     except:
         print("Could not generate hyperparameter importance plots. You may need to install plotly.")
     
@@ -431,9 +477,13 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
         'dataset': dataset_name,
         'original_accuracy': original_acc,
         'sublime_accuracy': sublime_acc,
-        'improvement': sublime_acc - original_acc,
+        'concat_accuracy': concat_acc,
+        'original_vs_sublime_improvement': sublime_acc - original_acc,
+        'concat_vs_original_improvement': concat_acc - original_acc,
+        'concat_vs_sublime_improvement': concat_acc - sublime_acc,
         'best_params_original': best_params_original,
-        'best_params_sublime': best_params_sublime
+        'best_params_sublime': best_params_sublime,
+        'best_params_concat': best_params_concat
     }
 
 def process_dataset(dataset_name, dataset_loader, n_trials=50):
@@ -551,6 +601,9 @@ def optimize_sublime_hyperparameters(dataset_name='iris', n_trials=30):
     print("="*80)
     print(f"OPTIMIZING SUBLIME HYPERPARAMETERS FOR {dataset_name.upper()} DATASET")
     print("="*80)
+    
+    # Suppress Optuna logging
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     
     # Get dataset loader
     datasets = get_available_datasets()
