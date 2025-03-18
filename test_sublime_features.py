@@ -3,6 +3,7 @@ import torch
 import pandas as pd
 import numpy as np
 import time
+import logging
 import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score
@@ -125,20 +126,20 @@ def train_sublime(data_file, n_clusters, output_dir, hyperparams=None):
         n_clusters=n_clusters,
         
         # GCL Module parameters
-        epochs=1000,  # Reduced for testing, increase for better results
-        lr=0.01,
-        w_decay=0.0,
-        hidden_dim=128,  # Reduced for smaller dataset
+        epochs=1500,  # Reduced for testing, increase for better results
+        lr=0.001244,
+        w_decay=0.0099,
+        hidden_dim=256,  # Reduced for smaller dataset
         rep_dim=32,      # Reduced for smaller dataset
-        proj_dim=64,     # Reduced for smaller dataset
-        dropout=0.5,
+        proj_dim=128,     # Reduced for smaller dataset
+        dropout=0.41,
         contrast_batch_size=0,
         nlayers=2,
         
         # Augmentation parameters
-        maskfeat_rate_learner=0.2,
-        maskfeat_rate_anchor=0.2,
-        dropedge_rate=0.3,
+        maskfeat_rate_learner=0.3077,
+        maskfeat_rate_anchor=0.2617,
+        dropedge_rate=0.1,
         
         # GSL Module parameters
         type_learner="fgp",
@@ -245,7 +246,7 @@ def extract_features(model_dir, X_train, X_test):
     
     return train_embeddings, test_embeddings
 
-def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=32):
+def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16):
     """
     Helper function to extract features in batches to avoid memory issues.
     
@@ -266,25 +267,54 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     num_batches = (len(X) + batch_size - 1) // batch_size
     all_embeddings = []
     
+    # Set models to evaluation mode
+    model.eval()
+    if graph_learner is not None:
+        graph_learner.eval()
+    
+    success_count = 0
+    error_count = 0
+    
+    
+    # Track which batch is being processed
     for i in range(num_batches):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, len(X))
         batch_X = X[start_idx:end_idx]
         
-        # Process each item in the batch
+        # Process each point individually for better error handling
         batch_embeddings = []
-        for j in range(len(batch_X)):
-            # Convert to tensor
-            point_tensor = torch.FloatTensor(batch_X[j]).to(device)
-            
-            # Extract embedding - handle the return value correctly
-            embedding = experiment.process_new_point(
-                point_tensor, model, graph_learner, features, adj, sparse
-            )
-            batch_embeddings.append(embedding.cpu().numpy())
         
+        for j in range(len(batch_X)):
+            point_idx = start_idx + j
+            
+            # Convert to tensor and ensure correct shape
+            try:
+                point_tensor = torch.FloatTensor(batch_X[j]).to(device)
+                
+                # Extract embedding using our improved process_new_point method
+                embedding = experiment.process_new_point(
+                    point_tensor, model, graph_learner, features, adj, sparse
+                )
+                
+                # Append the embedding
+                batch_embeddings.append(embedding.cpu().detach().numpy())
+                success_count += 1
+
+                
+            except Exception as e:
+                error_count += 1
+                print(f"Error processing point {point_idx}: {str(e)}")
+                
+                raise e
+        # Add the batch embeddings to the overall results
         all_embeddings.extend(batch_embeddings)
-        print(f"Processed batch {i+1}/{num_batches} ({end_idx}/{len(X)} points)")
+        
+        # Print progress
+        # CRITICAL DEBUG: Check if loop should continue but will stop early
+    if len(all_embeddings) != len(X):
+        print(f"DEBUG: ERROR! Expected {len(X)} embeddings but only got {len(all_embeddings)}!")
+        print(f"DEBUG: This explains the dimension mismatch error in your XGBoost training.")
     
     return np.array(all_embeddings)
 
@@ -339,16 +369,12 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
         return cross_val_score(model, train_embeddings, y_train, cv=5, scoring='accuracy').mean()
     
     # Tune hyperparameters for original features
-    print("\nTuning XGBoost hyperparameters for original features...")
     study_original = optuna.create_study(direction='maximize')
-    study_original.optimize(original_objective, n_trials=n_trials)
+    study_original.optimize(original_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=False)
     
     best_params_original = study_original.best_params
-    print(f"Best parameters for original features: {best_params_original}")
-    print(f"Best cross-validation accuracy: {study_original.best_value:.4f}")
     
     # Train XGBoost on original features with tuned hyperparameters
-    print("\nTraining XGBoost on original features with tuned hyperparameters...")
     original_clf = XGBClassifier(**best_params_original)
     original_clf.fit(X_train, y_train)
     
@@ -356,20 +382,16 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
     original_preds = original_clf.predict(X_test)
     original_acc = accuracy_score(y_test, original_preds)
     print(f"Original features accuracy: {original_acc:.4f}")
-    print("Classification report (original features):")
-    print(classification_report(y_test, original_preds))
+    # print("Classification report (original features):")
+    # print(classification_report(y_test, original_preds))
     
     # Tune hyperparameters for SUBLIME features
-    print("\nTuning XGBoost hyperparameters for SUBLIME features...")
     study_sublime = optuna.create_study(direction='maximize')
-    study_sublime.optimize(sublime_objective, n_trials=n_trials)
+    study_sublime.optimize(sublime_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=False)
     
     best_params_sublime = study_sublime.best_params
-    print(f"Best parameters for SUBLIME features: {best_params_sublime}")
-    print(f"Best cross-validation accuracy: {study_sublime.best_value:.4f}")
     
     # Train XGBoost on extracted features with tuned hyperparameters
-    print("\nTraining XGBoost on SUBLIME extracted features with tuned hyperparameters...")
     sublime_clf = XGBClassifier(**best_params_sublime)
     sublime_clf.fit(train_embeddings, y_train)
     
@@ -377,8 +399,8 @@ def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_trai
     sublime_preds = sublime_clf.predict(test_embeddings)
     sublime_acc = accuracy_score(y_test, sublime_preds)
     print(f"SUBLIME features accuracy: {sublime_acc:.4f}")
-    print("Classification report (SUBLIME features):")
-    print(classification_report(y_test, sublime_preds))
+    # print("Classification report (SUBLIME features):")
+    # print(classification_report(y_test, sublime_preds))
     
     # Create output directory for plots
     os.makedirs('plots', exist_ok=True)
@@ -481,7 +503,7 @@ def main():
             results = process_dataset(dataset_name, dataset_loader, n_trials=30)  # Reduced trials for faster execution
             all_results.append(results)
         except Exception as e:
-            print(f"Error processing dataset {dataset_name}: {str(e)}")
+            logging.error(f"Error processing dataset {dataset_name}: {str(e)}", exc_info=True)
     
     # Print summary of results
     print("\n" + "="*80)

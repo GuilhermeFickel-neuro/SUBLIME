@@ -207,12 +207,11 @@ class Experiment:
             if hasattr(graph_learner, 'mlp_act'):
                 f.write(f'activation_learner: {graph_learner.mlp_act}\n')
         
-    def load_model(self, model_params=None, input_dir='saved_models'):
+    def load_model(self, input_dir='saved_models'):
         """
         Load a saved model, graph learner, features and adjacency matrix
         
         Args:
-            model_params: Optional dictionary containing model parameters. If None, parameters will be loaded from config.txt
             input_dir: Directory where models are saved
             
         Returns:
@@ -238,21 +237,17 @@ class Experiment:
         features = torch.load(os.path.join(input_dir, 'features.pt')).to(self.device)
         
         # If model_params is not provided, use parameters from config
-        if model_params is None:
-            model_params = {
-                'nlayers': config.get('nlayers', 2),
-                'hidden_dim': config.get('hidden_dim', 128),
-                'emb_dim': config.get('emb_dim', 32),
-                'proj_dim': config.get('proj_dim', 32),
-                'dropout': config.get('dropout', 0.3),
-                'dropout_adj': config.get('dropout_adj', 0.3),
-                'k': config.get('k', 10),
-                'sim_function': config.get('sim_function', 'cosine'),
-                'activation_learner': config.get('activation_learner', 'relu')
-            }
-            print("Using model parameters from config file")
-        else:
-            print("Using provided model parameters")
+        model_params = {
+            'nlayers': config.get('nlayers', 2),
+            'hidden_dim': config.get('hidden_dim', 128),
+            'emb_dim': config.get('emb_dim', 32),
+            'proj_dim': config.get('proj_dim', 32),
+            'dropout': config.get('dropout', 0.3),
+            'dropout_adj': config.get('dropout_adj', 0.3),
+            'k': config.get('k', 10),
+            'sim_function': config.get('sim_function', 'cosine'),
+            'activation_learner': config.get('activation_learner', 'relu')
+        }
         
         # Initialize models
         model = GCL(nlayers=model_params['nlayers'], 
@@ -341,55 +336,67 @@ class Experiment:
             
         return adj
 
-    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse):
+    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None):
         """
-        Process a new data point and extract its embedding features
+        Process a new data point by replacing an existing point and extract its embedding features
         
         Args:
             new_point: Tensor of shape [feature_dim] containing the new point features
             model: The trained GCL model
-            graph_learner: The trained graph learner (only needed for compatibility)
-            features: The existing node features (only needed for compatibility)
+            graph_learner: The trained graph learner
+            features: The existing node features
             adj: The current adjacency matrix
             sparse: Whether the adjacency is sparse
+            replace_idx: Index of the point to replace. If None, will find the most similar point.
             
         Returns:
             torch.Tensor: The node embedding for the new point
         """
-        # Ensure model is in evaluation mode
+        # Ensure model and graph_learner are in evaluation mode
         model.eval()
+        graph_learner.eval()
         
         # Reshape new point if needed
         if len(new_point.shape) == 1:
             new_point = new_point.unsqueeze(0)  # Add batch dimension
-        
+        elif new_point.shape[0] > 1:
+            # If multiple points were passed, only use the first one
+            new_point = new_point[0].unsqueeze(0)
+            
         # Move to appropriate device
         new_point = new_point.to(self.device)
         
-        # Extract embedding
-        with torch.no_grad():
-            # Create a temporary adjacency for this single point
-            if sparse:
-                if isinstance(adj, dgl.DGLGraph):
-                    # For DGL graph, create a simple self-loop
-                    temp_adj = dgl.graph(([0], [0]), num_nodes=1, device=self.device)
-                    # Copy edge features if they exist
-                    if 'w' in adj.edata:
-                        temp_adj.edata['w'] = torch.ones(1, device=self.device)
-                else:
-                    # For torch sparse tensor
-                    indices = torch.tensor([[0], [0]], device=self.device)
-                    values = torch.ones(1, device=self.device)
-                    temp_adj = torch.sparse.FloatTensor(indices, values, (1, 1))
-            else:
-                # For dense adjacency, create an identity matrix of size 1
-                temp_adj = torch.eye(1, device=self.device)
-                
-            # Get embedding using the model directly
-            _, embedding = model(new_point, temp_adj)
+        # If no specific index provided, find the most similar point to replace
+        if replace_idx is None:
+            # Calculate cosine similarity between new point and all existing points
+            normalized_features = F.normalize(features, p=2, dim=1)
+            normalized_new_point = F.normalize(new_point, p=2, dim=1)
+            similarities = torch.mm(normalized_new_point, normalized_features.t())
             
-        return embedding[0].detach()
-
+            # Get the index of the most similar point
+            replace_idx = torch.argmax(similarities).item()
+        
+        # Create a copy of features and replace the selected point
+        modified_features = features.clone()
+        modified_features[replace_idx] = new_point
+        
+        # Generate new adjacency matrix using the graph learner
+        with torch.no_grad():
+            new_adj = graph_learner(modified_features)
+            
+            # Process adjacency matrix based on sparse flag
+            if not sparse:
+                new_adj = symmetrize(new_adj)
+                new_adj = normalize(new_adj, 'sym', sparse)
+            
+            # Get embeddings for all nodes including the new one
+            _, embeddings = model(modified_features, new_adj)
+            
+            # Return the embedding of the replaced point
+            new_point_embedding = embeddings[replace_idx].detach()
+            
+            return new_point_embedding
+            
     def train(self, args, load_data_fn=None):
         """
         Train the model
