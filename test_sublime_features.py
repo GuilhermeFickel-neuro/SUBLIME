@@ -11,7 +11,7 @@ from main import Experiment
 import os
 from sklearn.datasets import load_breast_cancer, load_iris, load_wine, load_digits, fetch_openml
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import classification_report
 import matplotlib.pyplot as plt
 
@@ -23,10 +23,21 @@ def get_available_datasets():
         dict: Dictionary with dataset names as keys and dataset loading functions as values
     """
     datasets = {
+        # Original smaller datasets
         'breast_cancer': load_breast_cancer,
         'iris': load_iris,
         'wine': load_wine,
         'digits': load_digits,
+        
+        # Larger datasets from OpenML
+        'mnist': lambda: fetch_openml('mnist_784', version=1, as_frame=False),
+        'fashion_mnist': lambda: fetch_openml('Fashion-MNIST', version=1, as_frame=False),
+        'adult': lambda: fetch_openml('adult', version=2, as_frame=False),
+        'covertype': lambda: fetch_openml('covertype', version=1, as_frame=False, parser='auto'),
+        'credit_g': lambda: fetch_openml('credit-g', version=1, as_frame=False),
+        'vehicle': lambda: fetch_openml('vehicle', version=1, as_frame=False),
+        'satimage': lambda: fetch_openml('satimage', version=1, as_frame=False),
+        'cifar_10': lambda: fetch_openml('CIFAR_10', version=1, as_frame=False),
     }
     return datasets
 
@@ -58,6 +69,12 @@ def prepare_data(dataset_name, dataset_loader):
     else:
         feature_names = [f'feature_{i}' for i in range(X.shape[1])]
     
+    # Convert target to numeric if it's not already
+    if y.dtype == 'O':  # Object dtype, likely strings
+        print("Converting string labels to numeric...")
+        le = LabelEncoder()
+        y = le.fit_transform(y)
+    
     # Scale the data
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -71,8 +88,15 @@ def prepare_data(dataset_name, dataset_loader):
     print(f"Training set: {X_train.shape}")
     print(f"Testing set: {X_test.shape}")
     print(f"Number of classes: {len(np.unique(y))}")
-    print(f"Class distribution in training: {np.bincount(y_train)}")
-    print(f"Class distribution in testing: {np.bincount(y_test)}")
+    
+    # Safely print class distribution
+    try:
+        print(f"Class distribution in training: {np.bincount(y_train)}")
+        print(f"Class distribution in testing: {np.bincount(y_test)}")
+    except TypeError:
+        # If bincount still fails, just show the unique values counts
+        print(f"Class distribution in training: {pd.Series(y_train).value_counts().sort_index()}")
+        print(f"Class distribution in testing: {pd.Series(y_test).value_counts().sort_index()}")
     
     return X_train, X_test, y_train, y_test, feature_names
 
