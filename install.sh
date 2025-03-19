@@ -25,7 +25,8 @@ conda activate OpenGSL
 
 echo "Installing PyTorch and dependencies..."
 # Install packages
-conda install -y pytorch==1.13.1 -c pytorch -c nvidia
+conda install -c nvidia/label/cuda-11.7.1 cuda-toolkit=11.7.1
+conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
 conda install -y -c dglteam/label/cu117 'dgl<2'
 
 echo "Installing requirements from requirements.txt..."
