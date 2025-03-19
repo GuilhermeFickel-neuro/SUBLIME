@@ -3,15 +3,87 @@ import torch
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
+import os
+import joblib
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 from main import Experiment
 from utils import sparse_mx_to_torch_sparse_tensor
 
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def preprocess_mixed_data(df, model_dir='sublime_models', load_transformer=False):
+    """
+    Preprocess a dataframe with mixed data types (categorical, numerical, missing values)
+    
+    Args:
+        df: Pandas DataFrame with raw data
+        model_dir: Directory to save/load transformation models
+        load_transformer: Whether to load existing transformer or create a new one
+    
+    Returns:
+        Preprocessed numpy array with all features converted to float and normalized to [-1, 1]
+    """
+    # Create model directory if it doesn't exist
+    os.makedirs(model_dir, exist_ok=True)
+    transformer_path = os.path.join(model_dir, 'data_transformer.joblib')
+    
+    # Separate numerical and categorical columns
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    
+    if load_transformer and os.path.exists(transformer_path):
+        # Load pre-fitted transformer
+        print(f"Loading transformer from {transformer_path}")
+        preprocessor = joblib.load(transformer_path)
+    else:
+        # Create preprocessing pipelines
+        numerical_pipeline = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),  # Handle missing values
+            ('scaler', MinMaxScaler(feature_range=(-1, 1)))  # Normalize to [-1, 1]
+        ])
+        
+        categorical_pipeline = Pipeline([
+            ('imputer', SimpleImputer(strategy='most_frequent')),  # Handle missing values
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))  # One-hot encode
+        ])
+        
+        # Combine pipelines into a single transformer
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', numerical_pipeline, numerical_cols),
+                ('cat', categorical_pipeline, categorical_cols)
+            ],
+            remainder='drop'  # Drop columns that can't be transformed
+        )
+        
+        # Fit the transformer
+        print(f"Fitting new transformer and saving to {transformer_path}")
+        preprocessor.fit(df)
+        
+        # Save the transformer
+        joblib.dump(preprocessor, transformer_path)
+    
+    # Transform the data
+    processed_data = preprocessor.transform(df)
+    
+    # Print data statistics
+    print("\nData Transformation Summary:")
+    print(f"Original shape: {df.shape}")
+    print(f"Processed shape: {processed_data.shape}")
+    print(f"Features retained: {processed_data.shape[1]} out of {df.shape[1]} original columns")
+    print(f"Data range: [{processed_data.min():.4f}, {processed_data.max():.4f}]")
+    print(f"Mean value: {processed_data.mean():.4f}, Std: {processed_data.std():.4f}")
+    
+    return processed_data
+
 def load_person_data(args):
     """
     Load person data from CSV and prepare it for SUBLIME self-supervised learning.
+    Handles mixed data types, missing values, and normalizes features.
     
     Args:
         args: Arguments containing dataset path
@@ -21,13 +93,17 @@ def load_person_data(args):
         matching the structure of load_citation_network
     """
     # Load data
+    print(f"Loading dataset from {args.dataset}")
     df = pd.read_csv(args.dataset)
     
     # Get dimensions
     n_samples = df.shape[0]
     
-    # Convert features to sparse matrix first for consistency
-    features = sp.lil_matrix(df.values, dtype=np.float32)
+    # Preprocess the data - convert to floats, handle missing values, normalize to [-1, 1]
+    processed_data = preprocess_mixed_data(df, model_dir='sublime_models')
+    
+    # Convert features to sparse matrix for consistency with the original code
+    features = sp.lil_matrix(processed_data, dtype=np.float32)
     
     # Create empty labels (since this is unsupervised)
     labels = None
@@ -51,6 +127,8 @@ def load_person_data(args):
     
     # Get feature dimension
     nfeats = features.shape[1]
+    
+    print(f"Prepared dataset with {n_samples} samples and {nfeats} features")
     
     # Return in the same format as load_citation_network
     return features, nfeats, labels, args.n_clusters, train_mask, val_mask, test_mask, adj
@@ -92,6 +170,10 @@ def main():
     # Structure Bootstrapping
     parser.add_argument('-tau', type=float, default=1)
     parser.add_argument('-c', type=int, default=0)
+
+    parser.add_argument('-verbose', type=int, default=1)
+    parser.add_argument('-save_model', type=int, default=1)
+    parser.add_argument('-output_dir', type=str, default='sublime_models/')
     
     args = parser.parse_args()
     
