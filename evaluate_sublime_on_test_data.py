@@ -7,6 +7,10 @@ import joblib
 import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 
 import matplotlib.pyplot as plt
 
@@ -49,6 +53,63 @@ def preprocess_mixed_data(df, model_dir):
     print(f"Data shape: {df.shape} -> Processed shape: {processed_data.shape}")
     
     return processed_data
+
+def preprocess_dataset_features(df, target_column=None, fit_transform=False):
+    """
+    Preprocess dataset_features to make them better suited for XGBoost
+    
+    Args:
+        df: Pandas DataFrame with dataset features
+        target_column: Name of the target column to exclude from preprocessing
+        fit_transform: Whether to fit a new transformer (True) or just transform (False)
+        
+    Returns:
+        tuple: (preprocessed_data, preprocessor)
+    """
+    # Make a copy to avoid modifying the original
+    df_copy = df.copy()
+    
+    # Drop target column if provided
+    if target_column and target_column in df_copy.columns:
+        X = df_copy.drop(columns=[target_column])
+        y = df_copy[target_column] if target_column else None
+    else:
+        X = df_copy
+        y = None
+    
+    # Identify column types
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    
+    # Create transformers for numerical and categorical data
+    numerical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+    
+    # Create preprocessor with ColumnTransformer
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_transformer, numerical_cols),
+            ('cat', categorical_transformer, categorical_cols)
+        ]
+    )
+    
+    if fit_transform:
+        # Fit and transform the data
+        preprocessed_data = preprocessor.fit_transform(X)
+        print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
+        return preprocessed_data, preprocessor, y
+    else:
+        # Only transform the data
+        preprocessed_data = preprocessor.transform(X)
+        print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
+        return preprocessed_data, y
 
 def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16):
     """
@@ -112,14 +173,14 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     
     return np.array(all_embeddings)
 
-def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50):
+def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, n_trials=50):
     """
-    Train XGBoost classifiers on three different feature sets and compare performance
+    Train XGBoost classifiers on two different feature sets and compare performance
     
     Args:
-        X_test: Original features
-        test_embeddings: SUBLIME extracted features 
-        y_test: Target labels
+        dataset_features: Preprocessed dataset features
+        sublime_embeddings: SUBLIME extracted embeddings
+        y: Target labels
         dataset_name: Name of the dataset
         n_trials: Number of optimization trials for Optuna
         
@@ -128,28 +189,22 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
     """
     results = {}
     
-    # Create concatenated features (original + SUBLIME)
-    test_concat = np.hstack((X_test, test_embeddings))
+    # Create concatenated features (dataset features + SUBLIME)
+    concat_features = np.hstack((dataset_features, sublime_embeddings))
     
-    print(f"Original features shape: {X_test.shape}")
-    print(f"SUBLIME features shape: {test_embeddings.shape}")
-    print(f"Concatenated features shape: {test_concat.shape}")
+    print(f"Dataset features shape: {dataset_features.shape}")
+    print(f"SUBLIME features shape: {sublime_embeddings.shape}")
+    print(f"Concatenated features shape: {concat_features.shape}")
     
-    # Split the test data into training and validation sets (70/30 split)
-    # We're using the test data for both training and testing since we're just evaluating the features
+    # Split the data into training and validation sets (70/30 split)
     from sklearn.model_selection import train_test_split
-    X_train, X_val, y_train, y_val = train_test_split(X_test, y_test, test_size=0.3, random_state=42, stratify=y_test)
+    X_train, X_val, sublime_train, sublime_val, concat_train, concat_val, y_train, y_val = train_test_split(
+        dataset_features, sublime_embeddings, concat_features, y, 
+        test_size=0.3, random_state=42, stratify=y
+    )
     
-    # Split the embeddings the same way
-    train_embeddings = test_embeddings[:len(X_train)]
-    val_embeddings = test_embeddings[len(X_train):]
-    
-    # Split the concatenated features
-    train_concat = test_concat[:len(X_train)]
-    val_concat = test_concat[len(X_train):]
-    
-    # Define Optuna objective for original features
-    def original_objective(trial):
+    # Define Optuna objective for dataset features
+    def dataset_objective(trial):
         param = {
             'n_estimators': trial.suggest_int('n_estimators', 50, 500),
             'max_depth': trial.suggest_int('max_depth', 3, 10),
@@ -165,23 +220,6 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
         preds = model.predict(X_val)
         return accuracy_score(y_val, preds)
     
-    # Define Optuna objective for SUBLIME features
-    def sublime_objective(trial):
-        param = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
-            'gamma': trial.suggest_float('gamma', 0, 5),
-            'random_state': 42
-        }
-        model = XGBClassifier(**param)
-        model.fit(train_embeddings, y_train)
-        preds = model.predict(val_embeddings)
-        return accuracy_score(y_val, preds)
-    
     # Define Optuna objective for concatenated features
     def concat_objective(trial):
         param = {
@@ -195,45 +233,27 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
             'random_state': 42
         }
         model = XGBClassifier(**param)
-        model.fit(train_concat, y_train)
-        preds = model.predict(val_concat)
+        model.fit(concat_train, y_train)
+        preds = model.predict(concat_val)
         return accuracy_score(y_val, preds)
     
-    # Tune hyperparameters for original features
-    print("\nOptimizing model for original features...")
-    study_original = optuna.create_study(direction='maximize')
-    study_original.optimize(original_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    # Tune hyperparameters for dataset features
+    print("\nOptimizing model for dataset features...")
+    study_dataset = optuna.create_study(direction='maximize')
+    study_dataset.optimize(dataset_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
     
-    best_params_original = study_original.best_params
+    best_params_dataset = study_dataset.best_params
     
-    # Train XGBoost on original features with tuned hyperparameters
-    print("\nTraining model on original features with best hyperparameters...")
-    original_clf = XGBClassifier(**best_params_original)
-    original_clf.fit(X_train, y_train)
+    # Train XGBoost on dataset features with tuned hyperparameters
+    print("\nTraining model on dataset features with best hyperparameters...")
+    dataset_clf = XGBClassifier(**best_params_dataset)
+    dataset_clf.fit(X_train, y_train)
     
-    # Evaluate on original features
-    original_preds = original_clf.predict(X_val)
-    original_acc = accuracy_score(y_val, original_preds)
-    print(f"Original features accuracy: {original_acc:.4f}")
-    print(classification_report(y_val, original_preds))
-    
-    # Tune hyperparameters for SUBLIME features
-    print("\nOptimizing model for SUBLIME features...")
-    study_sublime = optuna.create_study(direction='maximize')
-    study_sublime.optimize(sublime_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
-    
-    best_params_sublime = study_sublime.best_params
-    
-    # Train XGBoost on extracted features with tuned hyperparameters
-    print("\nTraining model on SUBLIME features with best hyperparameters...")
-    sublime_clf = XGBClassifier(**best_params_sublime)
-    sublime_clf.fit(train_embeddings, y_train)
-    
-    # Evaluate on extracted features
-    sublime_preds = sublime_clf.predict(val_embeddings)
-    sublime_acc = accuracy_score(y_val, sublime_preds)
-    print(f"SUBLIME features accuracy: {sublime_acc:.4f}")
-    print(classification_report(y_val, sublime_preds))
+    # Evaluate on dataset features
+    dataset_preds = dataset_clf.predict(X_val)
+    dataset_acc = accuracy_score(y_val, dataset_preds)
+    print(f"Dataset features accuracy: {dataset_acc:.4f}")
+    print(classification_report(y_val, dataset_preds))
     
     # Tune hyperparameters for concatenated features
     print("\nOptimizing model for concatenated features...")
@@ -245,10 +265,10 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
     # Train XGBoost on concatenated features with tuned hyperparameters
     print("\nTraining model on concatenated features with best hyperparameters...")
     concat_clf = XGBClassifier(**best_params_concat)
-    concat_clf.fit(train_concat, y_train)
+    concat_clf.fit(concat_train, y_train)
     
     # Evaluate on concatenated features
-    concat_preds = concat_clf.predict(val_concat)
+    concat_preds = concat_clf.predict(concat_val)
     concat_acc = accuracy_score(y_val, concat_preds)
     print(f"Concatenated features accuracy: {concat_acc:.4f}")
     print(classification_report(y_val, concat_preds))
@@ -257,17 +277,11 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
     plots_dir = os.path.join(args.output_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
     
-    # Feature importance comparison
+    # Feature importance for dataset features
     plt.figure(figsize=(10, 6))
-    plt.bar(range(len(original_clf.feature_importances_)), original_clf.feature_importances_)
-    plt.title(f"Feature Importance (Original Features) - {dataset_name}")
-    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_original_feature_importance.png"))
-    
-    # Feature importance for SUBLIME features
-    plt.figure(figsize=(10, 6))
-    plt.bar(range(len(sublime_clf.feature_importances_)), sublime_clf.feature_importances_)
-    plt.title(f"Feature Importance (SUBLIME Features) - {dataset_name}")
-    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_sublime_feature_importance.png"))
+    plt.bar(range(len(dataset_clf.feature_importances_)), dataset_clf.feature_importances_)
+    plt.title(f"Feature Importance (Dataset Features) - {dataset_name}")
+    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_dataset_feature_importance.png"))
     
     # Feature importance for concatenated features
     plt.figure(figsize=(10, 6))
@@ -278,14 +292,10 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
     # Save results
     results = {
         'dataset': dataset_name,
-        'original_accuracy': original_acc,
-        'sublime_accuracy': sublime_acc,
+        'dataset_features_accuracy': dataset_acc,
         'concat_accuracy': concat_acc,
-        'original_vs_sublime_improvement': sublime_acc - original_acc,
-        'concat_vs_original_improvement': concat_acc - original_acc,
-        'concat_vs_sublime_improvement': concat_acc - sublime_acc,
-        'best_params_original': best_params_original,
-        'best_params_sublime': best_params_sublime,
+        'concat_vs_dataset_improvement': concat_acc - dataset_acc,
+        'best_params_dataset': best_params_dataset,
         'best_params_concat': best_params_concat
     }
     
@@ -297,80 +307,73 @@ def evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=50
     
     return results
 
-def load_and_process_test_data(test_csv, model_dir, target_column):
-    """
-    Load test data from CSV and preprocess it
-    
-    Args:
-        test_csv: Path to the test CSV
-        model_dir: Directory where the SUBLIME model is stored (for transformer)
-        target_column: Name of the target column
-        
-    Returns:
-        tuple: (X_test, y_test)
-    """
-    print(f"Loading test data from {test_csv}")
-    df = pd.read_csv(test_csv, delimiter='\t')
-    
-    # Separate features and target
-    if target_column not in df.columns:
-        raise ValueError(f"Target column '{target_column}' not found in the dataset")
-    
-    y_test = df[target_column].values
-    features_df = df.drop(columns=[target_column])
-    
-    # Preprocess the data using the same transformer
-    X_test = preprocess_mixed_data(features_df, model_dir=model_dir)
-    
-    print(f"Test data loaded: {len(X_test)} samples with {X_test.shape[1]} features")
-    print(f"Target distribution: {np.unique(y_test, return_counts=True)}")
-    
-    return X_test, y_test
-
 def main(args):
     """Main function to run the evaluation pipeline"""
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 1. Load the test data
-    X_test, y_test = load_and_process_test_data(args.test_csv, args.model_dir, args.target_column)
+    # 1. Load and preprocess neurolake data (for SUBLIME)
+    print(f"\nLoading neurolake data from {args.neurolake_csv}")
+    neurolake_df = pd.read_csv(args.neurolake_csv, delimiter='\t')
     
-    # 2. Load the SUBLIME model
+    # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
+    X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
+    print(f"Neurolake data processed: {X_neurolake.shape}")
+    
+    # 3. Load dataset features
+    print(f"\nLoading dataset features from {args.dataset_features_csv}")
+    dataset_df = pd.read_csv(args.dataset_features_csv, delimiter='\t')
+    
+    # Verify that both datasets have the same number of rows (must be aligned)
+    if len(neurolake_df) != len(dataset_df):
+        raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
+    
+    # 4. Process dataset features with a new preprocessing pipeline
+    X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
+    
+    # Verify that we have a target column
+    if args.target_column not in dataset_df.columns:
+        raise ValueError(f"Target column '{args.target_column}' not found in the dataset features")
+    
+    # 5. Load the SUBLIME model
     print(f"\nLoading SUBLIME model from {args.model_dir}")
     experiment = Experiment(device)
     model, graph_learner, features, adj, sparse = experiment.load_model(input_dir=args.model_dir)
     print("Model loaded successfully!")
     
-    # 3. Extract SUBLIME features for the test data
-    print("\nExtracting SUBLIME features for test data...")
-    test_embeddings = extract_in_batches(
-        X_test, model, graph_learner, features, adj, sparse, experiment, batch_size=args.batch_size
+    # 6. Extract SUBLIME features from neurolake data
+    print("\nExtracting SUBLIME features...")
+    sublime_embeddings = extract_in_batches(
+        X_neurolake, model, graph_learner, features, adj, sparse, experiment, batch_size=args.batch_size
     )
-    print(f"Feature extraction complete. Extracted shape: {test_embeddings.shape}")
+    print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
     
-    # 4. Evaluate the features with XGBoost
+    # 7. Evaluate using dataset features and SUBLIME embeddings
     print("\nEvaluating features with XGBoost...")
-    dataset_name = os.path.basename(args.test_csv).split('.')[0]
-    results = evaluate_features(X_test, test_embeddings, y_test, dataset_name, n_trials=args.n_trials)
+    dataset_name = os.path.basename(args.dataset_features_csv).split('.')[0]
+    results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name, n_trials=args.n_trials)
     
-    # 5. Print summary
+    # 8. Print summary
     print("\n" + "="*80)
     print("EVALUATION SUMMARY")
     print("="*80)
     print(f"Dataset: {dataset_name}")
-    print(f"Original features accuracy: {results['original_accuracy']:.4f}")
-    print(f"SUBLIME features accuracy: {results['sublime_accuracy']:.4f}")
+    print(f"Dataset features accuracy: {results['dataset_features_accuracy']:.4f}")
     print(f"Concatenated features accuracy: {results['concat_accuracy']:.4f}")
-    print(f"SUBLIME vs Original improvement: {results['original_vs_sublime_improvement']:.4f}")
-    print(f"Concatenated vs Original improvement: {results['concat_vs_original_improvement']:.4f}")
-    print(f"Concatenated vs SUBLIME improvement: {results['concat_vs_sublime_improvement']:.4f}")
+    print(f"Concatenated vs Dataset features improvement: {results['concat_vs_dataset_improvement']:.4f}")
     print("="*80)
+    
+    # 9. Save the preprocessor for future use
+    preprocessor_path = os.path.join(args.output_dir, 'dataset_features_preprocessor.joblib')
+    joblib.dump(preprocessor, preprocessor_path)
+    print(f"Dataset features preprocessor saved to {preprocessor_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate SUBLIME features on a test dataset with a target")
-    parser.add_argument('--test-csv', type=str, required=True, help='Path to the test CSV file')
+    parser = argparse.ArgumentParser(description="Evaluate SUBLIME features with dataset features")
+    parser.add_argument('--neurolake-csv', type=str, required=True, help='Path to the neurolake CSV file for SUBLIME')
+    parser.add_argument('--dataset-features-csv', type=str, required=True, help='Path to the dataset features CSV file')
     parser.add_argument('--model-dir', type=str, required=True, help='Directory where the SUBLIME model is saved')
-    parser.add_argument('--target-column', type=str, required=True, help='Name of the target column in the CSV')
+    parser.add_argument('--target-column', type=str, required=True, help='Name of the target column in the dataset features CSV')
     parser.add_argument('--output-dir', type=str, default='evaluation_results', help='Directory to save evaluation results')
     parser.add_argument('--n-trials', type=int, default=30, help='Number of Optuna trials')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for feature extraction')
