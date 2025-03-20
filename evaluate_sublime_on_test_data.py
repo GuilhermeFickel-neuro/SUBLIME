@@ -320,7 +320,7 @@ def load_and_process_test_data(test_csv, model_dir, target_column):
     features_df = df.drop(columns=[target_column])
     
     # Preprocess the data using the same transformer
-    X_test = preprocess_mixed_data(features_df, model_dir=model_dir, load_transformer=True)
+    X_test = preprocess_mixed_data(features_df, model_dir=model_dir)
     
     print(f"Test data loaded: {len(X_test)} samples with {X_test.shape[1]} features")
     print(f"Target distribution: {np.unique(y_test, return_counts=True)}")
