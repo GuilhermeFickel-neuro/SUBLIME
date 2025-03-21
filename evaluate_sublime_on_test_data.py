@@ -316,10 +316,6 @@ def main(args):
     print(f"\nLoading neurolake data from {args.neurolake_csv}")
     neurolake_df = pd.read_csv(args.neurolake_csv, delimiter='\t')
     
-    # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
-    X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
-    print(f"Neurolake data processed: {X_neurolake.shape}")
-    
     # 3. Load dataset features
     print(f"\nLoading dataset features from {args.dataset_features_csv}")
     dataset_df = pd.read_csv(args.dataset_features_csv, delimiter='\t')
@@ -328,12 +324,30 @@ def main(args):
     if len(neurolake_df) != len(dataset_df):
         raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
     
+    # Filter out rows where target values are not 0 or 1
+    if args.target_column in dataset_df.columns:
+        # Create a mask for valid target values (0 or 1)
+        valid_mask = dataset_df[args.target_column].isin([0, 1])
+        
+        # Count filtered rows
+        filtered_count = (~valid_mask).sum()
+        if filtered_count > 0:
+            print(f"\nRemoving {filtered_count} rows where {args.target_column} is not 0 or 1")
+            
+            # Apply the same filtering to both dataframes to keep them aligned
+            dataset_df = dataset_df[valid_mask].reset_index(drop=True)
+            neurolake_df = neurolake_df[valid_mask].reset_index(drop=True)
+            
+            print(f"After filtering: {len(dataset_df)} rows remaining")
+    else:
+        raise ValueError(f"Target column '{args.target_column}' not found in the dataset features")
+    
+    # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
+    X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
+    print(f"Neurolake data processed: {X_neurolake.shape}")
+    
     # 4. Process dataset features with a new preprocessing pipeline
     X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
-    
-    # Verify that we have a target column
-    if args.target_column not in dataset_df.columns:
-        raise ValueError(f"Target column '{args.target_column}' not found in the dataset features")
     
     # 5. Load the SUBLIME model
     print(f"\nLoading SUBLIME model from {args.model_dir}")
