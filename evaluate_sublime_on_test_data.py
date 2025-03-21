@@ -198,7 +198,7 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     
     return embeddings_array
 
-def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, n_trials=50):
+def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, preprocessor=None, n_trials=50):
     """
     Train XGBoost classifiers on two different feature sets and compare performance
     
@@ -207,6 +207,7 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, n_t
         sublime_embeddings: SUBLIME extracted embeddings
         y: Target labels
         dataset_name: Name of the dataset
+        preprocessor: The column transformer used to preprocess dataset features (optional)
         n_trials: Number of optimization trials for Optuna
         
     Returns:
@@ -302,16 +303,53 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, n_t
     plots_dir = os.path.join(args.output_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
     
+    # Get feature names (simpler approach)
+    feature_names = []
+    if preprocessor is not None:
+        # Try to get feature names from preprocessor if available
+        try:
+            feature_names = preprocessor.get_feature_names_out()
+        except:
+            # If get_feature_names_out() not available (older sklearn)
+            print("Couldn't get feature names from preprocessor automatically")
+            # Use generic feature names
+            feature_names = [f"Feature_{i}" for i in range(dataset_features.shape[1])]
+    else:
+        # Use generic feature names
+        feature_names = [f"Feature_{i}" for i in range(dataset_features.shape[1])]
+    
+    # SUBLIME feature names
+    sublime_feature_names = [f"SUBLIME_{i}" for i in range(sublime_embeddings.shape[1])]
+    
+    # Combined feature names for concatenated model
+    concat_feature_names = feature_names + sublime_feature_names
+    
     # Feature importance for dataset features
-    plt.figure(figsize=(10, 6))
-    plt.bar(range(len(dataset_clf.feature_importances_)), dataset_clf.feature_importances_)
-    plt.title(f"Feature Importance (Dataset Features) - {dataset_name}")
+    plt.figure(figsize=(12, 8))
+    importances = dataset_clf.feature_importances_
+    indices = np.argsort(importances)[::-1]
+    
+    # Plot top 20 features or all if less than 20
+    n_to_plot = min(20, len(importances))
+    plt.bar(range(n_to_plot), importances[indices[:n_to_plot]])
+    plt.xticks(range(n_to_plot), [feature_names[i] if i < len(feature_names) else f"Feature_{i}" 
+                                for i in indices[:n_to_plot]], rotation=45, ha='right')
+    plt.title(f"Top {n_to_plot} Feature Importance (Dataset Features) - {dataset_name}")
+    plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, f"{dataset_name}_dataset_feature_importance.png"))
     
     # Feature importance for concatenated features
-    plt.figure(figsize=(10, 6))
-    plt.bar(range(len(concat_clf.feature_importances_)), concat_clf.feature_importances_)
-    plt.title(f"Feature Importance (Concatenated Features) - {dataset_name}")
+    plt.figure(figsize=(12, 8))
+    concat_importances = concat_clf.feature_importances_
+    concat_indices = np.argsort(concat_importances)[::-1]
+    
+    # Plot top 20 features or all if less than 20
+    n_to_plot = min(20, len(concat_importances))
+    plt.bar(range(n_to_plot), concat_importances[concat_indices[:n_to_plot]])
+    plt.xticks(range(n_to_plot), [concat_feature_names[i] if i < len(concat_feature_names) else f"Feature_{i}" 
+                                for i in concat_indices[:n_to_plot]], rotation=45, ha='right')
+    plt.title(f"Top {n_to_plot} Feature Importance (Concatenated Features) - {dataset_name}")
+    plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, f"{dataset_name}_concat_feature_importance.png"))
     
     # Save results
@@ -396,7 +434,7 @@ def main(args):
     # 7. Evaluate using dataset features and SUBLIME embeddings
     print("\nEvaluating features with XGBoost...")
     dataset_name = os.path.basename(args.dataset_features_csv).split('.')[0]
-    results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name, n_trials=args.n_trials)
+    results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name, preprocessor=preprocessor, n_trials=args.n_trials)
     
     # 8. Print summary
     print("\n" + "="*80)
