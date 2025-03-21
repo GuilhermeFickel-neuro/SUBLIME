@@ -6,7 +6,7 @@ import os
 import joblib
 import optuna
 from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -229,7 +229,7 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         test_size=0.3, random_state=42, stratify=y
     )
     
-    # Define Optuna objective for dataset features
+    # Define Optuna objective for dataset features - optimize for AUC-ROC
     def dataset_objective(trial):
         param = {
             'n_estimators': trial.suggest_int('n_estimators', 50, 500),
@@ -243,10 +243,11 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         }
         model = XGBClassifier(**param)
         model.fit(X_train, y_train)
-        preds = model.predict(X_val)
-        return accuracy_score(y_val, preds)
+        # Use predict_proba to get probability scores for AUC calculation
+        preds_proba = model.predict_proba(X_val)[:, 1]
+        return roc_auc_score(y_val, preds_proba)
     
-    # Define Optuna objective for concatenated features
+    # Define Optuna objective for concatenated features - optimize for AUC-ROC
     def concat_objective(trial):
         param = {
             'n_estimators': trial.suggest_int('n_estimators', 50, 500),
@@ -260,11 +261,12 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         }
         model = XGBClassifier(**param)
         model.fit(concat_train, y_train)
-        preds = model.predict(concat_val)
-        return accuracy_score(y_val, preds)
+        # Use predict_proba to get probability scores for AUC calculation
+        preds_proba = model.predict_proba(concat_val)[:, 1]
+        return roc_auc_score(y_val, preds_proba)
     
     # Tune hyperparameters for dataset features
-    print("\nOptimizing model for dataset features...")
+    print("\nOptimizing model for dataset features (using AUC-ROC)...")
     study_dataset = optuna.create_study(direction='maximize')
     study_dataset.optimize(dataset_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
     
@@ -277,12 +279,21 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     
     # Evaluate on dataset features
     dataset_preds = dataset_clf.predict(X_val)
+    dataset_preds_proba = dataset_clf.predict_proba(X_val)[:, 1]
     dataset_acc = accuracy_score(y_val, dataset_preds)
+    dataset_auc = roc_auc_score(y_val, dataset_preds_proba)
+    
+    # Calculate KS statistic for dataset features model
+    fpr_dataset, tpr_dataset, thresholds_dataset = roc_curve(y_val, dataset_preds_proba)
+    ks_dataset = max(tpr_dataset - fpr_dataset)
+    
     print(f"Dataset features accuracy: {dataset_acc:.4f}")
+    print(f"Dataset features AUC-ROC: {dataset_auc:.4f}")
+    print(f"Dataset features KS statistic: {ks_dataset:.4f}")
     print(classification_report(y_val, dataset_preds))
     
     # Tune hyperparameters for concatenated features
-    print("\nOptimizing model for concatenated features...")
+    print("\nOptimizing model for concatenated features (using AUC-ROC)...")
     study_concat = optuna.create_study(direction='maximize')
     study_concat.optimize(concat_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
     
@@ -295,13 +306,33 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     
     # Evaluate on concatenated features
     concat_preds = concat_clf.predict(concat_val)
+    concat_preds_proba = concat_clf.predict_proba(concat_val)[:, 1]
     concat_acc = accuracy_score(y_val, concat_preds)
+    concat_auc = roc_auc_score(y_val, concat_preds_proba)
+    
+    # Calculate KS statistic for concatenated features model
+    fpr_concat, tpr_concat, thresholds_concat = roc_curve(y_val, concat_preds_proba)
+    ks_concat = max(tpr_concat - fpr_concat)
+    
     print(f"Concatenated features accuracy: {concat_acc:.4f}")
+    print(f"Concatenated features AUC-ROC: {concat_auc:.4f}")
+    print(f"Concatenated features KS statistic: {ks_concat:.4f}")
     print(classification_report(y_val, concat_preds))
     
     # Create output directory for plots
     plots_dir = os.path.join(args.output_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
+    
+    # Plot ROC curves
+    plt.figure(figsize=(10, 8))
+    plt.plot(fpr_dataset, tpr_dataset, label=f'Dataset features (AUC = {dataset_auc:.4f}, KS = {ks_dataset:.4f})')
+    plt.plot(fpr_concat, tpr_concat, label=f'Concatenated features (AUC = {concat_auc:.4f}, KS = {ks_concat:.4f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'ROC Curves - {dataset_name}')
+    plt.legend()
+    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_roc_curves.png"))
     
     # Get feature names (simpler approach)
     feature_names = []
@@ -322,7 +353,7 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     sublime_feature_names = [f"SUBLIME_{i}" for i in range(sublime_embeddings.shape[1])]
     
     # Combined feature names for concatenated model
-    concat_feature_names = feature_names + sublime_feature_names
+    concat_feature_names = list(feature_names) + list(sublime_feature_names)
     
     # Feature importance for dataset features
     plt.figure(figsize=(12, 8))
@@ -356,8 +387,14 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     results = {
         'dataset': dataset_name,
         'dataset_features_accuracy': dataset_acc,
+        'dataset_features_auc': dataset_auc,
+        'dataset_features_ks': ks_dataset,
         'concat_accuracy': concat_acc,
-        'concat_vs_dataset_improvement': concat_acc - dataset_acc,
+        'concat_auc': concat_auc,
+        'concat_ks': ks_concat,
+        'concat_vs_dataset_improvement_acc': concat_acc - dataset_acc,
+        'concat_vs_dataset_improvement_auc': concat_auc - dataset_auc,
+        'concat_vs_dataset_improvement_ks': ks_concat - ks_dataset,
         'best_params_dataset': best_params_dataset,
         'best_params_concat': best_params_concat
     }
@@ -442,8 +479,13 @@ def main(args):
     print("="*80)
     print(f"Dataset: {dataset_name}")
     print(f"Dataset features accuracy: {results['dataset_features_accuracy']:.4f}")
+    print(f"Dataset features AUC-ROC: {results['dataset_features_auc']:.4f}")
+    print(f"Dataset features KS: {results['dataset_features_ks']:.4f}")
     print(f"Concatenated features accuracy: {results['concat_accuracy']:.4f}")
-    print(f"Concatenated vs Dataset features improvement: {results['concat_vs_dataset_improvement']:.4f}")
+    print(f"Concatenated features AUC-ROC: {results['concat_auc']:.4f}")
+    print(f"Concatenated features KS: {results['concat_ks']:.4f}")
+    print(f"Improvement in AUC-ROC: {results['concat_vs_dataset_improvement_auc']:.4f}")
+    print(f"Improvement in KS: {results['concat_vs_dataset_improvement_ks']:.4f}")
     print("="*80)
     
     # 9. Save the preprocessor for future use
