@@ -111,7 +111,7 @@ def preprocess_dataset_features(df, target_column=None, fit_transform=False):
         print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
         return preprocessed_data, y
 
-def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16):
+def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16, cache_dir=None, model_dir=None):
     """
     Extract features in batches to avoid memory issues (from test_sublime_features.py)
     
@@ -124,10 +124,28 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         sparse: Whether adjacency is sparse
         experiment: Experiment instance
         batch_size: Batch size for processing
+        cache_dir: Directory to cache results. If None, no caching is performed.
+        model_dir: Directory where the model is stored, used for cache file naming
         
     Returns:
         numpy.ndarray: Extracted features
     """
+    # Try to load from cache if cache_dir is provided
+    if cache_dir is not None and model_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Use model_dir as part of the cache filename
+        # Extract the base model directory name without the full path
+        model_name = os.path.basename(os.path.normpath(model_dir))
+        cache_file = os.path.join(cache_dir, f"sublime_embeddings_{model_name}.npy")
+        
+        # If cache file exists, load and return it
+        if os.path.exists(cache_file):
+            print(f"Loading cached embeddings from {cache_file}")
+            return np.load(cache_file)
+        else:
+            print(f"Cache file not found. Extracting embeddings and saving to {cache_file}")
+    
     num_batches = (len(X) + batch_size - 1) // batch_size
     all_embeddings = []
     
@@ -171,7 +189,14 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     if len(all_embeddings) != len(X):
         print(f"WARNING: Expected {len(X)} embeddings but only got {len(all_embeddings)}!")
     
-    return np.array(all_embeddings)
+    embeddings_array = np.array(all_embeddings)
+    
+    # Save to cache if cache_dir is provided
+    if cache_dir is not None and model_dir is not None:
+        print(f"Saving embeddings to cache: {cache_file}")
+        np.save(cache_file, embeddings_array)
+    
+    return embeddings_array
 
 def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, n_trials=50):
     """
@@ -312,6 +337,11 @@ def main(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Create cache directory if caching is enabled
+    if args.cache_dir:
+        os.makedirs(args.cache_dir, exist_ok=True)
+        print(f"Using cache directory: {args.cache_dir}")
+    
     # 1. Load and preprocess neurolake data (for SUBLIME)
     print(f"\nLoading neurolake data from {args.neurolake_csv}")
     neurolake_df = pd.read_csv(args.neurolake_csv, delimiter='\t')
@@ -358,7 +388,8 @@ def main(args):
     # 6. Extract SUBLIME features from neurolake data
     print("\nExtracting SUBLIME features...")
     sublime_embeddings = extract_in_batches(
-        X_neurolake, model, graph_learner, features, adj, sparse, experiment, batch_size=args.batch_size
+        X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
+        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir
     )
     print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
     
@@ -391,6 +422,7 @@ if __name__ == "__main__":
     parser.add_argument('--output-dir', type=str, default='evaluation_results', help='Directory to save evaluation results')
     parser.add_argument('--n-trials', type=int, default=30, help='Number of Optuna trials')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for feature extraction')
+    parser.add_argument('--cache-dir', type=str, default='cache', help='Directory to cache SUBLIME embeddings for faster subsequent runs')
     
     args = parser.parse_args()
     main(args) 
