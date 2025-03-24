@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import joblib
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 
 # Import functions from existing scripts
 from main import Experiment
@@ -41,15 +41,18 @@ def objective(trial, args):
     trial_dir = os.path.join(args.output_dir, f"trial_{trial.number}")
     os.makedirs(trial_dir, exist_ok=True)
     
-    # Update args with trial parameters
+    # Create a copy of the args to avoid modifying the original
+    trial_args = argparse.Namespace(**vars(args))
+    
+    # Update trial_args with trial parameters
     for param, value in params.items():
-        setattr(args, param, value)
-    args.output_dir = trial_dir
+        setattr(trial_args, param, value)
+    trial_args.output_dir = trial_dir
     
     # Train the SUBLIME model
     experiment = Experiment(device)
     try:
-        experiment.train(args, load_data_fn=load_person_data)
+        experiment.train(trial_args, load_data_fn=load_person_data)
     except Exception as e:
         print(f"Error during training: {e}")
         return float('-inf')  # Return a bad score if training fails
@@ -76,7 +79,7 @@ def objective(trial, args):
             neurolake_df = neurolake_df[valid_mask].reset_index(drop=True)
         
         # Process data
-        X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=trial_dir, load_transformer=True)
+        X_neurolake = preprocess_mixed_data(neurolake_df, model_dir='sublime_models/', load_transformer=True)
         X_dataset, _, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
         
         # Extract SUBLIME features
@@ -128,19 +131,26 @@ def objective(trial, args):
         best_clf = XGBClassifier(**best_xgb_params)
         best_clf.fit(concat_train, y_train)
         
+        # Calculate KS statistic for the best model
+        best_preds_proba = best_clf.predict_proba(concat_val)[:, 1]
+        fpr, tpr, _ = roc_curve(y_val, best_preds_proba)
+        best_ks = max(tpr - fpr)
+        
         # Save the best XGBoost model
         joblib.dump(best_clf, os.path.join(trial_dir, 'best_xgb_model.joblib'))
         
         # Save XGBoost hyperparameters
         with open(os.path.join(trial_dir, 'best_xgb_params.txt'), 'w') as f:
             f.write(f"Best XGBoost AUC-ROC: {best_xgb_auc}\n")
+            f.write(f"Best XGBoost KS: {best_ks}\n")
             f.write("Best XGBoost hyperparameters:\n")
             for key, value in best_xgb_params.items():
                 f.write(f"  {key}: {value}\n")
         
         # Save the score for this trial
         with open(os.path.join(trial_dir, 'score.txt'), 'w') as f:
-            f.write(f"SUBLIME + XGBoost AUC-ROC: {best_xgb_auc}")
+            f.write(f"SUBLIME + XGBoost AUC-ROC: {best_xgb_auc}\n")
+            f.write(f"SUBLIME + XGBoost KS: {best_ks}")
         
         return best_xgb_auc
         
