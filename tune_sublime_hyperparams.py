@@ -34,6 +34,7 @@ def objective(trial, args):
         'k': trial.suggest_int('k', 10, 50),
         'gamma': trial.suggest_float('gamma', 0.5, 0.99),
         'w_decay': trial.suggest_float('w_decay', 0.0, 0.01),
+        'type_learner': trial.suggest_categorical('type_learner', ['fgp', 'mlp', 'gnn', 'att']),
     }
     
     # Create a unique output directory for this trial
@@ -180,7 +181,6 @@ def main():
     parser.add_argument('-n_clusters', type=int, default=5)
     parser.add_argument('-epochs', type=int, default=1000)
     parser.add_argument('-contrast_batch_size', type=int, default=10000)
-    parser.add_argument('-type_learner', type=str, default='fgp')
     parser.add_argument('-sim_function', type=str, default='cosine')
     parser.add_argument('-activation_learner', type=str, default='relu')
     parser.add_argument('-tau', type=float, default=1)
