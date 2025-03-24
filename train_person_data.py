@@ -15,7 +15,7 @@ from utils import sparse_mx_to_torch_sparse_tensor
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def preprocess_mixed_data(df, model_dir='sublime_models', load_transformer=False):
+def preprocess_mixed_data(df, model_dir='sublime_models', load_transformer=True):
     """
     Preprocess a dataframe with mixed data types (categorical, numerical, missing values)
     
