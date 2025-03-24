@@ -35,6 +35,7 @@ def objective(trial, args):
         'gamma': trial.suggest_float('gamma', 0.5, 0.99),
         'w_decay': trial.suggest_float('w_decay', 0.0, 0.01),
         'type_learner': trial.suggest_categorical('type_learner', ['fgp', 'mlp', 'gnn', 'att']),
+        'epochs': trial.suggest_int('epochs', 750, 3000),
     }
     
     # Create a unique output directory for this trial
