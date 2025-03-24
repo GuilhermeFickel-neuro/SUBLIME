@@ -33,7 +33,6 @@ def objective(trial, args):
         'dropedge_rate': trial.suggest_float('dropedge_rate', 0.1, 0.7),
         'k': trial.suggest_int('k', 10, 50),
         'gamma': trial.suggest_float('gamma', 0.5, 0.99),
-        'tau': trial.suggest_float('tau', 0.5, 2.0),
         'w_decay': trial.suggest_float('w_decay', 0.0, 0.01),
     }
     
@@ -184,6 +183,7 @@ def main():
     parser.add_argument('-type_learner', type=str, default='fgp')
     parser.add_argument('-sim_function', type=str, default='cosine')
     parser.add_argument('-activation_learner', type=str, default='relu')
+    parser.add_argument('-tau', type=float, default=1)
     parser.add_argument('-c', type=int, default=0)
     parser.add_argument('-verbose', type=int, default=0)
     parser.add_argument('-save_model', type=int, default=1)
