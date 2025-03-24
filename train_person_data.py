@@ -94,7 +94,7 @@ def load_person_data(args):
     """
     # Load data
     print(f"Loading dataset from {args.dataset}")
-    df = pd.read_csv(args.dataset)
+    df = pd.read_csv(args.dataset, delimiter='\t')
     
     # Get dimensions
     n_samples = df.shape[0]
@@ -140,7 +140,7 @@ def main():
     parser.add_argument('-ntrials', type=int, default=1)  # Reduced since we don't need multiple trials for self-supervised
     parser.add_argument('-sparse', type=int, default=0)  # Changed default to 0 for CPU compatibility
     parser.add_argument('-gsl_mode', type=str, default="structure_inference")
-    parser.add_argument('-eval_freq', type=int, default=5)
+    parser.add_argument('-eval_freq', type=int, default=500)
     parser.add_argument('-downstream_task', type=str, default='clustering')  # Changed to clustering since we don't have labels
     parser.add_argument('-n_clusters', type=int, default=5, help='Number of clusters for clustering task')
     
