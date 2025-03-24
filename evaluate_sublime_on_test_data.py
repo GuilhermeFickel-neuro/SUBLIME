@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import os
 import joblib
+from tqdm import tqdm
 import optuna
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
@@ -154,8 +155,8 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     if graph_learner is not None:
         graph_learner.eval()
     
-    # Process each batch
-    for i in range(num_batches):
+    # Process each batch using tqdm for progress tracking
+    for i in tqdm(range(num_batches), desc="Processing batches", unit="batch"):
         start_idx = i * batch_size
         end_idx = min((i + 1) * batch_size, len(X))
         batch_X = X[start_idx:end_idx]
@@ -181,10 +182,6 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
                 
         # Add the batch embeddings to the overall results
         all_embeddings.extend(batch_embeddings)
-        
-        # Print progress every 10 batches
-        if i % 10 == 0:
-            print(f"Processed {end_idx}/{len(X)} samples")
     
     if len(all_embeddings) != len(X):
         print(f"WARNING: Expected {len(X)} embeddings but only got {len(all_embeddings)}!")
