@@ -23,9 +23,9 @@ def objective(trial, args):
     # Define hyperparameters to tune
     params = {
         'lr': trial.suggest_float('lr', 0.001, 0.1, log=True),
-        'hidden_dim': trial.suggest_int('hidden_dim', 32, 512),
-        'rep_dim': trial.suggest_int('rep_dim', 16, 128),
-        'proj_dim': trial.suggest_int('proj_dim', 16, 256),
+        'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 128, 256, 320]),
+        'rep_dim': trial.suggest_categorical('rep_dim', [16, 32, 64, 128]),
+        'proj_dim': trial.suggest_categorical('proj_dim', [16, 32, 64, 128, 192, 256]),
         'dropout': trial.suggest_float('dropout', 0.01, 0.7),
         'nlayers': trial.suggest_int('nlayers', 1, 4),
         'maskfeat_rate_learner': trial.suggest_float('maskfeat_rate_learner', 0.1, 0.5),
