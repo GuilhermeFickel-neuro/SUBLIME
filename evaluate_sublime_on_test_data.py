@@ -418,7 +418,45 @@ def main(args):
     print(f"\nLoading neurolake data from {args.neurolake_csv}")
     neurolake_df = pd.read_csv(args.neurolake_csv, delimiter='\t')
     
-    # 3. Load dataset features
+    # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
+    X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
+    print(f"Neurolake data processed: {X_neurolake.shape}")
+    
+    # 3. Load the SUBLIME model
+    print(f"\nLoading SUBLIME model from {args.model_dir}")
+    experiment = Experiment(device)
+    model, graph_learner, features, adj, sparse = experiment.load_model(input_dir=args.model_dir)
+    print("Model loaded successfully!")
+    
+    # 4. Extract SUBLIME features from neurolake data
+    print("\nExtracting SUBLIME features...")
+    sublime_embeddings = extract_in_batches(
+        X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
+        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir
+    )
+    print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
+    
+    # 5. If embeddings_output is provided, save embeddings to CSV
+    if args.embeddings_output:
+        # Create embeddings DataFrame with column names
+        embeddings_df = pd.DataFrame(
+            sublime_embeddings, 
+            columns=[f"sublime_embedding_{i}" for i in range(sublime_embeddings.shape[1])]
+        )
+        
+        # Add index from original neurolake data if it exists
+        if 'id' in neurolake_df.columns:
+            embeddings_df['id'] = neurolake_df['id'].values
+            
+        # Save to CSV
+        embeddings_df.to_csv(args.embeddings_output, index=False)
+        print(f"\nSUBLIME embeddings saved to {args.embeddings_output}")
+        
+        # If no evaluation parameters provided, exit now
+        if not (args.dataset_features_csv and args.target_column):
+            return
+    
+    # 6. Load and process dataset features (only needed for evaluation)
     print(f"\nLoading dataset features from {args.dataset_features_csv}")
     dataset_df = pd.read_csv(args.dataset_features_csv, delimiter='\t')
     
@@ -444,26 +482,8 @@ def main(args):
     else:
         raise ValueError(f"Target column '{args.target_column}' not found in the dataset features")
     
-    # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
-    X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
-    print(f"Neurolake data processed: {X_neurolake.shape}")
-    
-    # 4. Process dataset features with a new preprocessing pipeline
+    # Process dataset features with a new preprocessing pipeline
     X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
-    
-    # 5. Load the SUBLIME model
-    print(f"\nLoading SUBLIME model from {args.model_dir}")
-    experiment = Experiment(device)
-    model, graph_learner, features, adj, sparse = experiment.load_model(input_dir=args.model_dir)
-    print("Model loaded successfully!")
-    
-    # 6. Extract SUBLIME features from neurolake data
-    print("\nExtracting SUBLIME features...")
-    sublime_embeddings = extract_in_batches(
-        X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
-        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir
-    )
-    print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
     
     # 7. Evaluate using dataset features and SUBLIME embeddings
     print("\nEvaluating features with XGBoost...")
@@ -493,13 +513,19 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate SUBLIME features with dataset features")
     parser.add_argument('--neurolake-csv', type=str, required=True, help='Path to the neurolake CSV file for SUBLIME')
-    parser.add_argument('--dataset-features-csv', type=str, required=True, help='Path to the dataset features CSV file')
+    parser.add_argument('--dataset-features-csv', type=str, required=False, help='Path to the dataset features CSV file')
     parser.add_argument('--model-dir', type=str, required=True, help='Directory where the SUBLIME model is saved')
-    parser.add_argument('--target-column', type=str, required=True, help='Name of the target column in the dataset features CSV')
+    parser.add_argument('--target-column', type=str, required=False, help='Name of the target column in the dataset features CSV')
     parser.add_argument('--output-dir', type=str, default='evaluation_results', help='Directory to save evaluation results')
     parser.add_argument('--n-trials', type=int, default=30, help='Number of Optuna trials')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for feature extraction')
     parser.add_argument('--cache-dir', type=str, default='cache', help='Directory to cache SUBLIME embeddings for faster subsequent runs')
+    parser.add_argument('--embeddings-output', type=str, help='Path to save the extracted embeddings CSV. If specified without evaluation parameters, only embeddings will be extracted.')
     
     args = parser.parse_args()
+    
+    # Validate arguments
+    if not args.embeddings_output and (not args.dataset_features_csv or not args.target_column):
+        parser.error("Either provide --embeddings-output to extract embeddings, or provide --dataset-features-csv and --target-column for evaluation")
+    
     main(args) 
