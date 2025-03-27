@@ -1,6 +1,7 @@
 import argparse
 import os
 import optuna
+import logging
 import pandas as pd
 import numpy as np
 import torch
@@ -55,7 +56,7 @@ def objective(trial, args):
     try:
         experiment.train(trial_args, load_data_fn=load_person_data)
     except Exception as e:
-        print(f"Error during training: {e}")
+        logging.error(f"Error during training: {e}")
         return float('-inf')  # Return a bad score if training fails
     
     # Evaluate using classification performance
@@ -86,7 +87,7 @@ def objective(trial, args):
         # Extract SUBLIME features
         sublime_embeddings = extract_in_batches(
             X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
-            batch_size=args.batch_size
+            batch_size=args.batch_size, dataset_name=os.path.basename(args.neurolake_csv).split('.')[0]
         )
         
         # Split data for evaluation
@@ -156,7 +157,7 @@ def objective(trial, args):
         return best_xgb_auc
         
     except Exception as e:
-        print(f"Error during evaluation: {e}")
+        print(f"Error during evaluation: {e}", exc_info=True)
         return float('-inf')  # Return a bad score if evaluation fails
 
 def main():

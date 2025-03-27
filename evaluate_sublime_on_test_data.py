@@ -112,7 +112,7 @@ def preprocess_dataset_features(df, target_column=None, fit_transform=False):
         print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
         return preprocessed_data, y
 
-def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16, cache_dir=None, model_dir=None):
+def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16, cache_dir=None, model_dir=None, dataset_name=None):
     """
     Extract features in batches to avoid memory issues (from test_sublime_features.py)
     
@@ -127,18 +127,22 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         batch_size: Batch size for processing
         cache_dir: Directory to cache results. If None, no caching is performed.
         model_dir: Directory where the model is stored, used for cache file naming
+        dataset_name: Name of the dataset, used for cache file naming. If None, no caching is performed.
         
     Returns:
         numpy.ndarray: Extracted features
     """
-    # Try to load from cache if cache_dir is provided
-    if cache_dir is not None and model_dir is not None:
+    # Try to load from cache if cache_dir, model_dir AND dataset_name are provided
+    cache_file = None
+    if cache_dir is not None and model_dir is not None and dataset_name is not None:
         os.makedirs(cache_dir, exist_ok=True)
         
         # Use model_dir as part of the cache filename
         # Extract the base model directory name without the full path
         model_name = os.path.basename(os.path.normpath(model_dir))
-        cache_file = os.path.join(cache_dir, f"sublime_embeddings_{model_name}.npy")
+        
+        # Always include dataset_name in the cache filename
+        cache_file = os.path.join(cache_dir, f"sublime_embeddings_{model_name}_{dataset_name}.npy")
         
         # If cache file exists, load and return it
         if os.path.exists(cache_file):
@@ -146,6 +150,8 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
             return np.load(cache_file)
         else:
             print(f"Cache file not found. Extracting embeddings and saving to {cache_file}")
+    elif cache_dir is not None and (model_dir is None or dataset_name is None):
+        print("Caching disabled: Both model_dir and dataset_name must be provided to enable caching.")
     
     num_batches = (len(X) + batch_size - 1) // batch_size
     all_embeddings = []
@@ -188,8 +194,8 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     
     embeddings_array = np.array(all_embeddings)
     
-    # Save to cache if cache_dir is provided
-    if cache_dir is not None and model_dir is not None:
+    # Save to cache only if cache_file is defined (requires cache_dir, model_dir, and dataset_name)
+    if cache_file is not None:
         print(f"Saving embeddings to cache: {cache_file}")
         np.save(cache_file, embeddings_array)
     
@@ -432,7 +438,7 @@ def main(args):
     print("\nExtracting SUBLIME features...")
     sublime_embeddings = extract_in_batches(
         X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
-        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir
+        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir, dataset_name=os.path.basename(args.neurolake_csv).split('.')[0]
     )
     print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
     

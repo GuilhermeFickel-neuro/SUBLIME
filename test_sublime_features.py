@@ -231,7 +231,7 @@ def train_sublime(data_file, n_clusters, output_dir, hyperparams=None):
     
     return output_dir
 
-def extract_features(model_dir, X_train, X_test):
+def extract_features(model_dir, X_train, X_test, dataset_name=None, cache_dir=None):
     """
     Extract features from both training and testing data using the trained SUBLIME model.
     
@@ -239,6 +239,8 @@ def extract_features(model_dir, X_train, X_test):
         model_dir: Directory where the SUBLIME model is saved
         X_train: Training features
         X_test: Testing features
+        dataset_name: Name of the dataset. If None, no caching is performed.
+        cache_dir: Directory to cache results. If None, no caching is performed.
         
     Returns:
         tuple: (train_embeddings, test_embeddings)
@@ -260,17 +262,23 @@ def extract_features(model_dir, X_train, X_test):
     
     # Extract features for training data
     print(f"Extracting features for {len(X_train)} training points...")
-    train_embeddings = extract_in_batches(X_train, model, graph_learner, features, adj, sparse, experiment, batch_size)
+    train_embeddings = extract_in_batches(
+        X_train, model, graph_learner, features, adj, sparse, experiment, 
+        batch_size, dataset_name, cache_dir, model_dir
+    )
     
     # Extract features for testing data 
     print(f"Extracting features for {len(X_test)} testing points...")
-    test_embeddings = extract_in_batches(X_test, model, graph_learner, features, adj, sparse, experiment, batch_size)
+    test_embeddings = extract_in_batches(
+        X_test, model, graph_learner, features, adj, sparse, experiment, 
+        batch_size, dataset_name, cache_dir, model_dir
+    )
     
     print(f"Feature extraction complete. Shapes: train={train_embeddings.shape}, test={test_embeddings.shape}")
     
     return train_embeddings, test_embeddings
 
-def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16):
+def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16, dataset_name=None, cache_dir=None, model_dir=None):
     """
     Helper function to extract features in batches to avoid memory issues.
     
@@ -283,10 +291,34 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         sparse: Whether adjacency is sparse
         experiment: Experiment instance
         batch_size: Batch size for processing
+        dataset_name: Name of the dataset. If None, no caching is performed.
+        cache_dir: Directory to cache results. If None, no caching is performed.
+        model_dir: Directory where the model is stored, used for cache file naming
         
     Returns:
         numpy.ndarray: Extracted features
     """
+    # Try to load from cache if cache_dir, model_dir AND dataset_name are provided
+    cache_file = None
+    if cache_dir is not None and model_dir is not None and dataset_name is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Use model_dir as part of the cache filename
+        # Extract the base model directory name without the full path
+        model_name = os.path.basename(os.path.normpath(model_dir))
+        
+        # Always include dataset_name in the cache filename
+        cache_file = os.path.join(cache_dir, f"sublime_embeddings_{model_name}_{dataset_name}.npy")
+        
+        # If cache file exists, load and return it
+        if os.path.exists(cache_file):
+            print(f"Loading cached embeddings from {cache_file}")
+            return np.load(cache_file)
+        else:
+            print(f"Cache file not found. Extracting embeddings and saving to {cache_file}")
+    elif cache_dir is not None and (model_dir is None or dataset_name is None):
+        print("Caching disabled: Both model_dir and dataset_name must be provided to enable caching.")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_batches = (len(X) + batch_size - 1) // batch_size
     all_embeddings = []
@@ -340,7 +372,14 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         print(f"DEBUG: ERROR! Expected {len(X)} embeddings but only got {len(all_embeddings)}!")
         print(f"DEBUG: This explains the dimension mismatch error in your XGBoost training.")
     
-    return np.array(all_embeddings)
+    embeddings_array = np.array(all_embeddings)
+    
+    # Save to cache only if cache_file is defined (requires cache_dir, model_dir, and dataset_name)
+    if cache_file is not None:
+        print(f"Saving embeddings to cache: {cache_file}")
+        np.save(cache_file, embeddings_array)
+    
+    return embeddings_array
 
 def evaluate_features(X_train, X_test, train_embeddings, test_embeddings, y_train, y_test, dataset_name, n_trials=50):
     """
@@ -547,7 +586,7 @@ def process_dataset(dataset_name, dataset_loader, n_trials=50):
     
     # 4. Extract features using the trained SUBLIME model
     print("\nSTEP 4: Extracting features using SUBLIME...")
-    train_embeddings, test_embeddings = extract_features(model_dir, X_train, X_test)
+    train_embeddings, test_embeddings = extract_features(model_dir, X_train, X_test, dataset_name, cache_dir="cache")
     
     # 5. Evaluate the extracted features with XGBoost
     print("\nSTEP 5: Evaluating extracted features with XGBoost...")
@@ -677,7 +716,7 @@ def optimize_sublime_hyperparameters(dataset_name='iris', n_trials=30):
             train_sublime(data_file, n_clusters=n_clusters, output_dir=model_dir, hyperparams=hyperparams)
             
             # Extract features
-            train_embeddings, test_embeddings = extract_features(model_dir, X_train, X_test)
+            train_embeddings, test_embeddings = extract_features(model_dir, X_train, X_test, dataset_name, cache_dir="cache")
             
             # Evaluate the embeddings with XGBoost (simplified evaluation)
             clf = XGBClassifier(n_estimators=100, random_state=42)
