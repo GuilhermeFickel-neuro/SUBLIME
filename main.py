@@ -2,6 +2,7 @@ import argparse
 import copy
 from datetime import datetime
 
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -223,7 +224,7 @@ class Experiment:
             for line in f:
                 key, value = line.strip().split(': ')
                 if key == 'sparse':
-                    config[key] = value.lower() == 'true'
+                    config[key] = value.lower() == '1'
                 elif key in ['feature_dim', 'num_nodes', 'nlayers', 'hidden_dim', 'emb_dim', 'proj_dim', 'k']:
                     config[key] = int(value)
                 elif key in ['dropout', 'dropout_adj']:
@@ -477,7 +478,7 @@ class Experiment:
                 best_val_test = 0
                 best_epoch = 0
 
-            for epoch in range(1, args.epochs + 1):
+            for epoch in tqdm(range(1, args.epochs + 1), desc="Training", total=args.epochs):
                 model.train()
                 graph_learner.train()
 
