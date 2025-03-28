@@ -118,7 +118,7 @@ class Experiment:
         test_loss, test_accu = self.loss_cls(best_model, test_mask, features, labels)
         return best_val, test_accu, best_model
 
-    def save_model(self, model, graph_learner, features, adj, sparse, output_dir='saved_models'):
+    def save_model(self, model, graph_learner, features, adj, sparse, args=None, output_dir='saved_models'):
         """
         Save model, graph learner, features and adjacency matrix
         
@@ -128,6 +128,7 @@ class Experiment:
             features: Node features
             adj: Adjacency matrix
             sparse: Whether the adjacency matrix is sparse
+            args: Arguments from the train function
             output_dir: Directory to save models
         """
         # Create directory if it doesn't exist
@@ -155,9 +156,13 @@ class Experiment:
         else:
             # For dense adjacency
             torch.save(adj.cpu(), os.path.join(output_dir, 'adjacency.pt'))
-        
         # Save a config file with all important parameters
         with open(os.path.join(output_dir, 'config.txt'), 'w') as f:
+            # Save all args parameters if provided
+            if args:
+                for arg_name, arg_value in vars(args).items():
+                    f.write(f'{arg_name}: {arg_value}\n')
+                
             # Basic parameters
             f.write(f'sparse: {sparse}\n')
             f.write(f'feature_dim: {features.shape[1]}\n')
@@ -664,7 +669,7 @@ class Experiment:
             # After training completes
             if args.save_model:
                 # Save model, graph learner, features and final adjacency matrix
-                self.save_model(model, graph_learner, features, anchor_adj, args.sparse, 
+                self.save_model(model, graph_learner, features, anchor_adj, args.sparse, args,
                                output_dir=args.output_dir)
                 if args.verbose:
                     print(f"Model saved to {args.output_dir}")
