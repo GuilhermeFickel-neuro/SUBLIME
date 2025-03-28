@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.optim.lr_scheduler as lr_scheduler
 
 from model import GCN, GCL
 from graph_learners import *
@@ -465,6 +466,30 @@ class Experiment:
 
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
+            
+            # Set up OneCycleLR scheduler if enabled
+            if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
+                print("Using One Cycle Policy learning rate scheduler")
+                scheduler_cl = lr_scheduler.OneCycleLR(
+                    optimizer_cl,
+                    max_lr=args.lr,
+                    total_steps=args.epochs,
+                    pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3,
+                    div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
+                    final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
+                )
+                
+                scheduler_learner = lr_scheduler.OneCycleLR(
+                    optimizer_learner,
+                    max_lr=args.lr,
+                    total_steps=args.epochs,
+                    pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3,
+                    div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
+                    final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
+                )
+            else:
+                scheduler_cl = None
+                scheduler_learner = None
 
             model = model.to(self.device)
             graph_learner = graph_learner.to(self.device)
@@ -494,6 +519,16 @@ class Experiment:
                 loss.backward()
                 optimizer_cl.step()
                 optimizer_learner.step()
+                
+                # Step the schedulers if using OneCycleLR
+                if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
+                    scheduler_cl.step()
+                    scheduler_learner.step()
+                    
+                    # Print current learning rates periodically
+                    if args.verbose and epoch % 10 == 0:
+                        print(f"Epoch {epoch} - LR model: {optimizer_cl.param_groups[0]['lr']:.6f}, "
+                              f"LR learner: {optimizer_learner.param_groups[0]['lr']:.6f}")
 
                 # Structure Bootstrapping
                 if (1 - args.tau) and (args.c == 0 or epoch % args.c == 0):

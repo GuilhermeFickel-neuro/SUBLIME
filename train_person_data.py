@@ -171,13 +171,23 @@ def main():
     parser.add_argument('-tau', type=float, default=1)
     parser.add_argument('-c', type=int, default=0)
 
+    # One Cycle Learning Rate Scheduler parameters
+    parser.add_argument('-use_one_cycle', type=int, default=0,
+                        help='Whether to use OneCycleLR scheduler (0=disabled, 1=enabled)')
+    parser.add_argument('-one_cycle_pct_start', type=float, default=0.3,
+                        help='Percentage of cycle spent increasing learning rate (default: 0.3)')
+    parser.add_argument('-one_cycle_div_factor', type=float, default=25.0,
+                        help='Initial learning rate is max_lr/div_factor (default: 25.0)')
+    parser.add_argument('-one_cycle_final_div_factor', type=float, default=10000.0,
+                        help='Final learning rate is max_lr/(div_factor*final_div_factor) (default: 10000.0)')
+
     parser.add_argument('-verbose', type=int, default=1)
     parser.add_argument('-save_model', type=int, default=1)
     parser.add_argument('-output_dir', type=str, default='sublime_models/')
     
     args = parser.parse_args()
     
-    # Train model
+    # Create experiment and train model
     experiment = Experiment(device)
     experiment.train(args, load_data_fn=load_person_data)
 
