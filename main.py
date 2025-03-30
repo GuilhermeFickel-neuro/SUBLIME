@@ -760,13 +760,13 @@ class Experiment:
                     print("Trial: ", trial + 1)
                     print("Best val ACC: ", best_val.item())
                     print("Best test ACC: ", best_val_test.item())
-            elif args.downstream_task == 'clustering':
-                if labels is not None:
-                    if args.verbose:
-                        print("Final ACC: ", acc)
-                        print("Final NMI: ", nmi)
-                        print("Final F-score: ", f1)
-                        print("Final ARI: ", ari)
+            # elif args.downstream_task == 'clustering':
+            #     if labels is not None:
+            #         if args.verbose:
+            #             print("Final ACC: ", acc)
+            #             print("Final NMI: ", nmi)
+            #             print("Final F-score: ", f1)
+            #             print("Final ARI: ", ari)
 
             # After training completes
             if args.save_model:
@@ -801,6 +801,15 @@ if __name__ == '__main__':
     parser.add_argument('-gpu', type=int, default=0)
     parser.add_argument('-verbose', type=int, default=1, 
                        help='Control verbosity: 1 to show all prints, 0 to show only final results')
+    # One Cycle Learning Rate Scheduler parameters
+    parser.add_argument('-use_one_cycle', type=int, default=0,
+                        help='Whether to use OneCycleLR scheduler (0=disabled, 1=enabled)')
+    parser.add_argument('-one_cycle_pct_start', type=float, default=0.3,
+                        help='Percentage of cycle spent increasing learning rate (default: 0.3)')
+    parser.add_argument('-one_cycle_div_factor', type=float, default=25.0,
+                        help='Initial learning rate is max_lr/div_factor (default: 25.0)')
+    parser.add_argument('-one_cycle_final_div_factor', type=float, default=10000.0,
+                        help='Final learning rate is max_lr/(div_factor*final_div_factor) (default: 10000.0)')
 
     # GCL Module - Framework
     parser.add_argument('-epochs', type=int, default=1000)
