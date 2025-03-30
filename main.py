@@ -78,6 +78,47 @@ class Experiment:
             loss = model.calc_loss(z1, z2)
 
         return loss, learned_adj
+        
+    def loss_arcface(self, model, graph_learner, features, anchor_adj, labels, args):
+        """
+        Calculate combined loss using both ArcFace loss and contrastive learning
+        
+        Args:
+            model: The GCL model
+            graph_learner: The graph learner
+            features: Input features
+            anchor_adj: Anchor adjacency matrix
+            labels: Class labels (row indices in supervised mode)
+            args: Arguments
+            
+        Returns:
+            Tuple of (loss, learned_adjacency_matrix)
+        """
+        # First calculate the original contrastive loss
+        contrastive_loss, learned_adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+        
+        # Now calculate the ArcFace loss
+        # Forward pass with labels for ArcFace
+        if not hasattr(args, 'arcface_weight'):
+            arcface_weight = 1.0  # Default weight
+        else:
+            arcface_weight = args.arcface_weight
+            
+        # For ArcFace, we need a separate forward pass to get the ArcFace outputs
+        _, _, arcface_output = model(features, learned_adj, 'learner', labels)
+        
+        # Calculate cross-entropy loss
+        criterion = nn.CrossEntropyLoss()
+        arcface_loss = criterion(arcface_output, labels)
+        
+        # Combine both losses
+        combined_loss = contrastive_loss + arcface_weight * arcface_loss
+        
+        if args.verbose and (not hasattr(args, '_loss_printed') or not args._loss_printed):
+            print(f"Combined loss: contrastive_loss={contrastive_loss.item():.4f}, arcface_loss={arcface_loss.item():.4f}, weight={arcface_weight}")
+            args._loss_printed = True
+            
+        return combined_loss, learned_adj
 
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
         model = GCN(in_channels=nfeats, hidden_channels=args.hidden_dim_cls, out_channels=nclasses, num_layers=args.nlayers_cls,
@@ -397,7 +438,13 @@ class Experiment:
                 new_adj = normalize(new_adj, 'sym', sparse)
             
             # Get embeddings for all nodes including the new one
-            _, embeddings = model(modified_features, new_adj)
+            # For ArcFace models, we don't need to pass labels during inference
+            if hasattr(model, 'use_arcface') and model.use_arcface:
+                # For ArcFace models, we still get embeddings without passing labels
+                _, embeddings = model(modified_features, new_adj)
+            else:
+                # Standard model
+                _, embeddings = model(modified_features, new_adj)
             
             # Return the embedding of the replaced point
             new_point_embedding = embeddings[replace_idx].detach()
@@ -420,6 +467,14 @@ class Experiment:
             features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj_original = load_data_fn(args)
         elif args.gsl_mode == 'structure_inference':
             features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, _ = load_data_fn(args)
+        
+        # For ArcFace, create labels as row indices if not provided
+        if args.use_arcface:
+            if labels is None:
+                if args.verbose:
+                    print("Using row indices as labels for ArcFace")
+                labels = torch.arange(features.shape[0])
+                nclasses = features.shape[0]
 
         if args.downstream_task == 'classification':
             test_accuracies = []
@@ -460,9 +515,18 @@ class Experiment:
                 graph_learner = GNN_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                      args.activation_learner, anchor_adj)
 
-            model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
-                         emb_dim=args.rep_dim, proj_dim=args.proj_dim,
-                         dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse)
+            if args.use_arcface:
+                model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
+                          emb_dim=args.rep_dim, proj_dim=args.proj_dim,
+                          dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
+                          use_arcface=True, num_classes=nclasses,
+                          arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin)
+                if args.verbose:
+                    print(f"Using ArcFace loss with {nclasses} classes, scale={args.arcface_scale}, margin={args.arcface_margin}")
+            else:
+                model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
+                          emb_dim=args.rep_dim, proj_dim=args.proj_dim,
+                          dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse)
 
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
@@ -512,7 +576,10 @@ class Experiment:
                 model.train()
                 graph_learner.train()
 
-                loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                if args.use_arcface:
+                    loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
+                else:
+                    loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
                 optimizer_cl.zero_grad()
                 optimizer_learner.zero_grad()
@@ -775,6 +842,16 @@ if __name__ == '__main__':
     # New arguments for saving model
     parser.add_argument('-save_model', type=int, default=0)
     parser.add_argument('-output_dir', type=str, default='saved_models')
+    
+    # ArcFace arguments
+    parser.add_argument('-use_arcface', type=int, default=0,
+                       help='Whether to use ArcFace loss (0=disabled, 1=enabled)')
+    parser.add_argument('-arcface_scale', type=float, default=30.0,
+                       help='Scale factor for ArcFace (s parameter)')
+    parser.add_argument('-arcface_margin', type=float, default=0.5,
+                       help='Angular margin for ArcFace (m parameter)')
+    parser.add_argument('-arcface_weight', type=float, default=1.0,
+                       help='Weight for ArcFace loss when combining with contrastive loss')
 
     args = parser.parse_args()
 

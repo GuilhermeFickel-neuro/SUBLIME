@@ -98,13 +98,26 @@ class GraphEncoder(nn.Module):
         return z, x
 
 class GCL(nn.Module):
-    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse):
+    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse,
+                 use_arcface=False, num_classes=None, arcface_scale=30.0, arcface_margin=0.5):
         super(GCL, self).__init__()
 
         self.encoder = GraphEncoder(nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse)
+        self.use_arcface = use_arcface
+        
+        # Add ArcFace layer if specified
+        if use_arcface and num_classes is not None:
+            from layers import ArcFaceLayer
+            self.arcface = ArcFaceLayer(emb_dim, num_classes, scale=arcface_scale, margin=arcface_margin)
 
-    def forward(self, x, Adj_, branch=None):
+    def forward(self, x, Adj_, branch=None, labels=None):
         z, embedding = self.encoder(x, Adj_, branch)
+        
+        # If using ArcFace and we have labels, return ArcFace outputs too
+        if self.use_arcface and hasattr(self, 'arcface') and labels is not None:
+            arcface_output = self.arcface(embedding, labels)
+            return z, embedding, arcface_output
+        
         return z, embedding
 
     @staticmethod
