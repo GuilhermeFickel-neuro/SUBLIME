@@ -653,15 +653,24 @@ class Experiment:
                           use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None)
                 
+                # If using both sampled and batched ArcFace, prioritize sampled (don't try to use both)
+                if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface and args.use_batched_arcface:
+                    if args.verbose:
+                        print("Warning: Both sampled and batched ArcFace specified. Using sampled ArcFace only.")
                 # If using batched ArcFace, replace the standard ArcFace layer with batched version
-                if args.use_batched_arcface:
-                    # Get the properties from the original ArcFace layer
-                    original_arcface = model.arcface
-                    in_features = original_arcface.in_features
-                    out_features = original_arcface.out_features
-                    scale = original_arcface.scale
-                    margin = original_arcface.margin
-                    easy_margin = original_arcface.easy_margin
+                elif args.use_batched_arcface:
+                    try:
+                        # Get the properties from the original ArcFace layer
+                        original_arcface = model.arcface
+                        in_features = original_arcface.in_features
+                        out_features = original_arcface.out_features
+                        scale = original_arcface.scale
+                        margin = original_arcface.margin
+                        easy_margin = original_arcface.easy_margin
+                    except AttributeError as e:
+                        print(f"Error accessing attributes from ArcFace layer: {e}")
+                        print("Skipping batched ArcFace initialization")
+                        continue
                     
                     # Create new batched ArcFace layer
                     batched_layer = BatchedArcFaceLayer(

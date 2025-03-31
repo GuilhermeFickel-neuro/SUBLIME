@@ -55,6 +55,11 @@ class SampledArcFaceLayer(nn.Module):
         self.weight = nn.Parameter(torch.Tensor(num_samples, in_features))
         nn.init.xavier_uniform_(self.weight)
         
+        # Compatibility attributes to match standard ArcFace interface
+        self.out_features = num_samples  # This was missing and causing the error
+        self.s = scale  # Alternative name used in some code
+        self.m = margin  # Alternative name used in some code
+        
         # Restore the random seed
         torch.manual_seed(torch.initial_seed())
         
