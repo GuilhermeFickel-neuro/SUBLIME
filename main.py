@@ -185,12 +185,19 @@ class Experiment:
         # Calculate ArcFace loss using only the sampled classes
         arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
         
+        # Ensure both losses are torch tensors before combining
+        if not isinstance(contrastive_loss, torch.Tensor):
+            contrastive_loss = torch.tensor(contrastive_loss, device=arcface_output.device, requires_grad=True)
+        if not isinstance(arcface_loss, torch.Tensor):
+            arcface_loss = torch.tensor(arcface_loss, device=arcface_output.device, requires_grad=True)
+        
         # Combine losses
         total_loss = contrastive_loss + arcface_weight * arcface_loss
         
         if args.verbose:
             print(f"Combined loss: contrastive_loss={contrastive_loss:.4f}, arcface_loss={arcface_loss:.4f}, weight={arcface_weight}")
             
+        # Make sure we return a proper tensor
         return total_loss, learned_adj
         
     def loss_arcface_batched(self, model, graph_learner, features, anchor_adj, labels, args):

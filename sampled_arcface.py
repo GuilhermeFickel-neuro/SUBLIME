@@ -143,13 +143,13 @@ def arcface_loss_with_sampling(outputs, labels):
         labels: Remapped labels for the sampled classes
         
     Returns:
-        loss: CrossEntropyLoss
+        loss: CrossEntropyLoss as a tensor with requires_grad=True
     """
     # Filter out invalid labels (-1)
     valid_mask = (labels != -1)
     
     if not torch.any(valid_mask):
-        # If no valid labels, return zero loss
+        # If no valid labels, return zero loss as a tensor
         return torch.tensor(0.0, device=outputs.device, requires_grad=True)
     
     # Only compute loss for valid samples
@@ -159,4 +159,9 @@ def arcface_loss_with_sampling(outputs, labels):
     # Apply standard cross entropy loss
     loss = F.cross_entropy(valid_outputs, valid_labels)
     
+    # Ensure we're returning a tensor, not a float
+    # This shouldn't normally be necessary, but let's be extra careful
+    if not isinstance(loss, torch.Tensor):
+        loss = torch.tensor(loss, device=outputs.device, requires_grad=True)
+        
     return loss
