@@ -180,6 +180,16 @@ def main():
                         help='Initial learning rate is max_lr/div_factor (default: 25.0)')
     parser.add_argument('-one_cycle_final_div_factor', type=float, default=10000.0,
                         help='Final learning rate is max_lr/(div_factor*final_div_factor) (default: 10000.0)')
+    
+    # ArcFace arguments
+    parser.add_argument('-use_arcface', type=int, default=0,
+                       help='Whether to use ArcFace loss (0=disabled, 1=enabled)')
+    parser.add_argument('-arcface_scale', type=float, default=30.0,
+                       help='Scale factor for ArcFace (s parameter)')
+    parser.add_argument('-arcface_margin', type=float, default=0.5,
+                       help='Angular margin for ArcFace (m parameter)')
+    parser.add_argument('-arcface_weight', type=float, default=1.0,
+                       help='Weight for ArcFace loss when combining with contrastive loss')
 
     parser.add_argument('-verbose', type=int, default=1)
     parser.add_argument('-save_model', type=int, default=1)
