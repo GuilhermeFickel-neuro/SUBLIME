@@ -165,43 +165,22 @@ class Experiment:
         # Forward pass with include_features=True to get hidden representations
         z_from_model, hidden_representations, _ = model(features, learned_adj, include_features=True)
         
-        # Get the embedding dimension and number of classes
-        in_features = hidden_representations.shape[1]
-        max_classes = labels.max().item() + 1
-        
-        # Check if we need to create a new SampledArcFaceLayer
-        if not hasattr(model, 'sampled_arcface') or model.sampled_arcface is None:
-            # Create a SampledArcFaceLayer
-            scale = args.arcface_scale if hasattr(args, 'arcface_scale') else 30.0
-            margin = args.arcface_margin if hasattr(args, 'arcface_margin') else 0.5
-            easy_margin = args.arcface_easy_margin if hasattr(args, 'arcface_easy_margin') else False
+        # Verify that we're using the correct sampled ArcFace approach
+        if not hasattr(model, 'sampled_arcface') or not model.sampled_arcface:
+            raise ValueError("Model is not using sampled ArcFace. Set use_sampled_arcface=True in args")
             
-            # Create the layer
-            model.sampled_arcface = SampledArcFaceLayer(
-                in_features=in_features,
-                max_classes=max_classes,
-                num_samples=num_samples,
-                scale=scale,
-                margin=margin,
-                easy_margin=easy_margin
-            )
+        # Verify that model.arcface is an instance of SampledArcFaceLayer
+        from sampled_arcface import SampledArcFaceLayer
+        if not isinstance(model.arcface, SampledArcFaceLayer):
+            raise ValueError("Model.arcface is not a SampledArcFaceLayer instance. Check model initialization.")
             
-            # Copy weights from original layer if possible
-            if hasattr(model, 'arcface') and model.arcface is not None:
-                # Only copy if dimensions match
-                if model.arcface.weight.shape[1] == model.sampled_arcface.weight.shape[1]:
-                    with torch.no_grad():
-                        # Copy weights for classes that exist in both
-                        common_classes = min(model.arcface.weight.shape[0], model.sampled_arcface.weight.shape[0])
-                        model.sampled_arcface.weight.data[:common_classes].copy_(
-                            model.arcface.weight.data[:common_classes]
-                        )
-            
-            if args.verbose:
-                print(f"Using Sampled ArcFace with {num_samples} classes (out of {max_classes})")
+        if args.verbose and not hasattr(args, '_sampled_arcface_printed'):
+            print(f"Using Fixed Sampled ArcFace for memory efficiency")
+            args._sampled_arcface_printed = True
         
         # Forward pass through the sampling layer
-        arcface_output, sampled_labels = model.sampled_arcface(hidden_representations, labels)
+        # Note: sampled_arcface is a boolean flag, the actual layer is still stored in model.arcface
+        arcface_output, sampled_labels = model.arcface(hidden_representations, labels)
         
         # Calculate ArcFace loss using only the sampled classes
         arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
