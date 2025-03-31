@@ -190,6 +190,16 @@ def main():
                        help='Angular margin for ArcFace (m parameter)')
     parser.add_argument('-arcface_weight', type=float, default=1.0,
                        help='Weight for ArcFace loss when combining with contrastive loss')
+    
+        # Memory optimization arguments
+    parser.add_argument('-use_batched_arcface', type=int, default=0,
+                       help='Whether to use memory-efficient batched ArcFace implementation (0=disabled, 1=enabled)')
+    parser.add_argument('-arcface_batch_size', type=int, default=1000,
+                       help='Number of classes to process in each ArcFace batch (default: 1000)')
+    parser.add_argument('-debug_memory', type=int, default=0,
+                       help='Run memory debugging before training (0=disabled, 1=enabled)')
+    parser.add_argument('-max_debug_samples', type=int, default=10000,
+                       help='Maximum samples to use for memory debugging (default: 10000)')
 
     parser.add_argument('-verbose', type=int, default=1)
     parser.add_argument('-save_model', type=int, default=1)
