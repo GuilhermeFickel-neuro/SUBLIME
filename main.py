@@ -19,6 +19,11 @@ from data_loader import load_data
 import random
 import os
 
+# Import memory debugging utilities
+from memory_debug import profile_arcface_memory, analyze_forward_pass, measure_arcface_memory_usage
+# Import batched ArcFace functionality
+from batched_arcface import BatchedArcFaceLayer, batched_arcface_loss
+
 EOS = 1e-10
 
 class Experiment:
@@ -94,6 +99,11 @@ class Experiment:
         Returns:
             Tuple of (loss, learned_adjacency_matrix)
         """
+        # Check if we should use the batched version
+        if hasattr(args, 'use_batched_arcface') and args.use_batched_arcface:
+            # Use the memory-efficient batched implementation
+            return self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
+            
         # First calculate the original contrastive loss
         contrastive_loss, learned_adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
         
@@ -119,6 +129,24 @@ class Experiment:
             args._loss_printed = True
             
         return combined_loss, learned_adj
+        
+    def loss_arcface_batched(self, model, graph_learner, features, anchor_adj, labels, args):
+        """
+        Memory-efficient version of ArcFace loss that processes data in batches
+        
+        Args:
+            model: The GCL model
+            graph_learner: The graph learner
+            features: Input features
+            anchor_adj: Anchor adjacency matrix
+            labels: Class labels (row indices in supervised mode)
+            args: Arguments
+            
+        Returns:
+            Tuple of (loss, learned_adjacency_matrix)
+        """
+        # Import the batched implementation from batched_arcface.py
+        return batched_arcface_loss(self, model, graph_learner, features, anchor_adj, labels, args)
 
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
         model = GCN(in_channels=nfeats, hidden_channels=args.hidden_dim_cls, out_channels=nclasses, num_layers=args.nlayers_cls,
@@ -475,6 +503,16 @@ class Experiment:
                     print("Using row indices as labels for ArcFace")
                 labels = torch.arange(features.shape[0])
                 nclasses = features.shape[0]
+               
+            # Run memory profiling if requested
+            if args.debug_memory:
+                if args.verbose:
+                    print("\n=== Memory Profiling for ArcFace ===")
+                    # Estimate memory usage
+                    batch_size = features.shape[0]  # Full batch size
+                    emb_dim = args.rep_dim  # Embedding dimension
+                    profile_arcface_memory(batch_size, emb_dim, nclasses)
+                    print("===================================\n")
 
         if args.downstream_task == 'classification':
             test_accuracies = []
@@ -521,8 +559,56 @@ class Experiment:
                           dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
                           use_arcface=True, num_classes=nclasses,
                           arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin)
+                
+                # If using batched ArcFace, replace the standard ArcFace layer with batched version
+                if args.use_batched_arcface:
+                    # Get the properties from the original ArcFace layer
+                    original_arcface = model.arcface
+                    in_features = original_arcface.in_features
+                    out_features = original_arcface.out_features
+                    scale = original_arcface.scale
+                    margin = original_arcface.margin
+                    easy_margin = original_arcface.easy_margin
+                    
+                    # Create new batched ArcFace layer
+                    batched_layer = BatchedArcFaceLayer(
+                        in_features=in_features,
+                        out_features=out_features,
+                        scale=scale,
+                        margin=margin,
+                        easy_margin=easy_margin,
+                        batch_size=args.arcface_batch_size
+                    )
+                    
+                    # Copy weights from original layer (important for fine-tuning)
+                    batched_layer.weight.data.copy_(original_arcface.weight.data)
+                    
+                    # Replace the layer
+                    model.arcface = batched_layer
+                    
+                    if args.verbose:
+                        print(f"Using Batched ArcFace implementation with batch size {args.arcface_batch_size}")
+                
                 if args.verbose:
                     print(f"Using ArcFace loss with {nclasses} classes, scale={args.arcface_scale}, margin={args.arcface_margin}")
+                    
+                # Run memory debugging for model if requested
+                if args.debug_memory:
+                    # Move to GPU if needed
+                    model = model.to(self.device)
+                    features_gpu = features.to(self.device)
+                    labels_gpu = labels.to(self.device)
+                    
+                    if args.verbose:
+                        print("\n=== ArcFace Forward Pass Memory Analysis ===")
+                        result = analyze_forward_pass(
+                            model,
+                            features_gpu,
+                            anchor_adj,
+                            labels_gpu,
+                            max_samples=args.max_debug_samples
+                        )
+                        print("==========================================\n")
             else:
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
                           emb_dim=args.rep_dim, proj_dim=args.proj_dim,
@@ -861,6 +947,16 @@ if __name__ == '__main__':
                        help='Angular margin for ArcFace (m parameter)')
     parser.add_argument('-arcface_weight', type=float, default=1.0,
                        help='Weight for ArcFace loss when combining with contrastive loss')
+    
+    # Memory optimization arguments
+    parser.add_argument('-use_batched_arcface', type=int, default=0,
+                       help='Whether to use memory-efficient batched ArcFace implementation (0=disabled, 1=enabled)')
+    parser.add_argument('-arcface_batch_size', type=int, default=1000,
+                       help='Number of classes to process in each ArcFace batch (default: 1000)')
+    parser.add_argument('-debug_memory', type=int, default=0,
+                       help='Run memory debugging before training (0=disabled, 1=enabled)')
+    parser.add_argument('-max_debug_samples', type=int, default=10000,
+                       help='Maximum samples to use for memory debugging (default: 10000)')
 
     args = parser.parse_args()
 
