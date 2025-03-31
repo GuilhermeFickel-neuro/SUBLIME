@@ -595,15 +595,20 @@ class Experiment:
                 else:
                     nclasses = features.shape[0]
                
-            # Run memory profiling if requested
+            # Run memory profiling if requested and not using sampled ArcFace
+            # (memory debugging doesn't work well with sampled ArcFace due to subgraph issues)
             if args.debug_memory:
-                if args.verbose:
-                    print("\n=== Memory Profiling for ArcFace ===")
-                    # Estimate memory usage
-                    batch_size = features.shape[0]  # Full batch size
-                    emb_dim = args.rep_dim  # Embedding dimension
-                    profile_arcface_memory(batch_size, emb_dim, nclasses)
-                    print("===================================\n")
+                if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
+                    if args.verbose:
+                        print("\nSkipping memory debugging when using sampled ArcFace\n")
+                else:
+                    if args.verbose:
+                        print("\n=== Memory Profiling for ArcFace ===")
+                        # Estimate memory usage
+                        batch_size = features.shape[0]  # Full batch size
+                        emb_dim = args.rep_dim  # Embedding dimension
+                        profile_arcface_memory(batch_size, emb_dim, nclasses)
+                        print("===================================\n")
 
         if args.downstream_task == 'classification':
             test_accuracies = []
@@ -696,21 +701,27 @@ class Experiment:
                     
                 # Run memory debugging for model if requested
                 if args.debug_memory:
-                    # Move to GPU if needed
-                    model = model.to(self.device)
-                    features_gpu = features.to(self.device)
-                    labels_gpu = labels.to(self.device)
-                    
-                    if args.verbose:
-                        print("\n=== ArcFace Forward Pass Memory Analysis ===")
-                        result = analyze_forward_pass(
-                            model,
-                            features_gpu,
-                            anchor_adj,
-                            labels_gpu,
-                            max_samples=args.max_debug_samples
-                        )
-                        print("==========================================\n")
+                    # Skip memory debugging for sampled ArcFace due to subgraph issues
+                    if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
+                        if args.verbose:
+                            print("\nSkipping ArcFace forward pass memory analysis when using sampled ArcFace")
+                            print("(This is due to subgraph size mismatches that occur during testing)")
+                    else:
+                        # Move to GPU if needed
+                        model = model.to(self.device)
+                        features_gpu = features.to(self.device)
+                        labels_gpu = labels.to(self.device)
+                        
+                        if args.verbose:
+                            print("\n=== ArcFace Forward Pass Memory Analysis ===")
+                            result = analyze_forward_pass(
+                                model,
+                                features_gpu,
+                                anchor_adj,
+                                labels_gpu,
+                                max_samples=args.max_debug_samples
+                            )
+                            print("==========================================\n")
             else:
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
                           emb_dim=args.rep_dim, proj_dim=args.proj_dim,
