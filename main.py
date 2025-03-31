@@ -662,13 +662,14 @@ class Experiment:
                 best_val_test = 0
                 best_epoch = 0
 
-            # Initialize mixed precision if requested
+            # Mixed precision training is disabled by default to avoid type mismatch issues
+            # with the graph learner's KNN function
             scaler = None
             if hasattr(args, 'use_mixed_precision') and args.use_mixed_precision:
                 from torch.cuda.amp import GradScaler
                 scaler = GradScaler()
                 if args.verbose:
-                    print("Using mixed precision training")
+                    print("Using mixed precision training (WARNING: may cause type mismatch in KNN)")
             
             # Initialize gradient accumulation steps
             grad_accumulation_steps = args.grad_accumulation_steps if hasattr(args, 'grad_accumulation_steps') else 1
