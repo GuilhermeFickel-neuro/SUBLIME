@@ -1,6 +1,8 @@
 import argparse
 import copy
 from datetime import datetime
+import math
+import contextlib
 
 from tqdm import tqdm
 import numpy as np
@@ -23,6 +25,8 @@ import os
 from memory_debug import profile_arcface_memory, analyze_forward_pass, measure_arcface_memory_usage
 # Import batched ArcFace functionality
 from batched_arcface import BatchedArcFaceLayer, batched_arcface_loss
+# Import memory optimization utilities
+from memory_optimizations import train_with_memory_optimization, GradientAccumulation, enable_mixed_precision
 
 EOS = 1e-10
 
@@ -658,20 +662,92 @@ class Experiment:
                 best_val_test = 0
                 best_epoch = 0
 
+            # Initialize mixed precision if requested
+            scaler = None
+            if hasattr(args, 'use_mixed_precision') and args.use_mixed_precision:
+                from torch.cuda.amp import GradScaler
+                scaler = GradScaler()
+                if args.verbose:
+                    print("Using mixed precision training")
+            
+            # Initialize gradient accumulation steps
+            grad_accumulation_steps = args.grad_accumulation_steps if hasattr(args, 'grad_accumulation_steps') else 1
+            if grad_accumulation_steps > 1 and args.verbose:
+                print(f"Using gradient accumulation with {grad_accumulation_steps} steps")
+                
             for epoch in tqdm(range(1, args.epochs + 1), desc="Training", total=args.epochs):
                 model.train()
                 graph_learner.train()
-
-                if args.use_arcface:
-                    loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
+                
+                # Check if we should use memory-efficient training
+                if hasattr(args, 'memory_efficient_training') and args.memory_efficient_training:
+                    # Use our memory-efficient training function
+                    loss, Adj = train_with_memory_optimization(
+                        self, model, graph_learner, features, anchor_adj,
+                        labels, args, optimizer_cl, optimizer_learner
+                    )
+                elif grad_accumulation_steps > 1:
+                    # Use gradient accumulation
+                    accumulated_loss = 0
+                    optimizer_cl.zero_grad()
+                    optimizer_learner.zero_grad()
+                    
+                    for i in range(grad_accumulation_steps):
+                        # Forward pass
+                        if args.use_arcface:
+                            with torch.cuda.amp.autocast() if scaler else contextlib.nullcontext():
+                                mini_loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
+                                mini_loss = mini_loss / grad_accumulation_steps  # Scale loss
+                        else:
+                            with torch.cuda.amp.autocast() if scaler else contextlib.nullcontext():
+                                mini_loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                                mini_loss = mini_loss / grad_accumulation_steps  # Scale loss
+                        
+                        # Backward pass with scaling if using mixed precision
+                        if scaler:
+                            scaler.scale(mini_loss).backward()
+                        else:
+                            mini_loss.backward()
+                            
+                        accumulated_loss += mini_loss.item()
+                    
+                    # Update weights
+                    if scaler:
+                        scaler.step(optimizer_cl)
+                        scaler.step(optimizer_learner)
+                        scaler.update()
+                    else:
+                        optimizer_cl.step()
+                        optimizer_learner.step()
+                    
+                    loss = accumulated_loss
+                elif scaler:  # Mixed precision without gradient accumulation
+                    # Forward pass with mixed precision
+                    with torch.cuda.amp.autocast():
+                        if args.use_arcface:
+                            loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
+                        else:
+                            loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                    
+                    # Backward and optimize with scaling
+                    optimizer_cl.zero_grad()
+                    optimizer_learner.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer_cl)
+                    scaler.step(optimizer_learner)
+                    scaler.update()
                 else:
-                    loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                    # Original training code path
+                    if args.use_arcface:
+                        loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
+                    else:
+                        loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
-                optimizer_cl.zero_grad()
-                optimizer_learner.zero_grad()
-                loss.backward()
-                optimizer_cl.step()
-                optimizer_learner.step()
+                    optimizer_cl.zero_grad()
+                    optimizer_learner.zero_grad()
+                    loss.backward()
+                    optimizer_cl.step()
+                    optimizer_learner.step()
                 
                 # Step the schedulers if using OneCycleLR
                 if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
@@ -957,6 +1033,14 @@ if __name__ == '__main__':
                        help='Run memory debugging before training (0=disabled, 1=enabled)')
     parser.add_argument('-max_debug_samples', type=int, default=10000,
                        help='Maximum samples to use for memory debugging (default: 10000)')
+    
+    parser.add_argument('-use_mixed_precision', type=int, default=0,
+                       help='Use mixed precision training (FP16) to reduce memory usage (0=disabled, 1=enabled)')
+    parser.add_argument('-grad_accumulation_steps', type=int, default=1,
+                       help='Number of steps to accumulate gradients before updating weights (1=disabled)')
+    parser.add_argument('-memory_efficient_training', type=int, default=0,
+                       help='Use memory-efficient training with gradient accumulation and chunked processing (0=disabled, 1=enabled)')
+
 
     args = parser.parse_args()
 
