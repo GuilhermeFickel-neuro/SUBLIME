@@ -99,23 +99,47 @@ class GraphEncoder(nn.Module):
 
 class GCL(nn.Module):
     def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse,
-                 use_arcface=False, num_classes=None, arcface_scale=30.0, arcface_margin=0.5):
+                 use_arcface=False, num_classes=None, arcface_scale=30.0, arcface_margin=0.5,
+                 use_sampled_arcface=False, arcface_num_samples=None):
         super(GCL, self).__init__()
 
         self.encoder = GraphEncoder(nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse)
         self.use_arcface = use_arcface
+        self.use_sampled_arcface = use_sampled_arcface
         
         # Add ArcFace layer if specified
         if use_arcface and num_classes is not None:
-            from layers import ArcFaceLayer
-            self.arcface = ArcFaceLayer(emb_dim, num_classes, scale=arcface_scale, margin=arcface_margin)
+            if use_sampled_arcface and arcface_num_samples is not None:
+                # Use the memory-efficient sampled ArcFace implementation
+                from sampled_arcface import SampledArcFaceLayer
+                self.sampled_arcface = True
+                self.arcface = SampledArcFaceLayer(
+                    in_features=emb_dim,
+                    max_classes=num_classes,
+                    num_samples=arcface_num_samples,
+                    scale=arcface_scale,
+                    margin=arcface_margin
+                )
+                print(f"Using Fixed Sampled ArcFace with {arcface_num_samples}/{num_classes} classes")
+            else:
+                # Use the standard ArcFace implementation
+                from layers import ArcFaceLayer
+                self.sampled_arcface = False
+                self.arcface = ArcFaceLayer(emb_dim, num_classes, scale=arcface_scale, margin=arcface_margin)
 
-    def forward(self, x, Adj_, branch=None, labels=None):
+    def forward(self, x, Adj_, branch=None, labels=None, include_features=False):
         z, embedding = self.encoder(x, Adj_, branch)
+        
+        # Return hidden features if requested (for use in loss functions)
+        if include_features:
+            return z, embedding, None
         
         # If using ArcFace and we have labels, return ArcFace outputs too
         if self.use_arcface and hasattr(self, 'arcface') and labels is not None:
-            arcface_output = self.arcface(embedding, labels)
+            if hasattr(self, 'sampled_arcface') and self.sampled_arcface:
+                arcface_output, _ = self.arcface(embedding, labels)
+            else:
+                arcface_output = self.arcface(embedding, labels)
             return z, embedding, arcface_output
         
         return z, embedding

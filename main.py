@@ -586,7 +586,14 @@ class Experiment:
                 if args.verbose:
                     print("Using row indices as labels for ArcFace")
                 labels = torch.arange(features.shape[0])
-                nclasses = features.shape[0]
+                
+                # When using sampled ArcFace, limit the number of classes
+                if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface and hasattr(args, 'arcface_num_samples'):
+                    nclasses = args.arcface_num_samples
+                    if args.verbose:
+                        print(f"Using sampled ArcFace with {nclasses} classes instead of {features.shape[0]}")
+                else:
+                    nclasses = features.shape[0]
                
             # Run memory profiling if requested
             if args.debug_memory:
@@ -642,7 +649,9 @@ class Experiment:
                           emb_dim=args.rep_dim, proj_dim=args.proj_dim,
                           dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
                           use_arcface=True, num_classes=nclasses,
-                          arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin)
+                          arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
+                          use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
+                          arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None)
                 
                 # If using batched ArcFace, replace the standard ArcFace layer with batched version
                 if args.use_batched_arcface:
