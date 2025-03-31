@@ -191,11 +191,19 @@ def main():
     parser.add_argument('-arcface_weight', type=float, default=1.0,
                        help='Weight for ArcFace loss when combining with contrastive loss')
     
-        # Memory optimization arguments
+    # Memory optimization arguments
     parser.add_argument('-use_batched_arcface', type=int, default=0,
                        help='Whether to use memory-efficient batched ArcFace implementation (0=disabled, 1=enabled)')
     parser.add_argument('-arcface_batch_size', type=int, default=1000,
                        help='Number of classes to process in each ArcFace batch (default: 1000)')
+    parser.add_argument('-use_sampled_arcface', type=int, default=0,
+                       help='Whether to use ultra memory-efficient sampled ArcFace (0=disabled, 1=enabled)')
+    parser.add_argument('-arcface_num_samples', type=int, default=5000,
+                       help='Number of classes to sample in sampled ArcFace (default: 5000)')
+    parser.add_argument('-memory_efficient_training', type=int, default=0,
+                       help='Whether to use memory-efficient training with gradient accumulation (0=disabled, 1=enabled)')
+    parser.add_argument('-grad_accumulation_steps', type=int, default=8,
+                       help='Number of gradient accumulation steps (default: 8)')
     parser.add_argument('-debug_memory', type=int, default=0,
                        help='Run memory debugging before training (0=disabled, 1=enabled)')
     parser.add_argument('-max_debug_samples', type=int, default=10000,

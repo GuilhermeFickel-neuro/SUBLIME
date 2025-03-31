@@ -27,6 +27,8 @@ from memory_debug import profile_arcface_memory, analyze_forward_pass, measure_a
 from batched_arcface import BatchedArcFaceLayer, batched_arcface_loss
 # Import memory optimization utilities
 from memory_optimizations import train_with_memory_optimization, GradientAccumulation, enable_mixed_precision
+# Import sampled ArcFace functionality
+from sampled_arcface import SampledArcFaceLayer, arcface_loss_with_sampling
 
 EOS = 1e-10
 
@@ -103,8 +105,12 @@ class Experiment:
         Returns:
             Tuple of (loss, learned_adjacency_matrix)
         """
+        # Check if we should use the sampled version (highest memory savings)
+        if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
+            # Use the most memory-efficient implementation with class sampling
+            return self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
         # Check if we should use the batched version
-        if hasattr(args, 'use_batched_arcface') and args.use_batched_arcface:
+        elif hasattr(args, 'use_batched_arcface') and args.use_batched_arcface:
             # Use the memory-efficient batched implementation
             return self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
             
@@ -133,6 +139,80 @@ class Experiment:
             args._loss_printed = True
             
         return combined_loss, learned_adj
+    
+    def loss_arcface_sampled(self, model, graph_learner, features, anchor_adj, labels, args):
+        """
+        Most memory-efficient implementation of ArcFace loss using class sampling
+        
+        This implementation only computes ArcFace loss for a sample of classes
+        (e.g., 5,000 classes instead of all 35,000), drastically reducing memory usage.
+        """
+        # First calculate the original contrastive loss
+        contrastive_loss, learned_adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+        
+        # Get weight for ArcFace loss
+        if not hasattr(args, 'arcface_weight'):
+            arcface_weight = 1.0  # Default weight
+        else:
+            arcface_weight = args.arcface_weight
+            
+        # Get number of classes to sample
+        if hasattr(args, 'arcface_num_samples'):
+            num_samples = args.arcface_num_samples
+        else:
+            num_samples = min(5000, len(labels))  # Default to 5000 or total classes if less
+            
+        # Forward pass with include_features=True to get hidden representations
+        z_from_model, hidden_representations, _ = model(features, learned_adj, include_features=True)
+        
+        # Get the embedding dimension and number of classes
+        in_features = hidden_representations.shape[1]
+        max_classes = labels.max().item() + 1
+        
+        # Check if we need to create a new SampledArcFaceLayer
+        if not hasattr(model, 'sampled_arcface') or model.sampled_arcface is None:
+            # Create a SampledArcFaceLayer
+            scale = args.arcface_scale if hasattr(args, 'arcface_scale') else 30.0
+            margin = args.arcface_margin if hasattr(args, 'arcface_margin') else 0.5
+            easy_margin = args.arcface_easy_margin if hasattr(args, 'arcface_easy_margin') else False
+            
+            # Create the layer
+            model.sampled_arcface = SampledArcFaceLayer(
+                in_features=in_features,
+                max_classes=max_classes,
+                num_samples=num_samples,
+                scale=scale,
+                margin=margin,
+                easy_margin=easy_margin
+            )
+            
+            # Copy weights from original layer if possible
+            if hasattr(model, 'arcface') and model.arcface is not None:
+                # Only copy if dimensions match
+                if model.arcface.weight.shape[1] == model.sampled_arcface.weight.shape[1]:
+                    with torch.no_grad():
+                        # Copy weights for classes that exist in both
+                        common_classes = min(model.arcface.weight.shape[0], model.sampled_arcface.weight.shape[0])
+                        model.sampled_arcface.weight.data[:common_classes].copy_(
+                            model.arcface.weight.data[:common_classes]
+                        )
+            
+            if args.verbose:
+                print(f"Using Sampled ArcFace with {num_samples} classes (out of {max_classes})")
+        
+        # Forward pass through the sampling layer
+        arcface_output, sampled_labels = model.sampled_arcface(hidden_representations, labels)
+        
+        # Calculate ArcFace loss using only the sampled classes
+        arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
+        
+        # Combine losses
+        total_loss = contrastive_loss + arcface_weight * arcface_loss
+        
+        if args.verbose:
+            print(f"Combined loss: contrastive_loss={contrastive_loss:.4f}, arcface_loss={arcface_loss:.4f}, weight={arcface_weight}")
+            
+        return total_loss, learned_adj
         
     def loss_arcface_batched(self, model, graph_learner, features, anchor_adj, labels, args):
         """
