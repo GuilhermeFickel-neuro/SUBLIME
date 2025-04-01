@@ -7,6 +7,8 @@ import joblib
 from tqdm import tqdm
 import optuna
 from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -203,7 +205,7 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
 
 def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, preprocessor=None, n_trials=50):
     """
-    Train XGBoost classifiers on two different feature sets and compare performance
+    Train XGBoost, CatBoost and LightGBM classifiers on two different feature sets and compare performance
     
     Args:
         dataset_features: Preprocessed dataset features
@@ -231,9 +233,8 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         dataset_features, sublime_embeddings, concat_features, y, 
         test_size=0.3, random_state=42, stratify=y
     )
-    
-    # Define Optuna objective for dataset features - optimize for AUC-ROC
-    def dataset_objective(trial):
+    # Define Optuna objective for dataset features - XGBoost
+    def xgb_dataset_objective(trial):
         param = {
             'n_estimators': trial.suggest_int('n_estimators', 50, 500),
             'max_depth': trial.suggest_int('max_depth', 3, 10),
@@ -242,6 +243,8 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
             'gamma': trial.suggest_float('gamma', 0, 5),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1, 10),
             'random_state': 42
         }
         model = XGBClassifier(**param)
@@ -250,8 +253,8 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         preds_proba = model.predict_proba(X_val)[:, 1]
         return roc_auc_score(y_val, preds_proba)
     
-    # Define Optuna objective for concatenated features - optimize for AUC-ROC
-    def concat_objective(trial):
+    # Define Optuna objective for concatenated features - XGBoost
+    def xgb_concat_objective(trial):
         param = {
             'n_estimators': trial.suggest_int('n_estimators', 50, 500),
             'max_depth': trial.suggest_int('max_depth', 3, 10),
@@ -260,6 +263,8 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
             'gamma': trial.suggest_float('gamma', 0, 5),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1, 10),
             'random_state': 42
         }
         model = XGBClassifier(**param)
@@ -267,75 +272,344 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         # Use predict_proba to get probability scores for AUC calculation
         preds_proba = model.predict_proba(concat_val)[:, 1]
         return roc_auc_score(y_val, preds_proba)
+        
+    # Define Optuna objective for dataset features - CatBoost
+    def cat_dataset_objective(trial):
+        param = {
+            'iterations': trial.suggest_int('iterations', 50, 500),
+            'depth': trial.suggest_int('depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
+            'random_strength': trial.suggest_float('random_strength', 0, 10),
+            'bagging_temperature': trial.suggest_float('bagging_temperature', 0, 10),
+            'random_seed': 42,
+            'verbose': False
+        }
+        model = CatBoostClassifier(**param)
+        model.fit(X_train, y_train, verbose=False)
+        preds_proba = model.predict_proba(X_val)[:, 1]
+        return roc_auc_score(y_val, preds_proba)
     
-    # Tune hyperparameters for dataset features
-    print("\nOptimizing model for dataset features (using AUC-ROC)...")
-    study_dataset = optuna.create_study(direction='maximize')
-    study_dataset.optimize(dataset_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    # Define Optuna objective for concatenated features - CatBoost
+    def cat_concat_objective(trial):
+        param = {
+            'iterations': trial.suggest_int('iterations', 50, 500),
+            'depth': trial.suggest_int('depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
+            'random_strength': trial.suggest_float('random_strength', 0, 10),
+            'bagging_temperature': trial.suggest_float('bagging_temperature', 0, 10),
+            'random_seed': 42,
+            'verbose': False
+        }
+        model = CatBoostClassifier(**param)
+        model.fit(concat_train, y_train, verbose=False)
+        preds_proba = model.predict_proba(concat_val)[:, 1]
+        return roc_auc_score(y_val, preds_proba)
+        
+    # Define Optuna objective for dataset features - LightGBM
+    def lgbm_dataset_objective(trial):
+        param = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0, 10),
+            'random_state': 42
+        }
+        model = LGBMClassifier(**param)
+        model.fit(X_train, y_train)
+        preds_proba = model.predict_proba(X_val)[:, 1]
+        return roc_auc_score(y_val, preds_proba)
     
-    best_params_dataset = study_dataset.best_params
+    # Define Optuna objective for concatenated features - LightGBM
+    def lgbm_concat_objective(trial):
+        param = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 0, 10),
+            'random_state': 42
+        }
+        model = LGBMClassifier(**param)
+        model.fit(concat_train, y_train)
+        preds_proba = model.predict_proba(concat_val)[:, 1]
+        return roc_auc_score(y_val, preds_proba)
+        return roc_auc_score(y_val, preds_proba)
+    
+    # Dictionary to store results for all models
+    model_results = {}
+    
+    # Train and evaluate XGBoost models
+    print("\n" + "="*50)
+    print("XGBoost Models")
+    print("="*50)
+    
+    # Tune hyperparameters for dataset features - XGBoost
+    print("\nOptimizing XGBoost for dataset features (using AUC-ROC)...")
+    study_xgb_dataset = optuna.create_study(direction='maximize')
+    study_xgb_dataset.optimize(xgb_dataset_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    
+    best_params_xgb_dataset = study_xgb_dataset.best_params
     
     # Train XGBoost on dataset features with tuned hyperparameters
-    print("\nTraining model on dataset features with best hyperparameters...")
-    dataset_clf = XGBClassifier(**best_params_dataset)
-    dataset_clf.fit(X_train, y_train)
+    print("\nTraining XGBoost on dataset features with best hyperparameters...")
+    xgb_dataset_clf = XGBClassifier(**best_params_xgb_dataset)
+    xgb_dataset_clf.fit(X_train, y_train)
     
-    # Evaluate on dataset features
-    dataset_preds = dataset_clf.predict(X_val)
-    dataset_preds_proba = dataset_clf.predict_proba(X_val)[:, 1]
-    dataset_acc = accuracy_score(y_val, dataset_preds)
-    dataset_auc = roc_auc_score(y_val, dataset_preds_proba)
+    # Evaluate XGBoost on dataset features
+    xgb_dataset_preds = xgb_dataset_clf.predict(X_val)
+    xgb_dataset_preds_proba = xgb_dataset_clf.predict_proba(X_val)[:, 1]
+    xgb_dataset_acc = accuracy_score(y_val, xgb_dataset_preds)
+    xgb_dataset_auc = roc_auc_score(y_val, xgb_dataset_preds_proba)
     
-    # Calculate KS statistic for dataset features model
-    fpr_dataset, tpr_dataset, thresholds_dataset = roc_curve(y_val, dataset_preds_proba)
-    ks_dataset = max(tpr_dataset - fpr_dataset)
+    # Calculate KS statistic for XGBoost dataset features model
+    fpr_xgb_dataset, tpr_xgb_dataset, _ = roc_curve(y_val, xgb_dataset_preds_proba)
+    ks_xgb_dataset = max(tpr_xgb_dataset - fpr_xgb_dataset)
     
-    print(f"Dataset features accuracy: {dataset_acc:.4f}")
-    print(f"Dataset features AUC-ROC: {dataset_auc:.4f}")
-    print(f"Dataset features KS statistic: {ks_dataset:.4f}")
-    print(classification_report(y_val, dataset_preds))
+    print(f"XGBoost - Dataset features accuracy: {xgb_dataset_acc:.4f}")
+    print(f"XGBoost - Dataset features AUC-ROC: {xgb_dataset_auc:.4f}")
+    print(f"XGBoost - Dataset features KS statistic: {ks_xgb_dataset:.4f}")
+    print(classification_report(y_val, xgb_dataset_preds))
     
-    # Tune hyperparameters for concatenated features
-    print("\nOptimizing model for concatenated features (using AUC-ROC)...")
-    study_concat = optuna.create_study(direction='maximize')
-    study_concat.optimize(concat_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    # Tune hyperparameters for concatenated features - XGBoost
+    print("\nOptimizing XGBoost for concatenated features (using AUC-ROC)...")
+    study_xgb_concat = optuna.create_study(direction='maximize')
+    study_xgb_concat.optimize(xgb_concat_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
     
-    best_params_concat = study_concat.best_params
+    best_params_xgb_concat = study_xgb_concat.best_params
     
     # Train XGBoost on concatenated features with tuned hyperparameters
-    print("\nTraining model on concatenated features with best hyperparameters...")
-    concat_clf = XGBClassifier(**best_params_concat)
-    concat_clf.fit(concat_train, y_train)
+    print("\nTraining XGBoost on concatenated features with best hyperparameters...")
+    xgb_concat_clf = XGBClassifier(**best_params_xgb_concat)
+    xgb_concat_clf.fit(concat_train, y_train)
     
-    # Evaluate on concatenated features
-    concat_preds = concat_clf.predict(concat_val)
-    concat_preds_proba = concat_clf.predict_proba(concat_val)[:, 1]
-    concat_acc = accuracy_score(y_val, concat_preds)
-    concat_auc = roc_auc_score(y_val, concat_preds_proba)
+    # Evaluate XGBoost on concatenated features
+    xgb_concat_preds = xgb_concat_clf.predict(concat_val)
+    xgb_concat_preds_proba = xgb_concat_clf.predict_proba(concat_val)[:, 1]
+    xgb_concat_acc = accuracy_score(y_val, xgb_concat_preds)
+    xgb_concat_auc = roc_auc_score(y_val, xgb_concat_preds_proba)
     
-    # Calculate KS statistic for concatenated features model
-    fpr_concat, tpr_concat, thresholds_concat = roc_curve(y_val, concat_preds_proba)
-    ks_concat = max(tpr_concat - fpr_concat)
+    # Calculate KS statistic for XGBoost concatenated features model
+    fpr_xgb_concat, tpr_xgb_concat, _ = roc_curve(y_val, xgb_concat_preds_proba)
+    ks_xgb_concat = max(tpr_xgb_concat - fpr_xgb_concat)
     
-    print(f"Concatenated features accuracy: {concat_acc:.4f}")
-    print(f"Concatenated features AUC-ROC: {concat_auc:.4f}")
-    print(f"Concatenated features KS statistic: {ks_concat:.4f}")
-    print(classification_report(y_val, concat_preds))
+    print(f"XGBoost - Concatenated features accuracy: {xgb_concat_acc:.4f}")
+    print(f"XGBoost - Concatenated features AUC-ROC: {xgb_concat_auc:.4f}")
+    print(f"XGBoost - Concatenated features KS statistic: {ks_xgb_concat:.4f}")
+    print(classification_report(y_val, xgb_concat_preds))
+    
+    # Store XGBoost results
+    model_results['xgboost'] = {
+        'dataset_acc': xgb_dataset_acc,
+        'dataset_auc': xgb_dataset_auc,
+        'dataset_ks': ks_xgb_dataset,
+        'concat_acc': xgb_concat_acc,
+        'concat_auc': xgb_concat_auc,
+        'concat_ks': ks_xgb_concat,
+        'improvement_acc': xgb_concat_acc - xgb_dataset_acc,
+        'improvement_auc': xgb_concat_auc - xgb_dataset_auc,
+        'improvement_ks': ks_xgb_concat - ks_xgb_dataset,
+        'best_params_dataset': best_params_xgb_dataset,
+        'best_params_concat': best_params_xgb_concat,
+        'fpr_dataset': fpr_xgb_dataset,
+        'tpr_dataset': tpr_xgb_dataset,
+        'fpr_concat': fpr_xgb_concat,
+        'tpr_concat': tpr_xgb_concat
+    }
+    
+    # Train and evaluate CatBoost models
+    print("\n" + "="*50)
+    print("CatBoost Models")
+    print("="*50)
+    
+    # Tune hyperparameters for dataset features - CatBoost
+    print("\nOptimizing CatBoost for dataset features (using AUC-ROC)...")
+    study_cat_dataset = optuna.create_study(direction='maximize')
+    study_cat_dataset.optimize(cat_dataset_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    
+    best_params_cat_dataset = study_cat_dataset.best_params
+    
+    # Train CatBoost on dataset features with tuned hyperparameters
+    print("\nTraining CatBoost on dataset features with best hyperparameters...")
+    cat_dataset_clf = CatBoostClassifier(**best_params_cat_dataset)
+    cat_dataset_clf.fit(X_train, y_train, verbose=False)
+    
+    # Evaluate CatBoost on dataset features
+    cat_dataset_preds = cat_dataset_clf.predict(X_val)
+    cat_dataset_preds_proba = cat_dataset_clf.predict_proba(X_val)[:, 1]
+    cat_dataset_acc = accuracy_score(y_val, cat_dataset_preds)
+    cat_dataset_auc = roc_auc_score(y_val, cat_dataset_preds_proba)
+    
+    # Calculate KS statistic for CatBoost dataset features model
+    fpr_cat_dataset, tpr_cat_dataset, _ = roc_curve(y_val, cat_dataset_preds_proba)
+    ks_cat_dataset = max(tpr_cat_dataset - fpr_cat_dataset)
+    
+    print(f"CatBoost - Dataset features accuracy: {cat_dataset_acc:.4f}")
+    print(f"CatBoost - Dataset features AUC-ROC: {cat_dataset_auc:.4f}")
+    print(f"CatBoost - Dataset features KS statistic: {ks_cat_dataset:.4f}")
+    print(classification_report(y_val, cat_dataset_preds))
+    
+    # Tune hyperparameters for concatenated features - CatBoost
+    print("\nOptimizing CatBoost for concatenated features (using AUC-ROC)...")
+    study_cat_concat = optuna.create_study(direction='maximize')
+    study_cat_concat.optimize(cat_concat_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    
+    best_params_cat_concat = study_cat_concat.best_params
+    
+    # Train CatBoost on concatenated features with tuned hyperparameters
+    print("\nTraining CatBoost on concatenated features with best hyperparameters...")
+    cat_concat_clf = CatBoostClassifier(**best_params_cat_concat)
+    cat_concat_clf.fit(concat_train, y_train, verbose=False)
+    
+    # Evaluate CatBoost on concatenated features
+    cat_concat_preds = cat_concat_clf.predict(concat_val)
+    cat_concat_preds_proba = cat_concat_clf.predict_proba(concat_val)[:, 1]
+    cat_concat_acc = accuracy_score(y_val, cat_concat_preds)
+    cat_concat_auc = roc_auc_score(y_val, cat_concat_preds_proba)
+    
+    # Calculate KS statistic for CatBoost concatenated features model
+    fpr_cat_concat, tpr_cat_concat, _ = roc_curve(y_val, cat_concat_preds_proba)
+    ks_cat_concat = max(tpr_cat_concat - fpr_cat_concat)
+    
+    print(f"CatBoost - Concatenated features accuracy: {cat_concat_acc:.4f}")
+    print(f"CatBoost - Concatenated features AUC-ROC: {cat_concat_auc:.4f}")
+    print(f"CatBoost - Concatenated features KS statistic: {ks_cat_concat:.4f}")
+    print(classification_report(y_val, cat_concat_preds))
+    
+    # Store CatBoost results
+    model_results['catboost'] = {
+        'dataset_acc': cat_dataset_acc,
+        'dataset_auc': cat_dataset_auc,
+        'dataset_ks': ks_cat_dataset,
+        'concat_acc': cat_concat_acc,
+        'concat_auc': cat_concat_auc,
+        'concat_ks': ks_cat_concat,
+        'improvement_acc': cat_concat_acc - cat_dataset_acc,
+        'improvement_auc': cat_concat_auc - cat_dataset_auc,
+        'improvement_ks': ks_cat_concat - ks_cat_dataset,
+        'best_params_dataset': best_params_cat_dataset,
+        'best_params_concat': best_params_cat_concat,
+        'fpr_dataset': fpr_cat_dataset,
+        'tpr_dataset': tpr_cat_dataset,
+        'fpr_concat': fpr_cat_concat,
+        'tpr_concat': tpr_cat_concat
+    }
+    
+    # Train and evaluate LightGBM models
+    print("\n" + "="*50)
+    print("LightGBM Models")
+    print("="*50)
+    
+    # Tune hyperparameters for dataset features - LightGBM
+    print("\nOptimizing LightGBM for dataset features (using AUC-ROC)...")
+    study_lgbm_dataset = optuna.create_study(direction='maximize')
+    study_lgbm_dataset.optimize(lgbm_dataset_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    
+    best_params_lgbm_dataset = study_lgbm_dataset.best_params
+    
+    # Train LightGBM on dataset features with tuned hyperparameters
+    print("\nTraining LightGBM on dataset features with best hyperparameters...")
+    lgbm_dataset_clf = LGBMClassifier(**best_params_lgbm_dataset)
+    lgbm_dataset_clf.fit(X_train, y_train)
+    
+    # Evaluate LightGBM on dataset features
+    lgbm_dataset_preds = lgbm_dataset_clf.predict(X_val)
+    lgbm_dataset_preds_proba = lgbm_dataset_clf.predict_proba(X_val)[:, 1]
+    lgbm_dataset_acc = accuracy_score(y_val, lgbm_dataset_preds)
+    lgbm_dataset_auc = roc_auc_score(y_val, lgbm_dataset_preds_proba)
+    
+    # Calculate KS statistic for LightGBM dataset features model
+    fpr_lgbm_dataset, tpr_lgbm_dataset, _ = roc_curve(y_val, lgbm_dataset_preds_proba)
+    ks_lgbm_dataset = max(tpr_lgbm_dataset - fpr_lgbm_dataset)
+    
+    print(f"LightGBM - Dataset features accuracy: {lgbm_dataset_acc:.4f}")
+    print(f"LightGBM - Dataset features AUC-ROC: {lgbm_dataset_auc:.4f}")
+    print(f"LightGBM - Dataset features KS statistic: {ks_lgbm_dataset:.4f}")
+    print(classification_report(y_val, lgbm_dataset_preds))
+    
+    # Tune hyperparameters for concatenated features - LightGBM
+    print("\nOptimizing LightGBM for concatenated features (using AUC-ROC)...")
+    study_lgbm_concat = optuna.create_study(direction='maximize')
+    study_lgbm_concat.optimize(lgbm_concat_objective, n_trials=n_trials, n_jobs=1, show_progress_bar=True)
+    
+    best_params_lgbm_concat = study_lgbm_concat.best_params
+    
+    # Train LightGBM on concatenated features with tuned hyperparameters
+    print("\nTraining LightGBM on concatenated features with best hyperparameters...")
+    lgbm_concat_clf = LGBMClassifier(**best_params_lgbm_concat)
+    lgbm_concat_clf.fit(concat_train, y_train)
+    
+    # Evaluate LightGBM on concatenated features
+    lgbm_concat_preds = lgbm_concat_clf.predict(concat_val)
+    lgbm_concat_preds_proba = lgbm_concat_clf.predict_proba(concat_val)[:, 1]
+    lgbm_concat_acc = accuracy_score(y_val, lgbm_concat_preds)
+    lgbm_concat_auc = roc_auc_score(y_val, lgbm_concat_preds_proba)
+    
+    # Calculate KS statistic for LightGBM concatenated features model
+    fpr_lgbm_concat, tpr_lgbm_concat, _ = roc_curve(y_val, lgbm_concat_preds_proba)
+    ks_lgbm_concat = max(tpr_lgbm_concat - fpr_lgbm_concat)
+    
+    print(f"LightGBM - Concatenated features accuracy: {lgbm_concat_acc:.4f}")
+    print(f"LightGBM - Concatenated features AUC-ROC: {lgbm_concat_auc:.4f}")
+    print(f"LightGBM - Concatenated features KS statistic: {ks_lgbm_concat:.4f}")
+    print(classification_report(y_val, lgbm_concat_preds))
+    
+    # Store LightGBM results
+    model_results['lightgbm'] = {
+        'dataset_acc': lgbm_dataset_acc,
+        'dataset_auc': lgbm_dataset_auc,
+        'dataset_ks': ks_lgbm_dataset,
+        'concat_acc': lgbm_concat_acc,
+        'concat_auc': lgbm_concat_auc,
+        'concat_ks': ks_lgbm_concat,
+        'improvement_acc': lgbm_concat_acc - lgbm_dataset_acc,
+        'improvement_auc': lgbm_concat_auc - lgbm_dataset_auc,
+        'improvement_ks': ks_lgbm_concat - ks_lgbm_dataset,
+        'best_params_dataset': best_params_lgbm_dataset,
+        'best_params_concat': best_params_lgbm_concat,
+        'fpr_dataset': fpr_lgbm_dataset,
+        'tpr_dataset': tpr_lgbm_dataset,
+        'fpr_concat': fpr_lgbm_concat,
+        'tpr_concat': tpr_lgbm_concat
+    }
+    
+    # Use the best model's results for the plot (XGBoost for backward compatibility)
+    dataset_acc = xgb_dataset_acc
+    dataset_auc = xgb_dataset_auc
+    ks_dataset = ks_xgb_dataset
+    concat_acc = xgb_concat_acc
+    concat_auc = xgb_concat_auc
+    ks_concat = ks_xgb_concat
+    fpr_dataset = fpr_xgb_dataset
+    tpr_dataset = tpr_xgb_dataset
+    fpr_concat = fpr_xgb_concat
+    tpr_concat = tpr_xgb_concat
     
     # Create output directory for plots
     plots_dir = os.path.join(args.output_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
     
-    # Plot ROC curves
-    plt.figure(figsize=(10, 8))
-    plt.plot(fpr_dataset, tpr_dataset, label=f'Dataset features (AUC = {dataset_auc:.4f}, KS = {ks_dataset:.4f})')
-    plt.plot(fpr_concat, tpr_concat, label=f'Concatenated features (AUC = {concat_auc:.4f}, KS = {ks_concat:.4f})')
-    plt.plot([0, 1], [0, 1], 'k--')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'ROC Curves - {dataset_name}')
-    plt.legend()
-    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_roc_curves.png"))
+    # Plot ROC curves for each model
+    for model_name, model_data in model_results.items():
+        plt.figure(figsize=(10, 8))
+        plt.plot(model_data['fpr_dataset'], model_data['tpr_dataset'],
+                label=f'Dataset features (AUC = {model_data["dataset_auc"]:.4f}, KS = {model_data["dataset_ks"]:.4f})')
+        plt.plot(model_data['fpr_concat'], model_data['tpr_concat'],
+                label=f'Concatenated features (AUC = {model_data["concat_auc"]:.4f}, KS = {model_data["concat_ks"]:.4f})')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curves - {dataset_name} - {model_name.upper()}')
+        plt.legend()
+        plt.savefig(os.path.join(plots_dir, f"{dataset_name}_{model_name}_roc_curves.png"))
     
     # Get feature names (simpler approach)
     feature_names = []
@@ -358,57 +632,98 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     # Combined feature names for concatenated model
     concat_feature_names = list(feature_names) + list(sublime_feature_names)
     
-    # Feature importance for dataset features
-    plt.figure(figsize=(12, 8))
-    importances = dataset_clf.feature_importances_
-    indices = np.argsort(importances)[::-1]
-    
-    # Plot top 20 features or all if less than 20
-    n_to_plot = min(20, len(importances))
-    plt.bar(range(n_to_plot), importances[indices[:n_to_plot]])
-    plt.xticks(range(n_to_plot), [feature_names[i] if i < len(feature_names) else f"Feature_{i}" 
-                                for i in indices[:n_to_plot]], rotation=45, ha='right')
-    plt.title(f"Top {n_to_plot} Feature Importance (Dataset Features) - {dataset_name}")
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_dataset_feature_importance.png"))
-    
-    # Feature importance for concatenated features
-    plt.figure(figsize=(12, 8))
-    concat_importances = concat_clf.feature_importances_
-    concat_indices = np.argsort(concat_importances)[::-1]
-    
-    # Plot top 20 features or all if less than 20
-    n_to_plot = min(20, len(concat_importances))
-    plt.bar(range(n_to_plot), concat_importances[concat_indices[:n_to_plot]])
-    plt.xticks(range(n_to_plot), [concat_feature_names[i] if i < len(concat_feature_names) else f"Feature_{i}" 
-                                for i in concat_indices[:n_to_plot]], rotation=45, ha='right')
-    plt.title(f"Top {n_to_plot} Feature Importance (Concatenated Features) - {dataset_name}")
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, f"{dataset_name}_concat_feature_importance.png"))
-    
-    # Save results
-    results = {
-        'dataset': dataset_name,
-        'dataset_features_accuracy': dataset_acc,
-        'dataset_features_auc': dataset_auc,
-        'dataset_features_ks': ks_dataset,
-        'concat_accuracy': concat_acc,
-        'concat_auc': concat_auc,
-        'concat_ks': ks_concat,
-        'concat_vs_dataset_improvement_acc': concat_acc - dataset_acc,
-        'concat_vs_dataset_improvement_auc': concat_auc - dataset_auc,
-        'concat_vs_dataset_improvement_ks': ks_concat - ks_dataset,
-        'best_params_dataset': best_params_dataset,
-        'best_params_concat': best_params_concat
+    # Define model classifiers for feature importance plots
+    model_classifiers = {
+        'xgboost': {
+            'dataset': xgb_dataset_clf,
+            'concat': xgb_concat_clf
+        },
+        'catboost': {
+            'dataset': cat_dataset_clf,
+            'concat': cat_concat_clf
+        },
+        'lightgbm': {
+            'dataset': lgbm_dataset_clf,
+            'concat': lgbm_concat_clf
+        }
     }
     
+    # Plot feature importance for each model type
+    for model_name, classifiers in model_classifiers.items():
+        # Feature importance for dataset features
+        plt.figure(figsize=(12, 8))
+        importances = classifiers['dataset'].feature_importances_
+        indices = np.argsort(importances)[::-1]
+        
+        # Plot top 20 features or all if less than 20
+        n_to_plot = min(20, len(importances))
+        plt.bar(range(n_to_plot), importances[indices[:n_to_plot]])
+        plt.xticks(range(n_to_plot), [feature_names[i] if i < len(feature_names) else f"Feature_{i}"
+                                    for i in indices[:n_to_plot]], rotation=45, ha='right')
+        plt.title(f"Top {n_to_plot} Feature Importance ({model_name.upper()} - Dataset Features) - {dataset_name}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, f"{dataset_name}_{model_name}_dataset_feature_importance.png"))
+        
+        # Feature importance for concatenated features
+        plt.figure(figsize=(12, 8))
+        concat_importances = classifiers['concat'].feature_importances_
+        concat_indices = np.argsort(concat_importances)[::-1]
+        
+        # Plot top 20 features or all if less than 20
+        n_to_plot = min(20, len(concat_importances))
+        plt.bar(range(n_to_plot), concat_importances[concat_indices[:n_to_plot]])
+        plt.xticks(range(n_to_plot), [concat_feature_names[i] if i < len(concat_feature_names) else f"Feature_{i}"
+                                    for i in concat_indices[:n_to_plot]], rotation=45, ha='right')
+        plt.title(f"Top {n_to_plot} Feature Importance ({model_name.upper()} - Concatenated Features) - {dataset_name}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, f"{dataset_name}_{model_name}_concat_feature_importance.png"))
+    
+    # Create combined results for all models
+    combined_results = []
+    
+    for model_name, model_data in model_results.items():
+        result_row = {
+            'dataset': dataset_name,
+            'model': model_name,
+            'dataset_features_accuracy': model_data['dataset_acc'],
+            'dataset_features_auc': model_data['dataset_auc'],
+            'dataset_features_ks': model_data['dataset_ks'],
+            'concat_accuracy': model_data['concat_acc'],
+            'concat_auc': model_data['concat_auc'],
+            'concat_ks': model_data['concat_ks'],
+            'concat_vs_dataset_improvement_acc': model_data['improvement_acc'],
+            'concat_vs_dataset_improvement_auc': model_data['improvement_auc'],
+            'concat_vs_dataset_improvement_ks': model_data['improvement_ks']
+        }
+        combined_results.append(result_row)
+    
     # Save the detailed results to a CSV file
-    results_df = pd.DataFrame([results])
-    results_path = os.path.join(args.output_dir, f"{dataset_name}_results.csv")
+    results_df = pd.DataFrame(combined_results)
+    results_path = os.path.join(args.output_dir, f"{dataset_name}_all_models_results.csv")
     results_df.to_csv(results_path, index=False)
+    
+    # Also save the best parameters for each model
+    for model_name, model_data in model_results.items():
+        params_df = pd.DataFrame({
+            'dataset_params': [str(model_data['best_params_dataset'])],
+            'concat_params': [str(model_data['best_params_concat'])]
+        })
+        params_path = os.path.join(args.output_dir, f"{dataset_name}_{model_name}_best_params.csv")
+        params_df.to_csv(params_path, index=False)
     print(f"\nResults saved to {results_path}")
     
-    return results
+    # Find the best performing model based on improvement in AUC-ROC
+    best_model = max(model_results.items(), key=lambda x: x[1]['improvement_auc'])
+    best_model_name = best_model[0]
+    best_model_data = best_model[1]
+    
+    print("\nBest performing model based on AUC-ROC improvement:")
+    print(f"Model: {best_model_name.upper()}")
+    print(f"Dataset features AUC-ROC: {best_model_data['dataset_auc']:.4f}")
+    print(f"Concatenated features AUC-ROC: {best_model_data['concat_auc']:.4f}")
+    print(f"Improvement: {best_model_data['improvement_auc']:.4f}")
+    
+    return model_results
 
 def main(args):
     """Main function to run the evaluation pipeline"""
@@ -492,7 +807,7 @@ def main(args):
     X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
     
     # 7. Evaluate using dataset features and SUBLIME embeddings
-    print("\nEvaluating features with XGBoost...")
+    print("\nEvaluating features with XGBoost, CatBoost, and LightGBM...")
     dataset_name = os.path.basename(args.dataset_features_csv).split('.')[0]
     results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name, preprocessor=preprocessor, n_trials=args.n_trials)
     
@@ -501,15 +816,30 @@ def main(args):
     print("EVALUATION SUMMARY")
     print("="*80)
     print(f"Dataset: {dataset_name}")
-    print(f"Dataset features accuracy: {results['dataset_features_accuracy']:.4f}")
-    print(f"Dataset features AUC-ROC: {results['dataset_features_auc']:.4f}")
-    print(f"Dataset features KS: {results['dataset_features_ks']:.4f}")
-    print(f"Concatenated features accuracy: {results['concat_accuracy']:.4f}")
-    print(f"Concatenated features AUC-ROC: {results['concat_auc']:.4f}")
-    print(f"Concatenated features KS: {results['concat_ks']:.4f}")
-    print(f"Improvement in AUC-ROC: {results['concat_vs_dataset_improvement_auc']:.4f}")
-    print(f"Improvement in KS: {results['concat_vs_dataset_improvement_ks']:.4f}")
-    print("="*80)
+    
+    # Find the best performing model based on improvement in AUC-ROC
+    best_model = max(results.items(), key=lambda x: x[1]['improvement_auc'])
+    best_model_name = best_model[0]
+    
+    # Print results for each model
+    for model_name, model_data in results.items():
+        is_best = model_name == best_model_name
+        best_indicator = "★ BEST ★" if is_best else ""
+        
+        print("\n" + "-"*60)
+        print(f"{model_name.upper()} MODEL {best_indicator}")
+        print("-"*60)
+        print(f"Dataset features accuracy: {model_data['dataset_acc']:.4f}")
+        print(f"Dataset features AUC-ROC: {model_data['dataset_auc']:.4f}")
+        print(f"Dataset features KS: {model_data['dataset_ks']:.4f}")
+        print(f"Concatenated features accuracy: {model_data['concat_acc']:.4f}")
+        print(f"Concatenated features AUC-ROC: {model_data['concat_auc']:.4f}")
+        print(f"Concatenated features KS: {model_data['concat_ks']:.4f}")
+        print(f"Improvement in accuracy: {model_data['improvement_acc']:.4f}")
+        print(f"Improvement in AUC-ROC: {model_data['improvement_auc']:.4f}")
+        print(f"Improvement in KS: {model_data['improvement_ks']:.4f}")
+    
+    print("\n" + "="*80)
     
     # 9. Save the preprocessor for future use
     preprocessor_path = os.path.join(args.output_dir, 'dataset_features_preprocessor.joblib')
