@@ -910,7 +910,11 @@ class Experiment:
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
                 if args.verbose:
-                    print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()), args.downstream_task)
+                    try:
+                        print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()), args.downstream_task)
+                    except:
+                        print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss), args.downstream_task)
+
 
                 if epoch % args.eval_freq == 0:
                     if args.downstream_task == 'classification':
