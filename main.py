@@ -352,6 +352,19 @@ class Experiment:
                 f.write(f'sim_function: {graph_learner.knn_metric}\n')
             if hasattr(graph_learner, 'mlp_act'):
                 f.write(f'activation_learner: {graph_learner.mlp_act}\n')
+                
+            # Save ArcFace parameters if the model has ArcFace support
+            if hasattr(model, 'use_arcface') and model.use_arcface:
+                f.write(f'use_arcface: True\n')
+                f.write(f'num_classes: {model.arcface.weight.shape[0]}\n')
+                f.write(f'arcface_scale: {model.arcface.s}\n')
+                f.write(f'arcface_margin: {model.arcface.m}\n')
+                
+                # Check for sampled ArcFace
+                if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
+                    f.write(f'use_sampled_arcface: True\n')
+                    if hasattr(model.arcface, 'num_samples'):
+                        f.write(f'arcface_num_samples: {model.arcface.num_samples}\n')
         
     def load_model(self, input_dir='saved_models'):
         """
@@ -395,15 +408,46 @@ class Experiment:
             'activation_learner': config.get('activation_learner', 'relu')
         }
         
-        # Initialize models
-        model = GCL(nlayers=model_params['nlayers'], 
-                   in_dim=features.shape[1], 
-                   hidden_dim=model_params['hidden_dim'],
-                   emb_dim=model_params['emb_dim'], 
-                   proj_dim=model_params['proj_dim'],
-                   dropout=model_params['dropout'], 
-                   dropout_adj=model_params['dropout_adj'], 
-                   sparse=sparse)
+        # Check for arcface parameters in config
+        use_arcface = config.get('use_arcface', 'False').lower() in ['true', '1', 't', 'y', 'yes']
+        arcface_params = {}
+        if use_arcface:
+            arcface_params['use_arcface'] = True
+            arcface_params['num_classes'] = int(config.get('num_classes', 0))
+            arcface_params['arcface_scale'] = float(config.get('arcface_scale', 30.0))
+            arcface_params['arcface_margin'] = float(config.get('arcface_margin', 0.5))
+            
+            # Check for sampled arcface parameters
+            use_sampled_arcface = config.get('use_sampled_arcface', 'False').lower() in ['true', '1', 't', 'y', 'yes']
+            if use_sampled_arcface:
+                arcface_params['use_sampled_arcface'] = True
+                arcface_params['arcface_num_samples'] = int(config.get('arcface_num_samples', 5000))
+        
+        # Initialize models with arcface parameters if needed
+        if use_arcface:
+            model = GCL(nlayers=model_params['nlayers'],
+                       in_dim=features.shape[1],
+                       hidden_dim=model_params['hidden_dim'],
+                       emb_dim=model_params['emb_dim'],
+                       proj_dim=model_params['proj_dim'],
+                       dropout=model_params['dropout'],
+                       dropout_adj=model_params['dropout_adj'],
+                       sparse=sparse,
+                       use_arcface=arcface_params['use_arcface'],
+                       num_classes=arcface_params['num_classes'],
+                       arcface_scale=arcface_params['arcface_scale'],
+                       arcface_margin=arcface_params['arcface_margin'],
+                       use_sampled_arcface=arcface_params.get('use_sampled_arcface', False),
+                       arcface_num_samples=arcface_params.get('arcface_num_samples', None))
+        else:
+            model = GCL(nlayers=model_params['nlayers'],
+                       in_dim=features.shape[1],
+                       hidden_dim=model_params['hidden_dim'],
+                       emb_dim=model_params['emb_dim'],
+                       proj_dim=model_params['proj_dim'],
+                       dropout=model_params['dropout'],
+                       dropout_adj=model_params['dropout_adj'],
+                       sparse=sparse)
         
         # Determine type of graph learner from config or saved file
         learner_type = config.get('type_learner', None)
