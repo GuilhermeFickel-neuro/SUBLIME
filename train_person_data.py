@@ -171,6 +171,12 @@ def main():
     parser.add_argument('-tau', type=float, default=1)
     parser.add_argument('-c', type=int, default=0)
 
+    # Layer Norm and Residual Connections
+    parser.add_argument('-use_layer_norm', type=int, default=0,
+                       help='Use Layer Normalization (0=disabled, 1=enabled)')
+    parser.add_argument('-use_residual', type=int, default=0,
+                       help='Use Residual Connections (0=disabled, 1=enabled)')
+
     # One Cycle Learning Rate Scheduler parameters
     parser.add_argument('-use_one_cycle', type=int, default=0,
                         help='Whether to use OneCycleLR scheduler (0=disabled, 1=enabled)')

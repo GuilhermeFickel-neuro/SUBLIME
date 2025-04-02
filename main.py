@@ -220,7 +220,8 @@ class Experiment:
 
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
         model = GCN(in_channels=nfeats, hidden_channels=args.hidden_dim_cls, out_channels=nclasses, num_layers=args.nlayers_cls,
-                    dropout=args.dropout_cls, dropout_adj=args.dropedge_cls, Adj=Adj, sparse=args.sparse)
+                    dropout=args.dropout_cls, dropout_adj=args.dropedge_cls, Adj=Adj, sparse=args.sparse,
+                    use_layer_norm=bool(args.use_layer_norm), use_residual=bool(args.use_residual))
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr_cls, weight_decay=args.w_decay_cls)
 
         bad_counter = 0
@@ -296,76 +297,72 @@ class Experiment:
         else:
             # For dense adjacency
             torch.save(adj.cpu(), os.path.join(output_dir, 'adjacency.pt'))
-        # Save a config file with all important parameters
-        with open(os.path.join(output_dir, 'config.txt'), 'w') as f:
-            # Save all args parameters if provided
-            if args:
-                for arg_name, arg_value in vars(args).items():
-                    f.write(f'{arg_name}: {arg_value}\n')
-                
-            # Basic parameters
-            f.write(f'sparse: {sparse}\n')
-            f.write(f'feature_dim: {features.shape[1]}\n')
-            f.write(f'num_nodes: {features.shape[0]}\n')
-            
-            # Get model architecture parameters by inspecting the encoder
-            encoder = model.encoder
-            f.write(f'nlayers: {len(encoder.gnn_encoder_layers)}\n')
-            
-            # Get hidden_dim from the first layer's linear out_features
-            if sparse:
-                hidden_dim = encoder.gnn_encoder_layers[0].linear.out_features
-                emb_dim = encoder.gnn_encoder_layers[-1].linear.out_features
-            else:
-                hidden_dim = encoder.gnn_encoder_layers[0].linear.out_features
-                emb_dim = encoder.gnn_encoder_layers[-1].linear.out_features
-                
-            f.write(f'hidden_dim: {hidden_dim}\n')
-            f.write(f'emb_dim: {emb_dim}\n')
-            
-            # Get proj_dim from the first layer of the projection head
-            proj_dim = encoder.proj_head[0].out_features
-            f.write(f'proj_dim: {proj_dim}\n')
-            
-            f.write(f'dropout: {encoder.dropout}\n')
-            f.write(f'dropout_adj: {encoder.dropout_adj_p}\n')
-            
-            # Graph learner parameters
-            # Identify the learner type
-            if isinstance(graph_learner, FGP_learner):
-                learner_type = 'fgp'
-            elif isinstance(graph_learner, MLP_learner):
-                learner_type = 'mlp'
-            elif isinstance(graph_learner, ATT_learner):
-                learner_type = 'att'
-            elif isinstance(graph_learner, GNN_learner):
-                learner_type = 'gnn'
-            else:
-                learner_type = 'unknown'
-                
-            f.write(f'type_learner: {learner_type}\n')
-            
-            # These parameters should exist in all learner types
-            if hasattr(graph_learner, 'k'):
-                f.write(f'k: {graph_learner.k}\n')
-            if hasattr(graph_learner, 'knn_metric'):
-                f.write(f'sim_function: {graph_learner.knn_metric}\n')
-            if hasattr(graph_learner, 'mlp_act'):
-                f.write(f'activation_learner: {graph_learner.mlp_act}\n')
-                
-            # Save ArcFace parameters if the model has ArcFace support
-            if hasattr(model, 'use_arcface') and model.use_arcface:
-                f.write(f'use_arcface: True\n')
-                f.write(f'num_classes: {model.arcface.weight.shape[0]}\n')
-                f.write(f'arcface_scale: {model.arcface.s}\n')
-                f.write(f'arcface_margin: {model.arcface.m}\n')
-                
-                # Check for sampled ArcFace
-                if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
-                    f.write(f'use_sampled_arcface: True\n')
-                    if hasattr(model.arcface, 'num_samples'):
-                        f.write(f'arcface_num_samples: {model.arcface.num_samples}\n')
         
+        # Save config using the dedicated function
+        with open(os.path.join(output_dir, 'config.txt'), 'w') as f:
+            self.save_model_config(f, args, model, graph_learner, features, sparse)
+
+    def save_model_config(self, f, args, model, graph_learner, features, sparse):
+        # Save all args parameters if provided
+        if args:
+            for arg_name, arg_value in vars(args).items():
+                f.write(f'{arg_name}: {arg_value}\n')
+        # Basic parameters
+        f.write(f'sparse: {sparse}\n')
+        f.write(f'feature_dim: {features.shape[1]}\n')
+        f.write(f'num_nodes: {features.shape[0]}\n')
+        # Get model architecture parameters by inspecting the encoder
+        encoder = model.encoder
+        f.write(f'nlayers: {len(encoder.gnn_encoder_layers)}\n')
+        # Get hidden_dim from the first layer's linear out_features
+        if hasattr(encoder.gnn_encoder_layers[0], 'linear'):
+            hidden_dim = encoder.gnn_encoder_layers[0].linear.out_features
+            emb_dim = encoder.gnn_encoder_layers[-1].linear.out_features
+        else: # Fallback for potentially different layer types
+            hidden_dim = args.hidden_dim if args else 128 # Example fallback
+            emb_dim = args.rep_dim if args else 32 # Example fallback
+        f.write(f'hidden_dim: {hidden_dim}\n')
+        f.write(f'emb_dim: {emb_dim}\n')
+        # Get proj_dim from the first layer of the projection head
+        if hasattr(encoder.proj_head[0], 'out_features'):
+            proj_dim = encoder.proj_head[0].out_features
+        else: # Fallback
+            proj_dim = args.proj_dim if args else 32
+        f.write(f'proj_dim: {proj_dim}\n')
+        f.write(f'dropout: {encoder.dropout}\n')
+        f.write(f'dropout_adj: {encoder.dropout_adj_p}\n')
+        # Add flags to config
+        f.write(f'use_layer_norm: {encoder.use_layer_norm}\n')
+        f.write(f'use_residual: {encoder.use_residual}\n')
+        # Graph learner parameters
+        if isinstance(graph_learner, FGP_learner):
+            learner_type = 'fgp'
+        elif isinstance(graph_learner, MLP_learner):
+            learner_type = 'mlp'
+        elif isinstance(graph_learner, ATT_learner):
+            learner_type = 'att'
+        elif isinstance(graph_learner, GNN_learner):
+            learner_type = 'gnn'
+        else:
+            learner_type = 'unknown'
+        f.write(f'type_learner: {learner_type}\n')
+        if hasattr(graph_learner, 'k'):
+            f.write(f'k: {graph_learner.k}\n')
+        if hasattr(graph_learner, 'knn_metric'):
+            f.write(f'sim_function: {graph_learner.knn_metric}\n')
+        if hasattr(graph_learner, 'mlp_act'):
+            f.write(f'activation_learner: {graph_learner.mlp_act}\n')
+        # Save ArcFace parameters if the model has ArcFace support
+        if hasattr(model, 'use_arcface') and model.use_arcface:
+            f.write(f'use_arcface: True\n')
+            f.write(f'num_classes: {model.arcface.weight.shape[0]}\n')
+            f.write(f'arcface_scale: {model.arcface.s}\n')
+            f.write(f'arcface_margin: {model.arcface.m}\n')
+            if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
+                f.write(f'use_sampled_arcface: True\n')
+                if hasattr(model.arcface, 'num_samples'):
+                    f.write(f'arcface_num_samples: {model.arcface.num_samples}\n')
+
     def load_model(self, input_dir='saved_models'):
         """
         Load a saved model, graph learner, features and adjacency matrix
@@ -423,6 +420,10 @@ class Experiment:
                 arcface_params['use_sampled_arcface'] = True
                 arcface_params['arcface_num_samples'] = int(config.get('arcface_num_samples', 5000))
         
+        # Add flags to model loading defaults if needed (assuming they weren't saved)
+        use_layer_norm_load = config.get('use_layer_norm', 'False').lower() in ['true', '1']
+        use_residual_load = config.get('use_residual', 'False').lower() in ['true', '1']
+        
         # Initialize models with arcface parameters if needed
         if use_arcface:
             model = GCL(nlayers=model_params['nlayers'],
@@ -433,6 +434,8 @@ class Experiment:
                        dropout=model_params['dropout'],
                        dropout_adj=model_params['dropout_adj'],
                        sparse=sparse,
+                       use_layer_norm=use_layer_norm_load,
+                       use_residual=use_residual_load,
                        use_arcface=arcface_params['use_arcface'],
                        num_classes=arcface_params['num_classes'],
                        arcface_scale=arcface_params['arcface_scale'],
@@ -447,7 +450,9 @@ class Experiment:
                        proj_dim=model_params['proj_dim'],
                        dropout=model_params['dropout'],
                        dropout_adj=model_params['dropout_adj'],
-                       sparse=sparse)
+                       sparse=sparse,
+                       use_layer_norm=use_layer_norm_load,
+                       use_residual=use_residual_load)
         
         # Determine type of graph learner from config or saved file
         learner_type = config.get('type_learner', None)
@@ -680,13 +685,15 @@ class Experiment:
                                      args.activation_learner, anchor_adj)
 
             if args.use_arcface:
-                model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
-                          emb_dim=args.rep_dim, proj_dim=args.proj_dim,
-                          dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
-                          use_arcface=True, num_classes=nclasses,
-                          arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
-                          use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
-                          arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None)
+                model = GCL(nlayers=args.nlayers, in_dim=nfeats,
+                           hidden_dim=args.hidden_dim, emb_dim=args.rep_dim, proj_dim=args.proj_dim,
+                           dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
+                           use_layer_norm=bool(args.use_layer_norm),
+                           use_residual=bool(args.use_residual),
+                           use_arcface=True, num_classes=nclasses,
+                           arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
+                           use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
+                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None)
                 
                 # If using both sampled and batched ArcFace, prioritize sampled (don't try to use both)
                 if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface and args.use_batched_arcface:
@@ -797,7 +804,7 @@ class Experiment:
                 test_mask = test_mask.to(self.device)
 
             if args.downstream_task == 'classification':
-                best_val = 0
+                best_val = 0.0 # Initialize as float
                 best_val_test = 0
                 best_epoch = 0
 
@@ -931,7 +938,7 @@ class Experiment:
                                                                                nclasses, train_mask, val_mask, test_mask, args)
 
                         if val_accu > best_val:
-                            best_val = val_accu
+                            best_val = val_accu.item() if isinstance(val_accu, torch.Tensor) else val_accu # Ensure float
                             best_val_test = test_accu
                             best_epoch = epoch
 
@@ -1127,6 +1134,10 @@ if __name__ == '__main__':
     parser.add_argument('-dropout', type=float, default=0.5)
     parser.add_argument('-contrast_batch_size', type=int, default=0)
     parser.add_argument('-nlayers', type=int, default=2)
+    parser.add_argument('-use_layer_norm', type=int, default=0,
+                       help='Use Layer Normalization (0=disabled, 1=enabled)')
+    parser.add_argument('-use_residual', type=int, default=0,
+                       help='Use Residual Connections (0=disabled, 1=enabled)')
 
     # GCL Module -Augmentation
     parser.add_argument('-maskfeat_rate_learner', type=float, default=0.2)
