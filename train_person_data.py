@@ -216,11 +216,7 @@ def main():
                        help='Maximum samples to use for memory debugging (default: 10000)')
     parser.add_argument('-use_mixed_precision', type=int, default=0,
                        help='Use mixed precision training (FP16) to reduce memory usage (0=disabled, 1=enabled)')
-    parser.add_argument('-grad_accumulation_steps', type=int, default=1,
-                       help='Number of steps to accumulate gradients before updating weights (1=disabled)')
-    parser.add_argument('-memory_efficient_training', type=int, default=0,
-                       help='Use memory-efficient training with gradient accumulation and chunked processing (0=disabled, 1=enabled)')
-
+    
     parser.add_argument('-verbose', type=int, default=1)
     parser.add_argument('-save_model', type=int, default=1)
     parser.add_argument('-output_dir', type=str, default='sublime_models/')
