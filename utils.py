@@ -292,8 +292,8 @@ def knn_fast(X, k, b, use_gpu=False):
             print(f"Attempting FAISS ({faiss_device_info}, {index_type})")
             res = faiss.StandardGpuResources()
             
-            # Create GPU Flat Index directly
-            gpu_index = faiss.GpuIndexFlatIP(res, d, faiss.METRIC_INNER_PRODUCT)
+            # Create GPU Flat Index directly - Metric is implicit in the class name
+            gpu_index = faiss.GpuIndexFlatIP(res, d)
 
             # No training needed for IndexFlatIP
 
