@@ -282,44 +282,40 @@ def knn_fast(X, k, b, use_gpu=False):
 
     actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
     faiss_device_info = "CPU"
+    index_type = "IndexIVFFlat" # Default for CPU
 
     if actual_use_gpu:
         try:
-            # --- GPU FAISS Path ---
+            # --- GPU FAISS Path (Using GpuIndexFlatIP - No Training Required) ---
             faiss_device_info = "GPU"
-            print(f"Attempting FAISS ({faiss_device_info}) with nlist={nlist}, nprobe={nprobe}")
+            index_type = "GpuIndexFlatIP"
+            print(f"Attempting FAISS ({faiss_device_info}, {index_type})")
             res = faiss.StandardGpuResources()
             
-            # Define index structure on CPU first
-            quantizer_cpu = faiss.IndexFlatIP(d)
-            index_cpu = faiss.IndexIVFFlat(quantizer_cpu, d, nlist, faiss.METRIC_INNER_PRODUCT)
-            
-            # Transfer index structure to GPU (assuming device 0)
-            gpu_index = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+            # Create GPU Flat Index directly
+            gpu_index = faiss.GpuIndexFlatIP(res, d, faiss.METRIC_INNER_PRODUCT)
 
-            # Train GPU index using GPU data
-            if not gpu_index.is_trained:
-                gpu_index.train(X_normalized) # Pass GPU tensor
+            # No training needed for IndexFlatIP
 
             # Add data to GPU index
             gpu_index.add(X_normalized) # Pass GPU tensor
 
-            # Set nprobe for GPU index
-            gpu_index.nprobe = nprobe
+            # No nprobe needed for IndexFlatIP
 
             # Search using GPU index and GPU data
             vals, inds = gpu_index.search(X_normalized, k + 1) # Returns tensors on GPU
             # --- End GPU FAISS Path ---
 
         except Exception as e:
-            print(f"FAISS GPU execution failed: {e}. Falling back to CPU.")
+            print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
             actual_use_gpu = False # Reset flag to trigger CPU path
 
-    # CPU Path (or fallback from GPU error)
+    # CPU Path (or fallback from GPU error) - Still using IndexIVFFlat
     if not actual_use_gpu:
-        # --- CPU FAISS Path ---
+        # --- CPU FAISS Path (Using IndexIVFFlat) ---
         faiss_device_info = "CPU"
-        print(f"Using FAISS ({faiss_device_info}) with nlist={nlist}, nprobe={nprobe}")
+        index_type = "IndexIVFFlat"
+        print(f"Using FAISS ({faiss_device_info}, {index_type}) with nlist={nlist}, nprobe={nprobe}")
         # Convert to numpy for CPU FAISS
         X_np = X_normalized.cpu().detach().numpy().astype('float32')
         X_np = np.ascontiguousarray(X_np)
@@ -381,7 +377,7 @@ def knn_fast(X, k, b, use_gpu=False):
     cols = cols.long()
 
     end_time = time.time()
-    print(f"knn_fast ({faiss_device_info}) execution time: {end_time - start_time:.4f} seconds")
+    print(f"knn_fast ({faiss_device_info}, {index_type}) execution time: {end_time - start_time:.4f} seconds")
 
     return rows, cols, values
 
