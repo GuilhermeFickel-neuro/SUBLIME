@@ -267,7 +267,8 @@ def knn_fast(X, k, b):
     X_normalized = F.normalize(X, dim=1, p=2)
 
     # Convert to numpy for FAISS
-    X_np = X_normalized.cpu().numpy().astype('float32')
+    # Detach the tensor from the computation graph before converting to numpy
+    X_np = X_normalized.cpu().detach().numpy().astype('float32')
     X_np = np.ascontiguousarray(X_np) # Ensure contiguous array
 
     # Build FAISS index
