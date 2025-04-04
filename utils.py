@@ -8,6 +8,7 @@ import dgl
 from sklearn import metrics
 from munkres import Munkres
 import faiss
+import time
 
 EOS = 1e-10
 
@@ -249,7 +250,8 @@ def top_k(raw_graph, K):
 
 def knn_fast(X, k, b):
     """
-    Computes the k-nearest neighbors graph using FAISS for efficiency.
+    Computes the k-nearest neighbors graph using FAISS with an Approximate
+    Nearest Neighbor (ANN) index (IndexIVFFlat) for efficiency.
 
     Args:
         X (torch.Tensor): Input features (num_nodes x num_features).
@@ -260,10 +262,11 @@ def knn_fast(X, k, b):
         tuple: (rows, cols, values) representing the graph in COO format
                with normalized edge weights.
     """
+    start_time = time.time()
     device = X.device
-    n = X.shape[0]
+    n, d = X.shape # number of nodes, dimension of features
 
-    # Normalize features for cosine similarity
+    # Normalize features for cosine similarity (using Inner Product metric in FAISS)
     X_normalized = F.normalize(X, dim=1, p=2)
 
     # Convert to numpy for FAISS
@@ -271,54 +274,89 @@ def knn_fast(X, k, b):
     X_np = X_normalized.cpu().detach().numpy().astype('float32')
     X_np = np.ascontiguousarray(X_np) # Ensure contiguous array
 
-    # Build FAISS index
-    index = faiss.IndexFlatIP(X.shape[1]) # IP index for cosine similarity on normalized data
+    # --- FAISS ANN Index Setup (IndexIVFFlat) ---
+    # Heuristic for nlist (number of Voronoi cells/partitions)
+    # Adjust this based on dataset size and desired speed/accuracy trade-off
+    nlist = min(n // 40, max(1, int(4 * np.sqrt(n)))) # Rule of thumb: between 4*sqrt(N) and N/40
+    nlist = max(1, nlist) # Ensure nlist is at least 1
 
+    # Quantizer (defines the space partitioning) using Inner Product
+    quantizer = faiss.IndexFlatIP(d)
+
+    # Create the IVF index
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+
+    # Train the index (learns the data partitioning)
+    # NOTE: Training every time can be inefficient. Consider pre-training if possible.
+    if not index.is_trained:
+        index.train(X_np)
+
+    # Add the data to the index
     index.add(X_np)
 
+    # Set nprobe (number of cells to search) - higher is more accurate but slower
+    # Adjust this based on desired speed/accuracy trade-off
+    index.nprobe = min(nlist, max(1, nlist // 10)) # Search ~10% of cells, minimum 1
+    # --- End FAISS ANN Setup ---
+
     # Search for k+1 neighbors (including self)
-    # Search on CPU data even if index is on GPU
     vals_np, inds_np = index.search(X_np, k + 1)
 
     # Convert results back to PyTorch tensors
     vals = torch.from_numpy(vals_np).to(device) # Similarities
     inds = torch.from_numpy(inds_np).to(device) # Indices
 
-    # Ensure similarities are non-negative (cosine similarity can be slightly < 0 due to precision)
-    vals = torch.clamp(vals, min=0.0)
+    # Handle potential -1 indices from FAISS search (if < k neighbors found in searched partitions)
+    valid_mask_faiss = (inds_np != -1).flatten() # Flatten to match flattened rows/cols/values later
+    vals = torch.clamp(vals, min=0.0) # Ensure similarities are non-negative
 
-    # Create COO structure
-    rows = torch.arange(n, device=device).view(-1, 1).repeat(1, k + 1).view(-1)
-    cols = inds.view(-1)
-    values = vals.view(-1)
+    # Create COO structure (Initial creation based on expected full shape)
+    rows_full = torch.arange(n, device=device).view(-1, 1).repeat(1, k + 1).view(-1)
+    cols_full = inds.view(-1)
+    values_full = vals.view(-1)
 
-    # Filter out invalid indices if any (shouldn't happen with k < n)
-    valid_mask = (cols >= 0) & (cols < n)
-    rows = rows[valid_mask]
-    cols = cols[valid_mask]
-    values = values[valid_mask]
+    # Apply the valid mask from FAISS search results
+    rows = rows_full[valid_mask_faiss]
+    cols = cols_full[valid_mask_faiss]
+    values = values_full[valid_mask_faiss]
+
+    # --- Normalization (Same as before, but uses the potentially smaller ANN graph) ---
 
     # Calculate normalization terms (replicating original logic for symmetric normalization)
-    # Sum similarities for the k+1 neighbors found by FAISS for each node (outgoing weights)
-    # vals has shape (n, k+1) corresponding to the neighbors found for each node
-    norm_row = torch.sum(vals, dim=1)
+    # We need the sums based on the *original* k+1 potential neighbors structure before filtering,
+    # because the normalization factor depends on the sum of similarities *returned by the search* for each node.
+    # However, some values/indices might be invalid (-1), so handle that.
+
+    # Create a temporary vals tensor where -1 indices correspond to 0 similarity
+    vals_safe = vals.clone() # vals has shape (n, k+1)
+    vals_safe[inds == -1] = 0.0
+
+    # Sum similarities for the neighbors *found* by FAISS for each node (outgoing weights)
+    norm_row = torch.sum(vals_safe, dim=1) # Shape (n,)
 
     # Sum similarities for incoming edges per node (incoming weights)
-    # Uses the flattened COO structure: sums 'values' where the destination index is 'cols'
+    # Uses the filtered COO structure: sums 'values' where the destination index is 'cols'
     norm_col = torch.zeros(n, device=device)
-    norm_col.index_add_(0, cols, values) # Accumulate raw similarity values based on column index
+    # Use the *filtered* cols and values for index_add_
+    norm_col.index_add_(0, cols, values) # Accumulate valid similarity values based on column index
 
     # Combine outgoing and incoming sums for the normalization factor (analogous to degree)
     norm = norm_row + norm_col + EOS # Add EOS for stability
 
     # Apply symmetric normalization D^(-1/2) * A * D^(-1/2)
+    # Use the filtered rows/cols indices to access the correct norm values
     norm_rows_sqrt_inv = torch.pow(norm[rows], -0.5)
     norm_cols_sqrt_inv = torch.pow(norm[cols], -0.5)
+    # Apply normalization only to the valid 'values'
     values *= norm_rows_sqrt_inv * norm_cols_sqrt_inv
+    # --- End Normalization ---
 
     # Ensure indices are long type
     rows = rows.long()
     cols = cols.long()
+
+    end_time = time.time()
+    print(f"knn_fast execution time: {end_time - start_time:.4f} seconds")
 
     return rows, cols, values
 
