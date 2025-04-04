@@ -248,32 +248,77 @@ def top_k(raw_graph, K):
 
 
 def knn_fast(X, k, b):
+    """
+    Computes the k-nearest neighbors graph using FAISS for efficiency.
+
+    Args:
+        X (torch.Tensor): Input features (num_nodes x num_features).
+        k (int): Number of neighbors to find for each node.
+        b (int): Batch size parameter (ignored in this FAISS implementation).
+
+    Returns:
+        tuple: (rows, cols, values) representing the graph in COO format
+               with normalized edge weights.
+    """
     device = X.device
-    X = F.normalize(X, dim=1, p=2)
-    index = 0
-    values = torch.zeros(X.shape[0] * (k + 1), device=device)
-    rows = torch.zeros(X.shape[0] * (k + 1), device=device)
-    cols = torch.zeros(X.shape[0] * (k + 1), device=device)
-    norm_row = torch.zeros(X.shape[0], device=device)
-    norm_col = torch.zeros(X.shape[0], device=device)
-    while index < X.shape[0]:
-        if (index + b) > (X.shape[0]):
-            end = X.shape[0]
-        else:
-            end = index + b
-        sub_tensor = X[index:index + b]
-        similarities = torch.mm(sub_tensor, X.t())
-        vals, inds = similarities.topk(k=k + 1, dim=-1)
-        values[index * (k + 1):(end) * (k + 1)] = vals.view(-1)
-        cols[index * (k + 1):(end) * (k + 1)] = inds.view(-1)
-        rows[index * (k + 1):(end) * (k + 1)] = torch.arange(index, end, device=device).view(-1, 1).repeat(1, k + 1).view(-1)
-        norm_row[index: end] = torch.sum(vals, dim=1)
-        norm_col.index_add_(-1, inds.view(-1), vals.view(-1))
-        index += b
-    norm = norm_row + norm_col
+    n = X.shape[0]
+
+    # Normalize features for cosine similarity
+    X_normalized = F.normalize(X, dim=1, p=2)
+
+    # Convert to numpy for FAISS
+    X_np = X_normalized.cpu().numpy().astype('float32')
+    X_np = np.ascontiguousarray(X_np) # Ensure contiguous array
+
+    # Build FAISS index
+    index = faiss.IndexFlatIP(X.shape[1]) # IP index for cosine similarity on normalized data
+
+    index.add(X_np)
+
+    # Search for k+1 neighbors (including self)
+    # Search on CPU data even if index is on GPU
+    vals_np, inds_np = index.search(X_np, k + 1)
+
+    # Convert results back to PyTorch tensors
+    vals = torch.from_numpy(vals_np).to(device) # Similarities
+    inds = torch.from_numpy(inds_np).to(device) # Indices
+
+    # Ensure similarities are non-negative (cosine similarity can be slightly < 0 due to precision)
+    vals = torch.clamp(vals, min=0.0)
+
+    # Create COO structure
+    rows = torch.arange(n, device=device).view(-1, 1).repeat(1, k + 1).view(-1)
+    cols = inds.view(-1)
+    values = vals.view(-1)
+
+    # Filter out invalid indices if any (shouldn't happen with k < n)
+    valid_mask = (cols >= 0) & (cols < n)
+    rows = rows[valid_mask]
+    cols = cols[valid_mask]
+    values = values[valid_mask]
+
+    # Calculate normalization terms (replicating original logic for symmetric normalization)
+    # Sum similarities for the k+1 neighbors found by FAISS for each node (outgoing weights)
+    # vals has shape (n, k+1) corresponding to the neighbors found for each node
+    norm_row = torch.sum(vals, dim=1)
+
+    # Sum similarities for incoming edges per node (incoming weights)
+    # Uses the flattened COO structure: sums 'values' where the destination index is 'cols'
+    norm_col = torch.zeros(n, device=device)
+    norm_col.index_add_(0, cols, values) # Accumulate raw similarity values based on column index
+
+    # Combine outgoing and incoming sums for the normalization factor (analogous to degree)
+    norm = norm_row + norm_col + EOS # Add EOS for stability
+
+    # Apply symmetric normalization D^(-1/2) * A * D^(-1/2)
+    norm_rows_sqrt_inv = torch.pow(norm[rows], -0.5)
+    norm_cols_sqrt_inv = torch.pow(norm[cols], -0.5)
+    values *= norm_rows_sqrt_inv * norm_cols_sqrt_inv
+
+    # Ensure indices are long type
     rows = rows.long()
     cols = cols.long()
-    values *= (torch.pow(norm[rows], -0.5) * torch.pow(norm[cols], -0.5))
+
     return rows, cols, values
 
 
