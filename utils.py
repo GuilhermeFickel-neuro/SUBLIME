@@ -272,27 +272,22 @@ def knn_fast(X, k, b, use_gpu=False):
     # Normalize features (always on input device, likely GPU)
     X_normalized = F.normalize(X, dim=1, p=2)
 
-    # --- FAISS Setup --- 
-    # Heuristic for nlist (number of Voronoi cells/partitions)
-    nlist = min(n // 40, max(1, int(4 * np.sqrt(n))))
-    nlist = max(1, nlist) # Ensure nlist is at least 1
-    # Heuristic for nprobe (number of cells to search)
-    nprobe = min(nlist, max(1, nlist // 10))
-    nprobe = max(1, nprobe) # Ensure nprobe is at least 1
+    # --- FAISS Setup ---
+    # Removed nlist and nprobe calculations as we only use exact search now
 
     actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
     faiss_device_info = "CPU"
-    index_type = "IndexIVFFlat" # Default for CPU
+    index_type = "IndexFlatIP" # Default index type
 
     if actual_use_gpu:
         try:
-            # --- GPU FAISS Path (Using GpuIndexFlatIP - No Training Required) ---
+            # --- GPU FAISS Path (Using GpuIndexFlatIP - Exact Search) ---
             faiss_device_info = "GPU"
             index_type = "GpuIndexFlatIP"
             print(f"Attempting FAISS ({faiss_device_info}, {index_type})")
             res = faiss.StandardGpuResources()
-            
-            # Create GPU Flat Index directly - Metric is implicit in the class name
+
+            # Create GPU Flat Index directly
             gpu_index = faiss.GpuIndexFlatIP(res, d)
 
             # No training needed for IndexFlatIP
@@ -310,23 +305,23 @@ def knn_fast(X, k, b, use_gpu=False):
             print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
             actual_use_gpu = False # Reset flag to trigger CPU path
 
-    # CPU Path (or fallback from GPU error) - Still using IndexIVFFlat
+    # CPU Path (or fallback from GPU error) - Using IndexFlatIP
     if not actual_use_gpu:
-        # --- CPU FAISS Path (Using IndexIVFFlat) ---
+        # --- CPU FAISS Path (Using IndexFlatIP - Exact Search) ---
         faiss_device_info = "CPU"
-        index_type = "IndexIVFFlat"
-        print(f"Using FAISS ({faiss_device_info}, {index_type}) with nlist={nlist}, nprobe={nprobe}")
+        index_type = "IndexFlatIP"
+        print(f"Using FAISS ({faiss_device_info}, {index_type})")
         # Convert to numpy for CPU FAISS
         X_np = X_normalized.cpu().detach().numpy().astype('float32')
         X_np = np.ascontiguousarray(X_np)
 
-        quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+        # Create CPU Flat Index
+        index = faiss.IndexFlatIP(d)
 
-        if not index.is_trained:
-            index.train(X_np)
+        # No training needed for IndexFlatIP
+        # No nprobe needed for IndexFlatIP
+
         index.add(X_np)
-        index.nprobe = nprobe
 
         # Search using CPU index
         vals_np, inds_np = index.search(X_np, k + 1)
@@ -338,8 +333,9 @@ def knn_fast(X, k, b, use_gpu=False):
 
     # --- Post-processing (Common to both paths) ---
 
-    # Handle potential -1 indices from FAISS search (indices are on 'device' now)
-    valid_mask_faiss = (inds != -1).flatten() 
+    # Handle potential -1 indices from FAISS search (should not happen with IndexFlatIP and k < n)
+    # Still good practice to keep the clamp and mask for robustness
+    valid_mask_faiss = (inds != -1).flatten()
     vals = torch.clamp(vals, min=0.0) # Ensure similarities are non-negative
 
     # Create COO structure (Initial creation based on expected full shape)
@@ -348,13 +344,17 @@ def knn_fast(X, k, b, use_gpu=False):
     values_full = vals.view(-1)
 
     # Apply the valid mask from FAISS search results
+    # Note: For IndexFlatIP, if k+1 <= n, all indices should be valid (>=0)
+    #       unless something unexpected happens. Masking is cheap insurance.
     rows = rows_full[valid_mask_faiss]
     cols = cols_full[valid_mask_faiss]
     values = values_full[valid_mask_faiss]
 
     # --- Normalization (Common logic, uses tensors on 'device') ---
     vals_safe = vals.clone() # vals has shape (n, k+1) tensor on 'device'
-    vals_safe[inds == -1] = 0.0 # inds is (n, k+1) tensor on 'device'
+    # Since IndexFlatIP shouldn't return -1 for k+1 <= n, this masking might be redundant,
+    # but harmless if valid_mask_faiss handled any edge cases.
+    vals_safe[inds == -1] = 0.0
 
     norm_row = torch.sum(vals_safe, dim=1) # Shape (n,)
 
