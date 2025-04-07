@@ -279,7 +279,12 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
         return max(divisors) if divisors else 1
         
     # Calculate appropriate values for nlist (num of clusters) and M (num of subquantizers)
-    nlist = min(4 * int(np.sqrt(n)), n // 10)  # Rule of thumb
+    if n < 10000:  # For smaller datasets
+        nlist = min(int(np.sqrt(n)), n // 20)  # Much fewer centroids
+        nbits = 6
+    else:
+        nlist = min(4 * int(np.sqrt(n)), n // 10)  # Original formula
+        nbits = 8
     M = get_valid_pq_m(d)  # Find divisor of d that's <= 16
     
     # Set nprobe (num of clusters to visit during search) - higher = better recall but slower
@@ -339,7 +344,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
 
         # Create quantizer and IVFPQ index
         quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFPQ(quantizer, d, nlist, M, 8, faiss.METRIC_INNER_PRODUCT)
+        index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
         
         # Train the index (required for IVFPQ)
         index.train(X_np)
