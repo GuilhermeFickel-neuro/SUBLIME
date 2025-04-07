@@ -61,7 +61,8 @@ class Experiment:
         else:
             features_v1 = copy.deepcopy(features)
 
-        z1, _ = model(features_v1, anchor_adj, 'anchor')
+        # Get projection (z1) and embedding (emb1) from anchor view
+        z1, emb1 = model(features_v1, anchor_adj, 'anchor') # Modified to get embedding
 
         # view 2: learned graph
         if args.maskfeat_rate_learner:
@@ -75,9 +76,10 @@ class Experiment:
             learned_adj = symmetrize(learned_adj)
             learned_adj = normalize(learned_adj, 'sym', args.sparse)
 
-        z2, _ = model(features_v2, learned_adj, 'learner')
+        # Get projection (z2) and embedding (emb2) from learner view
+        z2, emb2 = model(features_v2, learned_adj, 'learner') # Modified to get embedding
 
-        # compute loss
+        # compute loss (contrastive)
         if args.contrast_batch_size:
             node_idxs = list(range(features.shape[0]))
             batches = split_batch(node_idxs, args.contrast_batch_size)
@@ -88,8 +90,10 @@ class Experiment:
         else:
             loss = model.calc_loss(z1, z2)
 
-        return loss, learned_adj
-        
+        # Return contrastive loss, learned adj, and the learner embedding
+        # The learner embedding (emb2) will be used by loss_arcface if called
+        return loss, learned_adj, emb2
+
     def loss_arcface(self, model, graph_learner, features, anchor_adj, labels, args):
         """
         Calculate combined loss using both ArcFace loss and contrastive learning
@@ -114,18 +118,34 @@ class Experiment:
             # Use the memory-efficient batched implementation
             return self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
             
-        # First calculate the original contrastive loss
-        contrastive_loss, learned_adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
-        
-        # Now calculate the ArcFace loss
-        # Forward pass with labels for ArcFace
+        # --- Optimization Implementation ---
+        # 1. Calculate the contrastive loss and GET the learner embedding (emb2)
+        #    This avoids a redundant forward pass later.
+        contrastive_loss, learned_adj, learner_embedding = self.loss_gcl(
+            model, graph_learner, features, anchor_adj, args
+        )
+
+        # 2. Calculate the ArcFace loss using the already computed embedding
         if not hasattr(args, 'arcface_weight'):
             arcface_weight = 1.0  # Default weight
         else:
             arcface_weight = args.arcface_weight
             
-        # For ArcFace, we need a separate forward pass to get the ArcFace outputs
-        _, _, arcface_output = model(features, learned_adj, 'learner', labels)
+        # Ensure the model has the ArcFace layer before proceeding
+        if not hasattr(model, 'arcface'):
+             raise AttributeError("Model does not have an 'arcface' layer, but loss_arcface was called.")
+
+        # Pass the embedding directly to the ArcFace layer.
+        # No need for another full model(features, ...) call here.
+        # Check if it's the sampled version (which returns output and sampled labels)
+        # Note: This standard loss_arcface function shouldn't ideally be called if sampled_arcface is True,
+        # as loss_arcface_sampled should be used instead. This check is for robustness.
+        if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
+             arcface_output, _ = model.arcface(learner_embedding, labels)
+        else:
+             # Standard ArcFace layer just returns the output logits
+             arcface_output = model.arcface(learner_embedding, labels)
+        # --- End Optimization Implementation ---
         
         # Calculate cross-entropy loss
         criterion = nn.CrossEntropyLoss()
@@ -148,7 +168,7 @@ class Experiment:
         (e.g., 5,000 classes instead of all 35,000), drastically reducing memory usage.
         """
         # First calculate the original contrastive loss
-        contrastive_loss, learned_adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+        contrastive_loss, learned_adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
         
         # Get weight for ArcFace loss
         if not hasattr(args, 'arcface_weight'):
@@ -942,129 +962,29 @@ class Experiment:
                             best_val_test = test_accu
                             best_epoch = epoch
 
-                    elif args.downstream_task == 'clustering':
+                    elif args.downstream_task == 'clustering' and labels is not None:
                         model.eval()
                         graph_learner.eval()
                         _, embedding = model(features, Adj)
                         
                         embedding = embedding.cpu().detach().numpy()
-
-                        # For unlabeled data, we'll use unsupervised metrics
-                        if labels is None:
-                            # Compute silhouette score to measure cluster quality
-                            if args.verbose:
-                                print(f"Embedding shape: {embedding.shape}")
-                            kmeans = KMeans(n_clusters=nclasses, random_state=0).fit(embedding)
-                            
+                        acc_mr, nmi_mr, f1_mr, ari_mr = [], [], [], []
+                        for clu_trial in range(n_clu_trials):
+                            kmeans = KMeans(n_clusters=nclasses, random_state=clu_trial).fit(embedding)
                             predict_labels = kmeans.predict(embedding)
-                            
-                            # Silhouette score: higher is better (-1 to 1)
-                            sil_score = silhouette_score(embedding, predict_labels)
-                            
-                            # Davies-Bouldin score: lower is better
-                            db_score = davies_bouldin_score(embedding, predict_labels)
-                            
-                            # Inertia (within-cluster sum of squares): lower is better
-                            inertia = kmeans.inertia_
-                            
-                            # Get cluster sizes
-                            unique, counts = np.unique(predict_labels, return_counts=True)
-                            cluster_sizes = dict(zip(unique, counts))
-                            
-                            if args.verbose:
-                                print("\nClustering Evaluation:")
-                                print(f"Silhouette Score: {sil_score:.4f} (higher is better, range: -1 to 1)")
-                                print(f"Davies-Bouldin Score: {db_score:.4f} (lower is better)")
-                                print(f"Inertia: {inertia:.4f} (lower is better)")
-                            
-                            # Calculate cluster statistics
-                            cluster_stats = {}
-                            all_distances = []
-                            for cluster_id in unique:
-                                cluster_mask = predict_labels == cluster_id
-                                cluster_points = embedding[cluster_mask]
-                                
-                                cluster_center = kmeans.cluster_centers_[cluster_id]
-                                
-                                # Calculate mean distance to center
-                                distances = np.linalg.norm(cluster_points - cluster_center, axis=1)
-                                all_distances.extend(distances)
-                                
-                                mean_dist = distances.mean()
-                                std_dist = distances.std()
-                                
-                                cluster_stats[cluster_id] = {
-                                    'size': counts[cluster_id],
-                                    'mean_distance_to_center': mean_dist,
-                                    'std_distance_to_center': std_dist
-                                }
-                            
-                            # Calculate overall statistics
-                            avg_cluster_size = np.mean(counts)
-                            std_cluster_size = np.std(counts)
-                            min_cluster_size = np.min(counts)
-                            max_cluster_size = np.max(counts)
-                            
-                            avg_distance = np.mean(all_distances)
-                            std_distance = np.std(all_distances)
-                            
-                            # Print condensed summary
-                            if args.verbose:
-                                print("\nCluster Statistics Summary:")
-                                print(f"Number of clusters: {len(unique)}")
-                                print(f"Cluster sizes: min={min_cluster_size}, max={max_cluster_size}, avg={avg_cluster_size:.2f}, std={std_cluster_size:.2f}")
-                                print(f"Distance to center: avg={avg_distance:.4f}, std={std_distance:.4f}")
-                                
-                                # Replace detailed distribution with condensed statistics
-                                sorted_clusters = sorted(zip(unique, counts), key=lambda x: x[1], reverse=True)
-                                
-                                # Only show top 3 and bottom 3 clusters if there are more than 6 clusters
-                                if len(unique) > 6:
-                                    print("\nLargest clusters:")
-                                    for cluster_id, count in sorted_clusters[:3]:
-                                        print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
-                                    
-                                    print("\nSmallest clusters:")
-                                    for cluster_id, count in sorted_clusters[-3:]:
-                                        print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
-                                    
-                                    # Add size distribution histogram using text-based visualization
-                                    print("\nCluster size distribution (text histogram):")
-                                    bin_count = min(10, len(unique))  # Use at most 10 bins
-                                    hist, bin_edges = np.histogram(counts, bins=bin_count)
-                                    max_bar_length = 40  # Maximum length of histogram bars
-                                    
-                                    for i in range(len(hist)):
-                                        bin_start = int(bin_edges[i])
-                                        bin_end = int(bin_edges[i+1])
-                                        bar_length = int((hist[i] / max(hist)) * max_bar_length)
-                                        bar = '█' * bar_length
-                                        print(f"  {bin_start:4d}-{bin_end:<4d} | {bar} ({hist[i]})")
-                                else:
-                                    # If few clusters, show all of them
-                                    print("\nCluster size distribution:")
-                                    for cluster_id, count in sorted_clusters:
-                                        print(f"  Cluster {cluster_id}: {count} points ({count/len(predict_labels)*100:.1f}%)")
+                            cm_all = clustering_metrics(labels.cpu().numpy(), predict_labels)
+                            acc_, nmi_, f1_, ari_ = cm_all.evaluationClusterModelFromLabel(print_results=False)
+                            acc_mr.append(acc_)
+                            nmi_mr.append(nmi_)
+                            f1_mr.append(f1_)
+                            ari_mr.append(ari_)
                         
-                        else:
-                            # Original code for labeled data
-                            acc_mr, nmi_mr, f1_mr, ari_mr = [], [], [], []
-                            for clu_trial in range(n_clu_trials):
-                                kmeans = KMeans(n_clusters=nclasses, random_state=clu_trial).fit(embedding)
-                                predict_labels = kmeans.predict(embedding)
-                                cm_all = clustering_metrics(labels.cpu().numpy(), predict_labels)
-                                acc_, nmi_, f1_, ari_ = cm_all.evaluationClusterModelFromLabel(print_results=False)
-                                acc_mr.append(acc_)
-                                nmi_mr.append(nmi_)
-                                f1_mr.append(f1_)
-                                ari_mr.append(ari_)
-                            
-                            acc, nmi, f1, ari = np.mean(acc_mr), np.mean(nmi_mr), np.mean(f1_mr), np.mean(ari_mr)
-                            if args.verbose:
-                                print("Final ACC: ", acc)
-                                print("Final NMI: ", nmi)
-                                print("Final F-score: ", f1)
-                                print("Final ARI: ", ari)
+                        acc, nmi, f1, ari = np.mean(acc_mr), np.mean(nmi_mr), np.mean(f1_mr), np.mean(ari_mr)
+                        if args.verbose:
+                            print("Final ACC: ", acc)
+                            print("Final NMI: ", nmi)
+                            print("Final F-score: ", f1)
+                            print("Final ARI: ", ari)
 
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val.item())
