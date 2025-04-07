@@ -10,7 +10,7 @@ from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from main import Experiment
-from utils import sparse_mx_to_torch_sparse_tensor
+from utils import sparse_mx_to_torch_sparse_tensor, faiss_kneighbors_graph
 
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -113,17 +113,27 @@ def load_person_data(args):
     val_mask = torch.zeros(n_samples, dtype=torch.bool)
     test_mask = torch.zeros(n_samples, dtype=torch.bool)
     
-    # Handle adjacency matrix
+    # Handle adjacency matrix: Use k-NN graph instead of identity
+    print(f"Constructing k-NN graph with k={args.k} using FAISS (cosine similarity)...")
+    # Ensure data is float32 for FAISS
+    if processed_data.dtype != np.float32:
+        processed_data = processed_data.astype(np.float32)
+        
+    # Compute k-NN graph using faiss
+    knn_graph_sparse = faiss_kneighbors_graph(processed_data, k=args.k, metric='cosine')
+    print(f"k-NN graph computed. Shape: {knn_graph_sparse.shape}, Non-zero entries: {knn_graph_sparse.nnz}")
+
     if args.sparse:
-        # Create sparse identity matrix using scipy first
-        identity = sp.eye(n_samples, dtype=np.float32)
-        # Convert to torch sparse tensor using the same method as in citation network
-        adj = sparse_mx_to_torch_sparse_tensor(identity)
+        # Convert scipy sparse matrix to torch sparse tensor
+        adj = sparse_mx_to_torch_sparse_tensor(knn_graph_sparse).to(device)
+        print("Using sparse adjacency matrix.")
     else:
-        adj = torch.eye(n_samples).to(device)
+        # Convert scipy sparse matrix to dense torch tensor
+        adj = torch.FloatTensor(knn_graph_sparse.todense()).to(device)
+        print("Using dense adjacency matrix.")
     
     # Convert features to dense torch tensor
-    features = torch.FloatTensor(features.todense())
+    features = torch.FloatTensor(features.todense()).to(device) # Move features to device
     
     # Get feature dimension
     nfeats = features.shape[1]
@@ -139,7 +149,7 @@ def main():
     parser.add_argument('-dataset', type=str, default='person_data.csv')
     parser.add_argument('-ntrials', type=int, default=1)  # Reduced since we don't need multiple trials for self-supervised
     parser.add_argument('-sparse', type=int, default=0)  # Changed default to 0 for CPU compatibility
-    parser.add_argument('-gsl_mode', type=str, default="structure_inference")
+    parser.add_argument('-gsl_mode', type=str, default="structure_refinement")
     parser.add_argument('-eval_freq', type=int, default=500)
     parser.add_argument('-downstream_task', type=str, default='clustering')  # Changed to clustering since we don't have labels
     parser.add_argument('-n_clusters', type=int, default=5, help='Number of clusters for clustering task')

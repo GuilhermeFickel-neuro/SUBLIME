@@ -1106,7 +1106,7 @@ if __name__ == '__main__':
                         help='Path to the dataset file')
     parser.add_argument('-ntrials', type=int, default=5)
     parser.add_argument('-sparse', type=int, default=0)
-    parser.add_argument('-gsl_mode', type=str, default="structure_inference",
+    parser.add_argument('-gsl_mode', type=str, default="structure_refinement",
                         choices=['structure_inference', 'structure_refinement'])
     parser.add_argument('-eval_freq', type=int, default=5)
     parser.add_argument('-downstream_task', type=str, default='classification',
