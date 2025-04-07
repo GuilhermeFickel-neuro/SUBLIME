@@ -248,137 +248,154 @@ def top_k(raw_graph, K):
     return sparse_graph
 
 
-def knn_fast(X, k, b, use_gpu=False):
+def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
     """
-    Computes the k-nearest neighbors graph using FAISS with an Approximate
-    Nearest Neighbor (ANN) index (IndexIVFFlat) for efficiency.
-    Can optionally run FAISS operations on GPU if available and requested.
-
+    Optimized KNN implementation using FAISS with IndexIVFPQ for best performance.
+    Based on benchmarking results showing IndexIVFPQ as the fastest method.
+    
     Args:
         X (torch.Tensor): Input features (num_nodes x num_features).
         k (int): Number of neighbors to find for each node.
-        b (int): Batch size parameter (ignored in this FAISS implementation).
+        b (int): Batch size parameter (kept for backward compatibility, not used).
         use_gpu (bool): If True, attempt to use GPU for FAISS operations.
                       Defaults to False.
-
+        nprobe (int, optional): Number of clusters to visit (higher improves recall).
+                               If None, a suitable value is selected automatically.
+                               
     Returns:
         tuple: (rows, cols, values) representing the graph in COO format
                with normalized edge weights.
     """
     start_time = time.time()
     device = X.device
-    n, d = X.shape # number of nodes, dimension of features
+    n, d = X.shape  # number of nodes, dimension of features
 
-    # Normalize features (always on input device, likely GPU)
+    # Normalize features for cosine similarity
     X_normalized = F.normalize(X, dim=1, p=2)
-
-    # --- FAISS Setup ---
-    # Removed nlist and nprobe calculations as we only use exact search now
-
+    
+    # Find a valid number of subquantizers (M) that divides d
+    def get_valid_pq_m(d, max_m=16):
+        divisors = [i for i in range(1, min(max_m+1, d+1)) if d % i == 0]
+        return max(divisors) if divisors else 1
+        
+    # Calculate appropriate values for nlist (num of clusters) and M (num of subquantizers)
+    nlist = min(4 * int(np.sqrt(n)), n // 10)  # Rule of thumb
+    M = get_valid_pq_m(d)  # Find divisor of d that's <= 16
+    
+    # Set nprobe (num of clusters to visit during search) - higher = better recall but slower
+    if nprobe is None:
+        nprobe = min(nlist // 2, 100)  # Increased from usual nlist//4 for better recall
+    
     actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
+    index_type = "IndexIVFPQ"  # Best performing index according to benchmarks
     faiss_device_info = "CPU"
-    index_type = "IndexFlatIP" # Default index type
 
     if actual_use_gpu:
         try:
-            # --- GPU FAISS Path (Using GpuIndexFlatIP - Exact Search) ---
+            # --- GPU FAISS Path ---
             faiss_device_info = "GPU"
-            index_type = "GpuIndexFlatIP"
-            print(f"Attempting FAISS ({faiss_device_info}, {index_type})")
+            print(f"Attempting FAISS on GPU with {index_type}")
             res = faiss.StandardGpuResources()
 
-            # Create GPU Flat Index directly
-            gpu_index = faiss.GpuIndexFlatIP(res, d)
-
-            # No training needed for IndexFlatIP
-
-            # Add data to GPU index
-            gpu_index.add(X_normalized) # Pass GPU tensor
-
-            # No nprobe needed for IndexFlatIP
-
-            # Search using GPU index and GPU data
-            vals, inds = gpu_index.search(X_normalized, k + 1) # Returns tensors on GPU
-            # --- End GPU FAISS Path ---
-
+            # Create CPU index first since some complex indices must be trained on CPU
+            cpu_quantizer = faiss.IndexFlatIP(d)
+            cpu_index = faiss.IndexIVFPQ(cpu_quantizer, d, nlist, M, 8, faiss.METRIC_INNER_PRODUCT)
+            
+            # Convert normalized features to numpy for training
+            X_np = X_normalized.cpu().detach().numpy().astype('float32')
+            X_np = np.ascontiguousarray(X_np)
+            
+            # Train on CPU
+            cpu_index.train(X_np)
+            
+            # Move index to GPU after training
+            gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+            
+            # Set search parameters
+            gpu_index.nprobe = nprobe
+            
+            # Add data to the index
+            gpu_index.add(X_np)
+            
+            # Search
+            vals_np, inds_np = gpu_index.search(X_np, k + 1)
+            
+            # Convert results back to torch tensors
+            vals = torch.from_numpy(vals_np).to(device)
+            inds = torch.from_numpy(inds_np).to(device)
+            
         except Exception as e:
             print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
-            actual_use_gpu = False # Reset flag to trigger CPU path
+            actual_use_gpu = False  # Reset flag to trigger CPU path
 
-    # CPU Path (or fallback from GPU error) - Using IndexFlatIP
+    # CPU Path (or fallback from GPU error)
     if not actual_use_gpu:
-        # --- CPU FAISS Path (Using IndexFlatIP - Exact Search) ---
         faiss_device_info = "CPU"
-        index_type = "IndexFlatIP"
-        print(f"Using FAISS ({faiss_device_info}, {index_type})")
+        print(f"Using FAISS on CPU with {index_type}")
+        
         # Convert to numpy for CPU FAISS
         X_np = X_normalized.cpu().detach().numpy().astype('float32')
         X_np = np.ascontiguousarray(X_np)
 
-        # Create CPU Flat Index
-        index = faiss.IndexFlatIP(d)
-
-        # No training needed for IndexFlatIP
-        # No nprobe needed for IndexFlatIP
-
+        # Create quantizer and IVFPQ index
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFPQ(quantizer, d, nlist, M, 8, faiss.METRIC_INNER_PRODUCT)
+        
+        # Train the index (required for IVFPQ)
+        index.train(X_np)
+        
+        # Set search parameters
+        index.nprobe = nprobe
+        
+        # Add vectors to the index
         index.add(X_np)
-
-        # Search using CPU index
-        vals_np, inds_np = index.search(X_np, k + 1)
-
-        # Convert results back to PyTorch tensors on the original device
+        
+        # Search
+        vals_np, inds_np = index.search(X_np, k + 1)  # +1 to include self
+        
+        # Convert results back to PyTorch tensors
         vals = torch.from_numpy(vals_np).to(device)
         inds = torch.from_numpy(inds_np).to(device)
-        # --- End CPU FAISS Path ---
 
     # --- Post-processing (Common to both paths) ---
-
-    # Handle potential -1 indices from FAISS search (should not happen with IndexFlatIP and k < n)
-    # Still good practice to keep the clamp and mask for robustness
+    
+    # Handle potential -1 indices from FAISS search
     valid_mask_faiss = (inds != -1).flatten()
-    vals = torch.clamp(vals, min=0.0) # Ensure similarities are non-negative
+    vals = torch.clamp(vals, min=0.0)  # Ensure similarities are non-negative
 
-    # Create COO structure (Initial creation based on expected full shape)
+    # Create COO structure
     rows_full = torch.arange(n, device=device).view(-1, 1).repeat(1, k + 1).view(-1)
     cols_full = inds.view(-1)
     values_full = vals.view(-1)
 
-    # Apply the valid mask from FAISS search results
-    # Note: For IndexFlatIP, if k+1 <= n, all indices should be valid (>=0)
-    #       unless something unexpected happens. Masking is cheap insurance.
+    # Apply the valid mask
     rows = rows_full[valid_mask_faiss]
     cols = cols_full[valid_mask_faiss]
     values = values_full[valid_mask_faiss]
 
-    # --- Normalization (Common logic, uses tensors on 'device') ---
-    vals_safe = vals.clone() # vals has shape (n, k+1) tensor on 'device'
-    # Since IndexFlatIP shouldn't return -1 for k+1 <= n, this masking might be redundant,
-    # but harmless if valid_mask_faiss handled any edge cases.
+    # --- Normalization ---
+    vals_safe = vals.clone()
     vals_safe[inds == -1] = 0.0
-
-    norm_row = torch.sum(vals_safe, dim=1) # Shape (n,)
-
+    
+    norm_row = torch.sum(vals_safe, dim=1)
+    
     norm_col = torch.zeros(n, device=device)
-    # Use the *filtered* cols and values (already on 'device')
     norm_col.index_add_(0, cols, values)
-
-    norm = norm_row + norm_col + EOS # Add EOS for stability
-
+    
+    norm = norm_row + norm_col + EOS  # Add EOS for stability
+    
     # Apply symmetric normalization D^(-1/2) * A * D^(-1/2)
-    # Use the filtered rows/cols indices to access the correct norm values
     norm_rows_sqrt_inv = torch.pow(norm[rows], -0.5)
     norm_cols_sqrt_inv = torch.pow(norm[cols], -0.5)
-    # Apply normalization only to the valid 'values'
     values *= norm_rows_sqrt_inv * norm_cols_sqrt_inv
-    # --- End Normalization ---
-
+    
     # Ensure indices are long type
     rows = rows.long()
     cols = cols.long()
-
+    
     end_time = time.time()
-    print(f"knn_fast ({faiss_device_info}, {index_type}) execution time: {end_time - start_time:.4f} seconds")
-
+    print(f"knn_fast ({faiss_device_info}, {index_type}, M={M}, nprobe={nprobe}) execution time: {end_time - start_time:.4f} seconds")
+    
     return rows, cols, values
 
 
