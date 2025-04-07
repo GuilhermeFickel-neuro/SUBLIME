@@ -93,7 +93,7 @@ class FGP_learner(nn.Module):
             adj_dense = torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i))
             self.Adj = nn.Parameter(adj_dense)
 
-    def forward(self, h):
+    def forward(self, h, faiss_index=None):
         if not self.sparse:
             # For dense mode
             Adj = F.elu(self.Adj) + 1
@@ -150,10 +150,10 @@ class ATT_learner(nn.Module):
                     h = F.tanh(h)
         return h
 
-    def forward(self, features):
+    def forward(self, features, faiss_index=None):
         if self.sparse:
             embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000)
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
             rows_ = torch.cat((rows, cols))
             cols_ = torch.cat((cols, rows))
             values_ = torch.cat((values, values))
@@ -207,10 +207,10 @@ class MLP_learner(nn.Module):
         for layer in self.layers:
             layer.weight = nn.Parameter(torch.eye(self.input_dim))
 
-    def forward(self, features):
+    def forward(self, features, faiss_index=None):
         if self.sparse:
             embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000)
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
             rows_ = torch.cat((rows, cols))
             cols_ = torch.cat((cols, rows))
             values_ = torch.cat((values, values))
@@ -265,10 +265,10 @@ class GNN_learner(nn.Module):
         for layer in self.layers:
             layer.weight = nn.Parameter(torch.eye(self.input_dim))
 
-    def forward(self, features):
+    def forward(self, features, faiss_index=None):
         if self.sparse:
             embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000)
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
             rows_ = torch.cat((rows, cols))
             cols_ = torch.cat((cols, rows))
             values_ = torch.cat((values, values))

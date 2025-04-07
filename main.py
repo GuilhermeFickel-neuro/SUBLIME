@@ -551,7 +551,7 @@ class Experiment:
             
         return adj
 
-    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None):
+    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None, faiss_index=None):
         """
         Process a new data point by replacing an existing point and extract its embedding features
         
@@ -563,6 +563,7 @@ class Experiment:
             adj: The current adjacency matrix
             sparse: Whether the adjacency is sparse
             replace_idx: Index of the point to replace. If None, will find the most similar point.
+            faiss_index: Optional pre-built FAISS index for the graph_learner to use
             
         Returns:
             torch.Tensor: The node embedding for the new point
@@ -597,7 +598,7 @@ class Experiment:
         
         # Generate new adjacency matrix using the graph learner
         with torch.no_grad():
-            new_adj = graph_learner(modified_features)
+            new_adj = graph_learner(modified_features, faiss_index=faiss_index)
             
             # Process adjacency matrix based on sparse flag
             if not sparse:

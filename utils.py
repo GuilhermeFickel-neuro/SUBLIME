@@ -12,6 +12,106 @@ import time
 
 EOS = 1e-10
 
+# New function to build and return a FAISS index
+def build_faiss_index(features, k=10, use_gpu=False, nprobe=None):
+    """
+    Build and return a FAISS index for the given features.
+    This can be reused to avoid rebuilding the index on each call.
+    
+    Args:
+        features (torch.Tensor): Input features (num_nodes x num_features).
+        k (int): Number of neighbors to find for each node (used to tune index).
+        use_gpu (bool): If True, attempt to use GPU for FAISS operations.
+        nprobe (int, optional): Number of clusters to visit (higher improves recall).
+                               
+    Returns:
+        faiss.Index: A trained FAISS index containing the features
+    """
+    print("Building reusable FAISS index...")
+    start_time = time.time()
+    
+    # Get device and dimensions
+    device = features.device
+    n, d = features.shape
+    
+    # Normalize features for cosine similarity
+    X_normalized = F.normalize(features, dim=1, p=2)
+    
+    # Convert to numpy for FAISS
+    X_np = X_normalized.cpu().detach().numpy().astype('float32')
+    X_np = np.ascontiguousarray(X_np)
+    
+    # Calculate appropriate values for nlist (num of clusters) and M (num of subquantizers)
+    def get_valid_pq_m(d, max_m=16):
+        divisors = [i for i in range(1, min(max_m+1, d+1)) if d % i == 0]
+        return max(divisors) if divisors else 1
+    
+    if n < 10000:
+        nlist = min(int(np.sqrt(n)), n // 20)
+        nbits = 6
+    else:
+        nlist = min(4 * int(np.sqrt(n)), n // 10)
+        nbits = 8
+    
+    M = get_valid_pq_m(d)
+    
+    # Set nprobe
+    if nprobe is None:
+        nprobe = min(nlist // 2, 100)
+    
+    # Build the index
+    actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
+    index_type = "IndexIVFPQ"
+    faiss_device_info = "CPU"
+    
+    if actual_use_gpu:
+        try:
+            faiss_device_info = "GPU"
+            print(f"Building FAISS index on GPU with {index_type}")
+            res = faiss.StandardGpuResources()
+            
+            # Create CPU index first
+            cpu_quantizer = faiss.IndexFlatIP(d)
+            cpu_index = faiss.IndexIVFPQ(cpu_quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
+            
+            # Train on CPU
+            cpu_index.train(X_np)
+            
+            # Move index to GPU after training
+            gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+            
+            # Set search parameters
+            gpu_index.nprobe = nprobe
+            
+            # Add data to the index
+            gpu_index.add(X_np)
+            
+            index = gpu_index
+        except Exception as e:
+            print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
+            actual_use_gpu = False
+    
+    if not actual_use_gpu:
+        faiss_device_info = "CPU"
+        print(f"Building FAISS index on CPU with {index_type}")
+        
+        # Create quantizer and IVFPQ index
+        quantizer = faiss.IndexFlatIP(d)
+        index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
+        
+        # Train the index
+        index.train(X_np)
+        
+        # Set search parameters
+        index.nprobe = nprobe
+        
+        # Add vectors to the index
+        index.add(X_np)
+    
+    end_time = time.time()
+    print(f"FAISS index built on {faiss_device_info} in {end_time - start_time:.4f} seconds")
+    
+    return index
 
 def apply_non_linearity(tensor, non_linearity, i):
     if non_linearity == 'elu':
@@ -248,10 +348,10 @@ def top_k(raw_graph, K):
     return sparse_graph
 
 
-def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
+def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
     """
-    Optimized KNN implementation using FAISS with IndexIVFPQ for best performance.
-    Based on benchmarking results showing IndexIVFPQ as the fastest method.
+    Optimized KNN implementation using FAISS with IndexIVFPQ.
+    Can reuse a pre-built FAISS index to avoid rebuilding the index on each call.
     
     Args:
         X (torch.Tensor): Input features (num_nodes x num_features).
@@ -261,6 +361,8 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
                       Defaults to False.
         nprobe (int, optional): Number of clusters to visit (higher improves recall).
                                If None, a suitable value is selected automatically.
+        faiss_index (faiss.Index, optional): A pre-built and trained FAISS index.
+                                            If provided, index building/training is skipped.
                                
     Returns:
         tuple: (rows, cols, values) representing the graph in COO format
@@ -273,97 +375,108 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
     # Normalize features for cosine similarity
     X_normalized = F.normalize(X, dim=1, p=2)
     
-    # Find a valid number of subquantizers (M) that divides d
-    def get_valid_pq_m(d, max_m=16):
-        divisors = [i for i in range(1, min(max_m+1, d+1)) if d % i == 0]
-        return max(divisors) if divisors else 1
+    # Convert normalized features to numpy for FAISS processing
+    X_np = X_normalized.cpu().detach().numpy().astype('float32')
+    X_np = np.ascontiguousarray(X_np)
+
+    index_built_or_trained = False # Flag to track if we built the index here
+
+    if faiss_index is None:
+        # --- Build and Train Index if not provided ---
+        index_built_or_trained = True
+        print("Building new FAISS index...")
         
-    # Calculate appropriate values for nlist (num of clusters) and M (num of subquantizers)
-    if n < 10000:  # For smaller datasets
-        nlist = min(int(np.sqrt(n)), n // 20)  # Much fewer centroids
-        nbits = 6
-    else:
-        nlist = min(4 * int(np.sqrt(n)), n // 10)  # Original formula
-        nbits = 8
-    M = get_valid_pq_m(d)  # Find divisor of d that's <= 16
-    
-    # Set nprobe (num of clusters to visit during search) - higher = better recall but slower
-    if nprobe is None:
-        nprobe = min(nlist // 2, 100)  # Increased from usual nlist//4 for better recall
-    
-    actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
-    index_type = "IndexIVFPQ"  # Best performing index according to benchmarks
-    faiss_device_info = "CPU"
+        # Find a valid number of subquantizers (M) that divides d
+        def get_valid_pq_m(d, max_m=16):
+            divisors = [i for i in range(1, min(max_m+1, d+1)) if d % i == 0]
+            return max(divisors) if divisors else 1
 
-    if actual_use_gpu:
-        try:
-            # --- GPU FAISS Path ---
-            faiss_device_info = "GPU"
-            print(f"Attempting FAISS on GPU with {index_type}")
-            res = faiss.StandardGpuResources()
+        # Calculate appropriate values for nlist (num of clusters) and M (num of subquantizers)
+        if n < 10000:  # For smaller datasets
+            nlist = min(int(np.sqrt(n)), n // 20)  # Much fewer centroids
+            nbits = 6
+        else:
+            nlist = min(4 * int(np.sqrt(n)), n // 10)  # Original formula
+            nbits = 8
+        M = get_valid_pq_m(d)  # Find divisor of d that's <= 16
 
-            # Create CPU index first since some complex indices must be trained on CPU
-            cpu_quantizer = faiss.IndexFlatIP(d)
-            cpu_index = faiss.IndexIVFPQ(cpu_quantizer, d, nlist, M, 8, faiss.METRIC_INNER_PRODUCT)
-            
-            # Convert normalized features to numpy for training
-            X_np = X_normalized.cpu().detach().numpy().astype('float32')
-            X_np = np.ascontiguousarray(X_np)
-            
-            # Train on CPU
-            cpu_index.train(X_np)
-            
-            # Move index to GPU after training
-            gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-            
-            # Set search parameters
-            gpu_index.nprobe = nprobe
-            
-            # Add data to the index
-            gpu_index.add(X_np)
-            
-            # Search
-            vals_np, inds_np = gpu_index.search(X_np, k + 1)
-            
-            # Convert results back to torch tensors
-            vals = torch.from_numpy(vals_np).to(device)
-            inds = torch.from_numpy(inds_np).to(device)
-            
-        except Exception as e:
-            print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
-            actual_use_gpu = False  # Reset flag to trigger CPU path
+        # Set nprobe (num of clusters to visit during search) - higher = better recall but slower
+        actual_nprobe = nprobe
+        if actual_nprobe is None:
+            actual_nprobe = min(nlist // 2, 100) # Use local variable
 
-    # CPU Path (or fallback from GPU error)
-    if not actual_use_gpu:
+        actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
+        index_type = "IndexIVFPQ"
         faiss_device_info = "CPU"
-        print(f"Using FAISS on CPU with {index_type}")
-        
-        # Convert to numpy for CPU FAISS
-        X_np = X_normalized.cpu().detach().numpy().astype('float32')
-        X_np = np.ascontiguousarray(X_np)
 
-        # Create quantizer and IVFPQ index
-        quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
-        
-        # Train the index (required for IVFPQ)
-        index.train(X_np)
-        
-        # Set search parameters
-        index.nprobe = nprobe
-        
-        # Add vectors to the index
-        index.add(X_np)
-        
-        # Search
-        vals_np, inds_np = index.search(X_np, k + 1)  # +1 to include self
-        
-        # Convert results back to PyTorch tensors
-        vals = torch.from_numpy(vals_np).to(device)
-        inds = torch.from_numpy(inds_np).to(device)
+        if actual_use_gpu:
+            try:
+                faiss_device_info = "GPU"
+                print(f"Attempting FAISS on GPU with {index_type}")
+                res = faiss.StandardGpuResources()
+                cpu_quantizer = faiss.IndexFlatIP(d)
+                cpu_index = faiss.IndexIVFPQ(cpu_quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT) # Use nbits
+                cpu_index.train(X_np)
+                gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                gpu_index.nprobe = actual_nprobe # Use local variable
+                gpu_index.add(X_np)
+                faiss_index = gpu_index # Assign to the variable we'll use for search
+            except Exception as e:
+                print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
+                actual_use_gpu = False
+
+        if not actual_use_gpu:
+            faiss_device_info = "CPU"
+            print(f"Using FAISS on CPU with {index_type}")
+            quantizer = faiss.IndexFlatIP(d)
+            index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT) # Use nbits
+            index.train(X_np)
+            index.nprobe = actual_nprobe # Use local variable
+            index.add(X_np)
+            faiss_index = index # Assign to the variable we'll use for search
+        # --- End of Index Building/Training ---
+    else:
+        # --- Use Provided Index ---
+        print("Using pre-built FAISS index for search.")
+        # We assume the provided index is already trained and has data added.
+        # We might need to set nprobe if it wasn't set previously or if we want a different value for this search.
+        actual_nprobe = nprobe
+        if actual_nprobe is None:
+             # Infer nprobe from index if possible, or use a default
+             if hasattr(faiss_index, 'nprobe'):
+                 actual_nprobe = faiss_index.nprobe
+             else:
+                 # Attempt to guess a reasonable nprobe based on index type if possible
+                 # For IVFPQ, nlist is important
+                 if isinstance(faiss_index, faiss.IndexIVFPQ):
+                     nlist = faiss_index.nlist
+                     actual_nprobe = min(nlist // 2, 100)
+                 else:
+                     actual_nprobe = 10 # Default fallback nprobe
+             print(f"Using nprobe={actual_nprobe} for search.")
+
+        if hasattr(faiss_index, 'nprobe'):
+             faiss_index.nprobe = actual_nprobe
+
+        # Determine if the provided index is on GPU
+        if hasattr(faiss_index, 'getDevice'):
+             faiss_device_info = f"GPU (device {faiss_index.getDevice()})"
+        else:
+             faiss_device_info = "CPU"
+        # --- End of Using Provided Index ---
+
+    # --- Search using the index (either built here or provided) ---
+    # We search using X_np (the features passed to this function call)
+    print(f"Searching neighbors using {faiss_device_info} index...")
+    vals_np, inds_np = faiss_index.search(X_np, k + 1) # Search for k+1 neighbors
+    print("Search complete.")
+
+    # Convert results back to PyTorch tensors
+    vals = torch.from_numpy(vals_np).to(device)
+    inds = torch.from_numpy(inds_np).to(device)
+    # --- End of Search ---
 
     # --- Post-processing (Common to both paths) ---
-    
     # Handle potential -1 indices from FAISS search
     valid_mask_faiss = (inds != -1).flatten()
     vals = torch.clamp(vals, min=0.0)  # Ensure similarities are non-negative
@@ -380,7 +493,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
 
     # --- Normalization ---
     vals_safe = vals.clone()
-    vals_safe[inds == -1] = 0.0
+    vals_safe[inds == -1] = 0.0 # Zero out contributions from invalid indices (-1)
     
     norm_row = torch.sum(vals_safe, dim=1)
     
@@ -397,9 +510,10 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None):
     # Ensure indices are long type
     rows = rows.long()
     cols = cols.long()
-    
+
     end_time = time.time()
-    print(f"knn_fast ({faiss_device_info}, {index_type}, M={M}, nprobe={nprobe}) execution time: {end_time - start_time:.4f} seconds")
+    index_source = "pre-built" if not index_built_or_trained else "built/trained"
+    print(f"knn_fast ({index_source} index, {k} neighbors) execution time: {end_time - start_time:.4f} seconds")
     
     return rows, cols, values
 
