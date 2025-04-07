@@ -14,3 +14,8 @@ torch_scatter
 ogb
 numpy<2
 munkres
+faiss-cpu
+xgboost
+catboost
+lightgbm
+optuna

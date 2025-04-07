@@ -1,18 +1,18 @@
 #!/bin/bash
 set -e  # Exit immediately if a command exits with a non-zero status
 
-echo "Installing Miniconda3..."
-mkdir -p ~/miniconda3
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
-bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
-rm ~/miniconda3/miniconda.sh
+# echo "Installing Miniconda3..."
+# mkdir -p ~/miniconda3
+# wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
+# bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3
+# rm ~/miniconda3/miniconda.sh
 
-# Add conda to path for this script session
-export PATH="$HOME/miniconda3/bin:$PATH"
+# # Add conda to path for this script session
+# export PATH="$HOME/miniconda3/bin:$PATH"
 
 # Initialize conda (creates ~/.bashrc modifications)
 echo "Initializing conda..."
-eval "$(~/miniconda3/bin/conda shell.bash hook)"
+eval "$(conda shell.bash hook)"
 conda init --all
 
 echo "Creating OpenGSL environment..."
@@ -25,8 +25,8 @@ conda activate OpenGSL
 
 echo "Installing PyTorch and dependencies..."
 # Install packages
-conda install -c nvidia/label/cuda-11.7.1 cuda-toolkit=11.7.1
-conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
+conda install -y -c nvidia/label/cuda-11.7.1 cuda-toolkit=11.7.1
+conda install -y pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
 conda install -y -c dglteam/label/cu117 'dgl<2'
 
 echo "Installing requirements from requirements.txt..."
