@@ -114,7 +114,7 @@ def preprocess_dataset_features(df, target_column=None, fit_transform=False):
         print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
         return preprocessed_data, y
 
-def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16, cache_dir=None, model_dir=None, dataset_name=None):
+def extract_in_batches(X, model, graph_learner, features, adj, sparse, experiment, batch_size=16, cache_dir=None, model_dir=None, dataset_name=None, faiss_index=None):
     """
     Extract features in batches to avoid memory issues (from test_sublime_features.py)
     
@@ -130,6 +130,7 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         cache_dir: Directory to cache results. If None, no caching is performed.
         model_dir: Directory where the model is stored, used for cache file naming
         dataset_name: Name of the dataset, used for cache file naming. If None, no caching is performed.
+        faiss_index: Optional pre-built FAISS index. If None, will build one from the features.
         
     Returns:
         numpy.ndarray: Extracted features
@@ -155,6 +156,19 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     elif cache_dir is not None and (model_dir is None or dataset_name is None):
         print("Caching disabled: Both model_dir and dataset_name must be provided to enable caching.")
     
+    # Build FAISS index from features if not provided (performance optimization)
+    if faiss_index is None and hasattr(graph_learner, 'k'):
+        try:
+            from utils import build_faiss_index
+            print("Building FAISS index for graph generation...")
+            # Extract parameters from graph_learner if available
+            k = getattr(graph_learner, 'k', 10)
+            use_gpu = torch.cuda.is_available()
+            faiss_index = build_faiss_index(features, k=k, use_gpu=use_gpu)
+            print("FAISS index built successfully.")
+        except Exception as e:
+            print(f"Failed to build FAISS index: {str(e)}. Continuing without index optimization.")
+    
     num_batches = (len(X) + batch_size - 1) // batch_size
     all_embeddings = []
     
@@ -162,9 +176,6 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     model.eval()
     if graph_learner is not None:
         graph_learner.eval()
-    
-    # Variable to store and reuse the KNN graph between points
-    knn_graph = None
     
     # Process each batch using tqdm for progress tracking
     for i in tqdm(range(num_batches), desc="Processing batches", unit="batch"):
@@ -179,9 +190,9 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
             try:
                 point_tensor = torch.FloatTensor(batch_X[j]).to(device)
                 
-                # Extract embedding using process_new_point method
+                # Extract embedding using process_new_point method, passing our pre-built FAISS index
                 embedding = experiment.process_new_point(
-                    point_tensor, model, graph_learner, features, adj, sparse
+                    point_tensor, model, graph_learner, features, adj, sparse, faiss_index=faiss_index
                 )
                 
                 # Append the embedding
@@ -189,8 +200,6 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
                 
             except Exception as e:
                 print(f"Error processing point {start_idx + j}: {str(e)}")
-                # Reset KNN graph if we encounter an error
-                knn_graph = None
                 raise e
                 
         # Add the batch embeddings to the overall results
@@ -754,14 +763,26 @@ def main(args):
     model, graph_learner, features, adj, sparse = experiment.load_model(input_dir=args.model_dir)
     print("Model loaded successfully!")
     
-    # 4. Extract SUBLIME features from neurolake data
+    # 4. Build FAISS index once for the entire dataset (optimization)
+    print("\nBuilding FAISS index for faster embedding extraction...")
+    try:
+        from utils import build_faiss_index
+        # Extract parameters from graph_learner if available
+        k = getattr(graph_learner, 'k', 10)
+        faiss_index = build_faiss_index(features, k=k, use_gpu=torch.cuda.is_available())
+        print("FAISS index built successfully!")
+    except Exception as e:
+        print(f"Failed to build FAISS index: {str(e)}. Continuing without index optimization.")
+        faiss_index = None
+    
+    # 5. Extract SUBLIME features from neurolake data
     print("\nExtracting SUBLIME features...")
     sublime_embeddings = extract_in_batches(
         X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
-        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir, dataset_name=os.path.basename(args.neurolake_csv).split('.')[0]
+        batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir, 
+        dataset_name=os.path.basename(args.neurolake_csv).split('.')[0],
+        faiss_index=faiss_index
     )
-    # Normalize the SUBLIME embeddings
-    sublime_embeddings = sublime_embeddings / np.maximum(np.linalg.norm(sublime_embeddings, axis=1, keepdims=True), 1e-10)
     print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
     
     # 5. If embeddings_output is provided, save embeddings to CSV

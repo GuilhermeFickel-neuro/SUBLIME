@@ -551,7 +551,7 @@ class Experiment:
             
         return adj
 
-    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None):
+    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None, faiss_index=None):
         """
         Process a new data point by replacing an existing point and extract its embedding features
         
@@ -563,14 +563,15 @@ class Experiment:
             adj: The current adjacency matrix
             sparse: Whether the adjacency is sparse
             replace_idx: Index of the point to replace. If None, will find the most similar point.
+            faiss_index: Optional pre-built FAISS index for the graph_learner to use
             
         Returns:
-            tuple: (embedding, knn_graph) - The node embedding for the new point and the updated KNN graph
+            torch.Tensor: The node embedding for the new point
         """
         # Ensure model and graph_learner are in evaluation mode
         model.eval()
         graph_learner.eval()
-
+        
         # Reshape new point if needed
         if len(new_point.shape) == 1:
             new_point = new_point.unsqueeze(0)  # Add batch dimension
@@ -581,16 +582,23 @@ class Experiment:
         # Move to appropriate device
         new_point = new_point.to(self.device)
         
-        # Calculate cosine similarity between new point and all existing points
-        normalized_features = F.normalize(features, p=2, dim=1)
-        normalized_new_point = F.normalize(new_point, p=2, dim=1)
-        similarities = torch.mm(normalized_new_point, normalized_features.t())
+        # If no specific index provided, find the most similar point to replace
+        if replace_idx is None:
+            # Calculate cosine similarity between new point and all existing points
+            normalized_features = F.normalize(features, p=2, dim=1)
+            normalized_new_point = F.normalize(new_point, p=2, dim=1)
+            similarities = torch.mm(normalized_new_point, normalized_features.t())
+            
+            # Get the index of the most similar point
+            replace_idx = torch.argmax(similarities).item()
         
-        # Get the index of the most similar point
-        replace_idx = torch.argmax(similarities).item()
+        # Create a copy of features and replace the selected point
+        modified_features = features.clone()
+        modified_features[replace_idx] = new_point
         
+        # Generate new adjacency matrix using the graph learner
         with torch.no_grad():
-            new_adj = graph_learner(modified_features)
+            new_adj = graph_learner(modified_features, faiss_index=faiss_index)
             
             # Process adjacency matrix based on sparse flag
             if not sparse:
