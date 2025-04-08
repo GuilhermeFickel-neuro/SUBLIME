@@ -93,7 +93,7 @@ class FGP_learner(nn.Module):
             adj_dense = torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i))
             self.Adj = nn.Parameter(adj_dense)
 
-    def forward(self, h):
+    def forward(self, h, faiss_index=None):
         if not self.sparse:
             # For dense mode
             Adj = F.elu(self.Adj) + 1
@@ -123,12 +123,7 @@ class FGP_learner(nn.Module):
             graph = dgl.graph((src, dst), num_nodes=Adj.size(0), device=Adj.device)
             graph.edata['w'] = new_values
             
-            # Return both the DGL graph and the raw KNN graph data for future reuse
-            # For consistency with other learners, return a tuple of (rows, cols, values)
-            # Note: We extract the raw KNN data before the non-linearity is applied
-            knn_graph = (indices[0], indices[1], values)
-            
-            return graph, knn_graph
+            return graph
 
 
 class ATT_learner(nn.Module):
@@ -155,20 +150,17 @@ class ATT_learner(nn.Module):
                     h = F.tanh(h)
         return h
 
-    def forward(self, features):
+    def forward(self, features, faiss_index=None):
         if self.sparse:
             embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000)
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
             rows_ = torch.cat((rows, cols))
             cols_ = torch.cat((cols, rows))
             values_ = torch.cat((values, values))
-            values_for_graph = apply_non_linearity(values_, self.non_linearity, self.i)
+            values_ = apply_non_linearity(values_, self.non_linearity, self.i)
             adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device='cuda')
-            adj.edata['w'] = values_for_graph
-            
-            # Return both the DGL graph and the raw KNN graph data for future reuse
-            knn_graph = (rows, cols, values)
-            return adj, knn_graph
+            adj.edata['w'] = values_
+            return adj
         else:
             embeddings = self.internal_forward(features)
             embeddings = F.normalize(embeddings, dim=1, p=2)
@@ -215,20 +207,17 @@ class MLP_learner(nn.Module):
         for layer in self.layers:
             layer.weight = nn.Parameter(torch.eye(self.input_dim))
 
-    def forward(self, features):
+    def forward(self, features, faiss_index=None):
         if self.sparse:
             embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000)
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
             rows_ = torch.cat((rows, cols))
             cols_ = torch.cat((cols, rows))
             values_ = torch.cat((values, values))
-            values_for_graph = apply_non_linearity(values_, self.non_linearity, self.i)
+            values_ = apply_non_linearity(values_, self.non_linearity, self.i)
             adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device='cuda')
-            adj.edata['w'] = values_for_graph
-            
-            # Return both the DGL graph and the raw KNN graph data for future reuse
-            knn_graph = (rows, cols, values)
-            return adj, knn_graph
+            adj.edata['w'] = values_
+            return adj
         else:
             embeddings = self.internal_forward(features)
             embeddings = F.normalize(embeddings, dim=1, p=2)
@@ -276,20 +265,17 @@ class GNN_learner(nn.Module):
         for layer in self.layers:
             layer.weight = nn.Parameter(torch.eye(self.input_dim))
 
-    def forward(self, features):
+    def forward(self, features, faiss_index=None):
         if self.sparse:
             embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000)
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
             rows_ = torch.cat((rows, cols))
             cols_ = torch.cat((cols, rows))
             values_ = torch.cat((values, values))
-            values_for_graph = apply_non_linearity(values_, self.non_linearity, self.i)
+            values_ = apply_non_linearity(values_, self.non_linearity, self.i)
             adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device='cuda')
-            adj.edata['w'] = values_for_graph
-            
-            # Return both the DGL graph and the raw KNN graph data for future reuse
-            knn_graph = (rows, cols, values)
-            return adj, knn_graph
+            adj.edata['w'] = values_
+            return adj
         else:
             embeddings = self.internal_forward(features)
             embeddings = F.normalize(embeddings, dim=1, p=2)
