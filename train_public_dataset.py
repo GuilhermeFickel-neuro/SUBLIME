@@ -264,6 +264,21 @@ def extract_features_using_process_new_point(model_path, X_samples):
         # Convert samples to tensor
         X_tensor = convert_to_torch_tensor(X_samples)
         
+        # Build FAISS index for optimization
+        faiss_index = None
+        if hasattr(graph_learner, 'k'):
+            try:
+                from utils import build_faiss_index
+                k = getattr(graph_learner, 'k', 10)
+                print(f"Building FAISS index for feature extraction (k={k})...")
+                faiss_index = build_faiss_index(features, k=k, use_gpu=torch.cuda.is_available())
+                print("FAISS index built successfully.")
+            except Exception as e:
+                print(f"Failed to build FAISS index: {e}. Continuing without optimization.")
+        
+        # Variable to store and reuse the KNN graph between points
+        knn_graph = None
+        
         # Performance optimization: use torch.no_grad() to reduce memory usage during inference
         embeddings = []
         with torch.no_grad():
@@ -273,8 +288,9 @@ def extract_features_using_process_new_point(model_path, X_samples):
                     
                 try:
                     # Get the embedding for the current sample
-                    embedding = experiment.process_new_point(
-                        X_tensor[i], model, graph_learner, features, adj, sparse, 0
+                    embedding, knn_graph = experiment.process_new_point(
+                        X_tensor[i], model, graph_learner, features, adj, sparse,
+                        faiss_index=faiss_index, knn_graph=knn_graph
                     )
                     
                     # Error handling: Check for NaN values or zero-length embeddings
@@ -296,6 +312,8 @@ def extract_features_using_process_new_point(model_path, X_samples):
                     embeddings.append(normalized_embedding.cpu().numpy())
                 except Exception as e:
                     print(f"Error processing sample {i}: {e}")
+                    # Reset KNN graph on error
+                    knn_graph = None
                     # If there are any embeddings already, use zeros with matching dimensions
                     if len(embeddings) > 0:
                         embeddings.append(np.zeros_like(embeddings[0]))

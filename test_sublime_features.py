@@ -349,7 +349,7 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
                 point_tensor = torch.FloatTensor(batch_X[j]).to(device)
                 
                 # Extract embedding using our improved process_new_point method
-                embedding = experiment.process_new_point(
+                embedding, _ = experiment.process_new_point(
                     point_tensor, model, graph_learner, features, adj, sparse
                 )
                 

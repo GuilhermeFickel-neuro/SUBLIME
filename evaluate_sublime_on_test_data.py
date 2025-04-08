@@ -177,6 +177,9 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     if graph_learner is not None:
         graph_learner.eval()
     
+    # Variable to store and reuse the KNN graph between points
+    knn_graph = None
+    
     # Process each batch using tqdm for progress tracking
     for i in tqdm(range(num_batches), desc="Processing batches", unit="batch"):
         start_idx = i * batch_size
@@ -191,8 +194,10 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
                 point_tensor = torch.FloatTensor(batch_X[j]).to(device)
                 
                 # Extract embedding using process_new_point method, passing our pre-built FAISS index
-                embedding = experiment.process_new_point(
-                    point_tensor, model, graph_learner, features, adj, sparse, faiss_index=faiss_index
+                # and any existing KNN graph
+                embedding, knn_graph = experiment.process_new_point(
+                    point_tensor, model, graph_learner, features, adj, sparse, 
+                    faiss_index=faiss_index, knn_graph=knn_graph
                 )
                 
                 # Append the embedding
@@ -200,6 +205,8 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
                 
             except Exception as e:
                 print(f"Error processing point {start_idx + j}: {str(e)}")
+                # Reset KNN graph if we encounter an error
+                knn_graph = None
                 raise e
                 
         # Add the batch embeddings to the overall results

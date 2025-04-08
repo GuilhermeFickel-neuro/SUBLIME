@@ -518,6 +518,107 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
     return rows, cols, values
 
 
+def update_knn_single_point(X, k, replace_idx, existing_knn=None):
+    """
+    Efficiently update KNN graph after changing a single point.
+    Instead of rebuilding the entire KNN graph, this function only computes
+    the similarity of the new point with all others and updates just those connections.
+    
+    Args:
+        X (torch.Tensor): Input features (num_nodes x num_features) with the new point already inserted.
+        k (int): Number of neighbors to find for each node.
+        replace_idx (int): Index of the point that was replaced/updated.
+        existing_knn (tuple, optional): Existing KNN graph as (rows, cols, values) in COO format.
+                                     If None, a new graph will be created (but this defeats the purpose).
+    
+    Returns:
+        tuple: Updated (rows, cols, values) representing the graph in COO format.
+    """
+    start_time = time.time()
+    device = X.device
+    n = X.shape[0]
+    
+    # If no existing KNN graph, this optimization doesn't apply - build full graph
+    if existing_knn is None:
+        print("No existing KNN graph provided, building full graph...")
+        return knn_fast(X, k)
+    
+    rows, cols, values = existing_knn
+    
+    # Normalize features for cosine similarity
+    X_normalized = F.normalize(X, dim=1, p=2)
+    
+    # Compute similarity of new point to all points
+    new_point = X_normalized[replace_idx:replace_idx+1]  # Keep dimension for matrix multiply
+    similarities = torch.mm(new_point, X_normalized.t())[0]  # [0] to get the vector
+    
+    # Find top k+1 neighbors (includes self with similarity=1.0)
+    new_vals, new_inds = similarities.topk(k + 1)
+    
+    # Filter out self-loop if it's in the results
+    # (self will have similarity 1.0 and should be the first entry)
+    self_idx = (new_inds == replace_idx).nonzero()
+    if len(self_idx) > 0:
+        self_pos = self_idx.item()
+        # Remove self entry and keep only k neighbors
+        mask = torch.ones_like(new_inds, dtype=torch.bool)
+        mask[self_pos] = False
+        new_inds = new_inds[mask][:k]
+        new_vals = new_vals[mask][:k]
+    else:
+        # Just take first k if self wasn't found
+        new_inds = new_inds[:k]
+        new_vals = new_vals[:k]
+    
+    # Remove old connections involving the replaced point
+    mask = (rows != replace_idx) & (cols != replace_idx)
+    filtered_rows = rows[mask]
+    filtered_cols = cols[mask]
+    filtered_vals = values[mask]
+    
+    # Create new connections for the replaced point
+    # 1. From new point to its neighbors
+    out_rows = torch.full((k,), replace_idx, device=device)
+    out_cols = new_inds  # These are indices of the top k neighbors
+    out_vals = new_vals  # These are similarity values
+    
+    # 2. From neighbors to the new point (symmetric connections)
+    in_rows = new_inds
+    in_cols = torch.full((k,), replace_idx, device=device)
+    in_vals = new_vals  # Use same similarity values for symmetry
+    
+    # Combine all connections
+    updated_rows = torch.cat([filtered_rows, out_rows, in_rows])
+    updated_cols = torch.cat([filtered_cols, out_cols, in_cols])
+    updated_vals = torch.cat([filtered_vals, out_vals, in_vals])
+    
+    # Normalize the graph just like in knn_fast
+    # Create node-specific normalization values
+    norm = torch.zeros(n, device=device)
+    
+    # Add contribution of all edge weights connected to each node
+    # For outgoing edges
+    for i in range(len(updated_rows)):
+        norm[updated_rows[i]] += updated_vals[i]
+    # For incoming edges
+    for i in range(len(updated_cols)):
+        norm[updated_cols[i]] += updated_vals[i]
+    
+    # Add small epsilon for numerical stability
+    norm += EOS
+    
+    # Apply symmetric normalization D^(-1/2) * A * D^(-1/2)
+    for i in range(len(updated_vals)):
+        row_idx = updated_rows[i]
+        col_idx = updated_cols[i]
+        updated_vals[i] *= torch.pow(norm[row_idx], -0.5) * torch.pow(norm[col_idx], -0.5)
+    
+    end_time = time.time()
+    print(f"KNN update for single point (idx={replace_idx}) execution time: {end_time - start_time:.4f} seconds")
+    
+    return updated_rows, updated_cols, updated_vals
+
+
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     """Convert a scipy sparse matrix to a torch sparse tensor."""
     sparse_mx = sparse_mx.tocoo().astype(np.float32)
