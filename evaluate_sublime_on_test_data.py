@@ -790,6 +790,8 @@ def main(args):
         dataset_name=os.path.basename(args.neurolake_csv).split('.')[0],
         faiss_index=faiss_index
     )
+    # Normalize the SUBLIME embeddings
+    sublime_embeddings = sublime_embeddings / np.maximum(np.linalg.norm(sublime_embeddings, axis=1, keepdims=True), 1e-10)
     print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
     
     # 5. If embeddings_output is provided, save embeddings to CSV
