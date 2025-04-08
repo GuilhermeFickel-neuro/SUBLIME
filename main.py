@@ -652,10 +652,11 @@ class Experiment:
                     new_adj = normalize(new_adj, 'sym', sparse)
                 
                 # Get embeddings for all nodes including the new one
-                output = model(modified_features, new_adj, sparse)
+                # model() returns a tuple (projection, embedding)
+                proj, emb = model(modified_features, new_adj, sparse)
                 
-                # Get the embedding for the replaced point
-                embedding = output[replace_idx]
+                # Get the embedding for the replaced point from the embedding tensor
+                embedding = emb[replace_idx]
                 
                 return embedding, updated_knn_graph
 
