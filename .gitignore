@@ -1,5 +1,7 @@
+.vscode
+/memory-bank
+.rooignore
 *.csv
-
-*.vscode
-
+*.png
 __pycache__/
+data/
