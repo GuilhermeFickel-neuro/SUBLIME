@@ -551,8 +551,9 @@ class Experiment:
             
         return adj
 
-    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, faiss_index=None, knn_graph=None):
-        """Process a new data point by finding and replacing the most similar existing point.
+    def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None):
+        """
+        Process a new data point by replacing an existing point and extract its embedding features
         
         Args:
             new_point: Tensor of shape [feature_dim] containing the new point features
@@ -561,8 +562,7 @@ class Experiment:
             features: The existing node features
             adj: The current adjacency matrix
             sparse: Whether the adjacency is sparse
-            faiss_index: Optional pre-built FAISS index for the graph_learner to use
-            knn_graph: Optional tuple (rows, cols, values) of precomputed KNN graph to update
+            replace_idx: Index of the point to replace. If None, will find the most similar point.
             
         Returns:
             tuple: (embedding, knn_graph) - The node embedding for the new point and the updated KNN graph
@@ -590,80 +590,27 @@ class Experiment:
         replace_idx = torch.argmax(similarities).item()
         
         with torch.no_grad():
-            # If our model is ArcFace and we have no labels, we need to modify temporarily
-            original_arcface_weights = None
-            try:
-                if hasattr(model, 'arcface') and hasattr(model.arcface, 'weight'):
-                    original_arcface_weights = model.arcface.weight.data.clone()
-                    # Set weights to zeros (no influence from ArcFace during inference)
-                    model.arcface.weight.data.zero_()
-                
-                # Create a copy of features and replace the selected point
-                modified_features = features.clone()
-                modified_features[replace_idx] = new_point.squeeze(0)
-                
-                # Use the KNN graph optimization if we're in sparse mode and have a graph
-                if sparse and knn_graph is not None:
-                    # Update the KNN graph for the new/replaced point
-                    from utils import update_knn_single_point
-                    
-                    rows, cols, values = update_knn_single_point(
-                        modified_features, 
-                        getattr(graph_learner, 'k', 10),  # Use graph learner's k value or default to 10
-                        replace_idx,
-                        knn_graph
-                    )
-                    
-                    # Create DGL graph from the updated KNN
-                    rows_ = torch.cat((rows, cols))
-                    cols_ = torch.cat((cols, rows))
-                    values_ = torch.cat((values, values))
-                    if hasattr(graph_learner, 'non_linearity') and hasattr(graph_learner, 'i'):
-                        from utils import apply_non_linearity
-                        non_linearity = getattr(graph_learner, 'non_linearity', 'relu')
-                        i = getattr(graph_learner, 'i', 1.0)
-                        values_ = apply_non_linearity(values_, non_linearity, i)
-                    
-                    new_adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device=self.device)
-                    new_adj.edata['w'] = values_
-                    
-                    # Save updated KNN graph for future use
-                    updated_knn_graph = (rows, cols, values)
-                else:
-                    # Use the graph learner to create a new graph
-                    # The graph learner now returns both the DGL graph and the KNN data
-                    if sparse:
-                        graph_output = graph_learner(modified_features, faiss_index=faiss_index)
-                        # Handle both old and new return types for backward compatibility
-                        if isinstance(graph_output, tuple) and len(graph_output) == 2:
-                            new_adj, updated_knn_graph = graph_output
-                        else:
-                            # Old style - just returned the graph
-                            new_adj = graph_output
-                            updated_knn_graph = None
-                    else:
-                        # Dense mode - just get the adjacency matrix
-                        new_adj = graph_learner(modified_features, faiss_index=faiss_index)
-                        updated_knn_graph = None
-                
-                # Process adjacency matrix based on sparse flag if needed
-                if not sparse:
-                    new_adj = symmetrize(new_adj)
-                    new_adj = normalize(new_adj, 'sym', sparse)
-                
-                # Get embeddings for all nodes including the new one
-                # model() returns a tuple (projection, embedding)
-                proj, emb = model(modified_features, new_adj, sparse)
-                
-                # Get the embedding for the replaced point from the embedding tensor
-                embedding = emb[replace_idx]
-                
-                return embedding, updated_knn_graph
-
-            finally:
-                if original_arcface_weights is not None:
-                    model.arcface.weight.data = original_arcface_weights
-
+            new_adj = graph_learner(modified_features)
+            
+            # Process adjacency matrix based on sparse flag
+            if not sparse:
+                new_adj = symmetrize(new_adj)
+                new_adj = normalize(new_adj, 'sym', sparse)
+            
+            # Get embeddings for all nodes including the new one
+            # For ArcFace models, we don't need to pass labels during inference
+            if hasattr(model, 'use_arcface') and model.use_arcface:
+                # For ArcFace models, we still get embeddings without passing labels
+                _, embeddings = model(modified_features, new_adj)
+            else:
+                # Standard model
+                _, embeddings = model(modified_features, new_adj)
+            
+            # Return the embedding of the replaced point
+            new_point_embedding = embeddings[replace_idx].detach()
+            
+            return new_point_embedding
+            
     def train(self, args, load_data_fn=None):
         """
         Train the model
