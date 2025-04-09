@@ -2,7 +2,6 @@ import argparse
 import copy
 from datetime import datetime
 import math
-import contextlib
 
 from tqdm import tqdm
 import numpy as np
@@ -21,14 +20,10 @@ from data_loader import load_data
 import random
 import os
 
-# Import memory debugging utilities
-from memory_debug import profile_arcface_memory, analyze_forward_pass, measure_arcface_memory_usage
 # Import batched ArcFace functionality
 from batched_arcface import BatchedArcFaceLayer, batched_arcface_loss
-# Import memory optimization utilities
-from memory_optimizations import train_with_memory_optimization, GradientAccumulation, enable_mixed_precision
-# Import sampled ArcFace functionality
-from sampled_arcface import SampledArcFaceLayer, arcface_loss_with_sampling
+# Import memory optimization utilities (only gradient accumulation remains relevant)
+from memory_optimizations import GradientAccumulation # Keep if grad_accumulation is used
 
 EOS = 1e-10
 
@@ -91,135 +86,9 @@ class Experiment:
             loss = model.calc_loss(z1, z2)
 
         # Return contrastive loss, learned adj, and the learner embedding
-        # The learner embedding (emb2) will be used by loss_arcface if called
+        # The learner embedding (emb2) will be used by loss_arcface_batched if called
         return loss, learned_adj, emb2
 
-    def loss_arcface(self, model, graph_learner, features, anchor_adj, labels, args):
-        """
-        Calculate combined loss using both ArcFace loss and contrastive learning
-        
-        Args:
-            model: The GCL model
-            graph_learner: The graph learner
-            features: Input features
-            anchor_adj: Anchor adjacency matrix
-            labels: Class labels (row indices in supervised mode)
-            args: Arguments
-            
-        Returns:
-            Tuple of (loss, learned_adjacency_matrix)
-        """
-        # Check if we should use the sampled version (highest memory savings)
-        if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
-            # Use the most memory-efficient implementation with class sampling
-            return self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
-        # Check if we should use the batched version
-        elif hasattr(args, 'use_batched_arcface') and args.use_batched_arcface:
-            # Use the memory-efficient batched implementation
-            return self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
-            
-        # --- Optimization Implementation ---
-        # 1. Calculate the contrastive loss and GET the learner embedding (emb2)
-        #    This avoids a redundant forward pass later.
-        contrastive_loss, learned_adj, learner_embedding = self.loss_gcl(
-            model, graph_learner, features, anchor_adj, args
-        )
-
-        # 2. Calculate the ArcFace loss using the already computed embedding
-        if not hasattr(args, 'arcface_weight'):
-            arcface_weight = 1.0  # Default weight
-        else:
-            arcface_weight = args.arcface_weight
-            
-        # Ensure the model has the ArcFace layer before proceeding
-        if not hasattr(model, 'arcface'):
-             raise AttributeError("Model does not have an 'arcface' layer, but loss_arcface was called.")
-
-        # Pass the embedding directly to the ArcFace layer.
-        # No need for another full model(features, ...) call here.
-        # Check if it's the sampled version (which returns output and sampled labels)
-        # Note: This standard loss_arcface function shouldn't ideally be called if sampled_arcface is True,
-        # as loss_arcface_sampled should be used instead. This check is for robustness.
-        if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
-             arcface_output, _ = model.arcface(learner_embedding, labels)
-        else:
-             # Standard ArcFace layer just returns the output logits
-             arcface_output = model.arcface(learner_embedding, labels)
-        # --- End Optimization Implementation ---
-        
-        # Calculate cross-entropy loss
-        criterion = nn.CrossEntropyLoss()
-        arcface_loss = criterion(arcface_output, labels)
-        
-        # Combine both losses
-        combined_loss = contrastive_loss + arcface_weight * arcface_loss
-        
-        if args.verbose and (not hasattr(args, '_loss_printed') or not args._loss_printed):
-            print(f"Combined loss: contrastive_loss={contrastive_loss.item():.4f}, arcface_loss={arcface_loss.item():.4f}, weight={arcface_weight}")
-            args._loss_printed = True
-            
-        return combined_loss, learned_adj
-    
-    def loss_arcface_sampled(self, model, graph_learner, features, anchor_adj, labels, args):
-        """
-        Most memory-efficient implementation of ArcFace loss using class sampling
-        
-        This implementation only computes ArcFace loss for a sample of classes
-        (e.g., 5,000 classes instead of all 35,000), drastically reducing memory usage.
-        """
-        # First calculate the original contrastive loss
-        contrastive_loss, learned_adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
-        
-        # Get weight for ArcFace loss
-        if not hasattr(args, 'arcface_weight'):
-            arcface_weight = 1.0  # Default weight
-        else:
-            arcface_weight = args.arcface_weight
-            
-        # Get number of classes to sample
-        if hasattr(args, 'arcface_num_samples'):
-            num_samples = args.arcface_num_samples
-        else:
-            num_samples = min(5000, len(labels))  # Default to 5000 or total classes if less
-            
-        # Forward pass with include_features=True to get hidden representations
-        z_from_model, hidden_representations, _ = model(features, learned_adj, include_features=True)
-        
-        # Verify that we're using the correct sampled ArcFace approach
-        if not hasattr(model, 'sampled_arcface') or not model.sampled_arcface:
-            raise ValueError("Model is not using sampled ArcFace. Set use_sampled_arcface=True in args")
-            
-        # Verify that model.arcface is an instance of SampledArcFaceLayer
-        from sampled_arcface import SampledArcFaceLayer
-        if not isinstance(model.arcface, SampledArcFaceLayer):
-            raise ValueError("Model.arcface is not a SampledArcFaceLayer instance. Check model initialization.")
-            
-        if args.verbose and not hasattr(args, '_sampled_arcface_printed'):
-            print(f"Using Fixed Sampled ArcFace for memory efficiency")
-            args._sampled_arcface_printed = True
-        
-        # Forward pass through the sampling layer
-        # Note: sampled_arcface is a boolean flag, the actual layer is still stored in model.arcface
-        arcface_output, sampled_labels = model.arcface(hidden_representations, labels)
-        
-        # Calculate ArcFace loss using only the sampled classes
-        arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
-        
-        # Ensure both losses are torch tensors before combining
-        if not isinstance(contrastive_loss, torch.Tensor):
-            contrastive_loss = torch.tensor(contrastive_loss, device=arcface_output.device, requires_grad=True)
-        if not isinstance(arcface_loss, torch.Tensor):
-            arcface_loss = torch.tensor(arcface_loss, device=arcface_output.device, requires_grad=True)
-        
-        # Combine losses
-        total_loss = contrastive_loss + arcface_weight * arcface_loss
-        
-        if args.verbose:
-            print(f"Combined loss: contrastive_loss={contrastive_loss:.4f}, arcface_loss={arcface_loss:.4f}, weight={arcface_weight}")
-            
-        # Make sure we return a proper tensor
-        return total_loss, learned_adj
-        
     def loss_arcface_batched(self, model, graph_learner, features, anchor_adj, labels, args):
         """
         Memory-efficient version of ArcFace loss that processes data in batches
@@ -235,7 +104,7 @@ class Experiment:
         Returns:
             Tuple of (loss, learned_adjacency_matrix)
         """
-        # Import the batched implementation from batched_arcface.py
+        # Use the dedicated function from batched_arcface.py
         return batched_arcface_loss(self, model, graph_learner, features, anchor_adj, labels, args)
 
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
@@ -378,10 +247,6 @@ class Experiment:
             f.write(f'num_classes: {model.arcface.weight.shape[0]}\n')
             f.write(f'arcface_scale: {model.arcface.s}\n')
             f.write(f'arcface_margin: {model.arcface.m}\n')
-            if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
-                f.write(f'use_sampled_arcface: True\n')
-                if hasattr(model.arcface, 'num_samples'):
-                    f.write(f'arcface_num_samples: {model.arcface.num_samples}\n')
 
     def load_model(self, input_dir='saved_models'):
         """
@@ -434,12 +299,6 @@ class Experiment:
             arcface_params['arcface_scale'] = float(config.get('arcface_scale', 30.0))
             arcface_params['arcface_margin'] = float(config.get('arcface_margin', 0.5))
             
-            # Check for sampled arcface parameters
-            use_sampled_arcface = config.get('use_sampled_arcface', 'False').lower() in ['true', '1', 't', 'y', 'yes']
-            if use_sampled_arcface:
-                arcface_params['use_sampled_arcface'] = True
-                arcface_params['arcface_num_samples'] = int(config.get('arcface_num_samples', 5000))
-        
         # Add flags to model loading defaults if needed (assuming they weren't saved)
         use_layer_norm_load = config.get('use_layer_norm', 'False').lower() in ['true', '1']
         use_residual_load = config.get('use_residual', 'False').lower() in ['true', '1']
@@ -460,8 +319,7 @@ class Experiment:
                        num_classes=arcface_params['num_classes'],
                        arcface_scale=arcface_params['arcface_scale'],
                        arcface_margin=arcface_params['arcface_margin'],
-                       use_sampled_arcface=arcface_params.get('use_sampled_arcface', False),
-                       arcface_num_samples=arcface_params.get('arcface_num_samples', None))
+                       )
         else:
             model = GCL(nlayers=model_params['nlayers'],
                        in_dim=features.shape[1],
@@ -605,14 +463,9 @@ class Experiment:
                 new_adj = symmetrize(new_adj)
                 new_adj = normalize(new_adj, 'sym', sparse)
             
-            # Get embeddings for all nodes including the new one
-            # For ArcFace models, we don't need to pass labels during inference
-            if hasattr(model, 'use_arcface') and model.use_arcface:
-                # For ArcFace models, we still get embeddings without passing labels
-                _, embeddings = model(modified_features, new_adj)
-            else:
-                # Standard model
-                _, embeddings = model(modified_features, new_adj)
+            # Get embeddings for all nodes including the new one.
+            # The if/else based on use_arcface was redundant here because labels are not passed.
+            _, embeddings = model(modified_features, new_adj)
             
             # Return the embedding of the replaced point
             new_point_embedding = embeddings[replace_idx].detach()
@@ -642,29 +495,8 @@ class Experiment:
                 if args.verbose:
                     print("Using row indices as labels for ArcFace")
                 labels = torch.arange(features.shape[0])
-                
-                # When using sampled ArcFace, limit the number of classes
-                if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface and hasattr(args, 'arcface_num_samples'):
-                    nclasses = args.arcface_num_samples
-                    if args.verbose:
-                        print(f"Using sampled ArcFace with {nclasses} classes instead of {features.shape[0]}")
-                else:
-                    nclasses = features.shape[0]
-               
-            # Run memory profiling if requested and not using sampled ArcFace
-            # (memory debugging doesn't work well with sampled ArcFace due to subgraph issues)
-            if args.debug_memory:
-                if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
-                    if args.verbose:
-                        print("\nSkipping memory debugging when using sampled ArcFace\n")
-                else:
-                    if args.verbose:
-                        print("\n=== Memory Profiling for ArcFace ===")
-                        # Estimate memory usage
-                        batch_size = features.shape[0]  # Full batch size
-                        emb_dim = args.rep_dim  # Embedding dimension
-                        profile_arcface_memory(batch_size, emb_dim, nclasses)
-                        print("===================================\n")
+                # Simplified nclasses assignment - only depends on feature shape now
+                nclasses = features.shape[0]
 
         if args.downstream_task == 'classification':
             test_accuracies = []
@@ -713,73 +545,44 @@ class Experiment:
                            use_residual=bool(args.use_residual),
                            use_arcface=True, num_classes=nclasses,
                            arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
-                           use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
-                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None)
+                           )
                 
-                # If using both sampled and batched ArcFace, prioritize sampled (don't try to use both)
-                if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface and args.use_batched_arcface:
-                    if args.verbose:
-                        print("Warning: Both sampled and batched ArcFace specified. Using sampled ArcFace only.")
-                # If using batched ArcFace, replace the standard ArcFace layer with batched version
-                elif args.use_batched_arcface:
-                    try:
-                        # Get the properties from the original ArcFace layer
-                        original_arcface = model.arcface
-                        in_features = original_arcface.in_features
-                        out_features = original_arcface.out_features
-                        scale = original_arcface.scale
-                        margin = original_arcface.margin
-                        easy_margin = original_arcface.easy_margin
-                    except AttributeError as e:
-                        print(f"Error accessing attributes from ArcFace layer: {e}")
-                        print("Skipping batched ArcFace initialization")
-                        continue
-                    
-                    # Create new batched ArcFace layer
-                    batched_layer = BatchedArcFaceLayer(
-                        in_features=in_features,
-                        out_features=out_features,
-                        scale=scale,
-                        margin=margin,
-                        easy_margin=easy_margin,
-                        batch_size=args.arcface_batch_size
-                    )
-                    
-                    # Copy weights from original layer (important for fine-tuning)
-                    batched_layer.weight.data.copy_(original_arcface.weight.data)
-                    
-                    # Replace the layer
-                    model.arcface = batched_layer
-                    
-                    if args.verbose:
-                        print(f"Using Batched ArcFace implementation with batch size {args.arcface_batch_size}")
-                
+                # Logic for using BatchedArcFace remains
+                if args.use_batched_arcface:
+                    # Check if the model already has an ArcFace layer to replace
+                    if hasattr(model, 'arcface') and model.arcface is not None:
+                        try:
+                            original_arcface = model.arcface
+                            in_features = original_arcface.in_features
+                            out_features = original_arcface.out_features
+                            scale = original_arcface.s # Use .s for scale
+                            margin = original_arcface.m # Use .m for margin
+                            easy_margin = original_arcface.easy_margin
+                        except AttributeError as e:
+                            print(f"Error accessing attributes from original ArcFace layer: {e}")
+                            print("Skipping batched ArcFace replacement.")
+                        else:
+                            # Create new batched ArcFace layer
+                            batched_layer = BatchedArcFaceLayer(
+                                in_features=in_features,
+                                out_features=out_features,
+                                scale=scale,
+                                margin=margin,
+                                easy_margin=easy_margin,
+                                batch_size=args.arcface_batch_size
+                            )
+                            # Copy weights from original layer (important for fine-tuning)
+                            if original_arcface.weight is not None:
+                                batched_layer.weight.data.copy_(original_arcface.weight.data)
+                            # Replace the layer
+                            model.arcface = batched_layer
+                            if args.verbose:
+                                print(f"Using Batched ArcFace implementation with batch size {args.arcface_batch_size}")
+                    else:
+                         print("Warning: use_batched_arcface is True, but the model doesn't have an initial 'arcface' layer to replace.")
+
                 if args.verbose:
                     print(f"Using ArcFace loss with {nclasses} classes, scale={args.arcface_scale}, margin={args.arcface_margin}")
-                    
-                # Run memory debugging for model if requested
-                if args.debug_memory:
-                    # Skip memory debugging for sampled ArcFace due to subgraph issues
-                    if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
-                        if args.verbose:
-                            print("\nSkipping ArcFace forward pass memory analysis when using sampled ArcFace")
-                            print("(This is due to subgraph size mismatches that occur during testing)")
-                    else:
-                        # Move to GPU if needed
-                        model = model.to(self.device)
-                        features_gpu = features.to(self.device)
-                        labels_gpu = labels.to(self.device)
-                        
-                        if args.verbose:
-                            print("\n=== ArcFace Forward Pass Memory Analysis ===")
-                            result = analyze_forward_pass(
-                                model,
-                                features_gpu,
-                                anchor_adj,
-                                labels_gpu,
-                                max_samples=args.max_debug_samples
-                            )
-                            print("==========================================\n")
             else:
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
                           emb_dim=args.rep_dim, proj_dim=args.proj_dim,
@@ -788,6 +591,20 @@ class Experiment:
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
             
+            # --- Checkpoint Setup ---
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            start_epoch = 0
+            last_checkpoint_path = None
+
+            # Load latest checkpoint if available
+            model, graph_learner, optimizer_cl, optimizer_learner, start_epoch, loaded_anchor_adj = \
+                self.load_checkpoint(model, graph_learner, optimizer_cl, optimizer_learner, args)
+            
+            # If checkpoint loaded an anchor_adj, use it (important for resuming bootstrapping)
+            if loaded_anchor_adj is not None:
+                anchor_adj = loaded_anchor_adj
+            # --- End Checkpoint Setup ---
+
             # Set up OneCycleLR scheduler if enabled
             if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
                 print("Using One Cycle Policy learning rate scheduler")
@@ -829,91 +646,91 @@ class Experiment:
                 best_val_test = 0
                 best_epoch = 0
 
-            # Mixed precision training is disabled by default to avoid type mismatch issues
-            # with the graph learner's KNN function
-            scaler = None
-            if hasattr(args, 'use_mixed_precision') and args.use_mixed_precision:
-                from torch.cuda.amp import GradScaler
-                scaler = GradScaler()
-                if args.verbose:
-                    print("Using mixed precision training (WARNING: may cause type mismatch in KNN)")
-            
             # Initialize gradient accumulation steps
             grad_accumulation_steps = args.grad_accumulation_steps if hasattr(args, 'grad_accumulation_steps') else 1
             if grad_accumulation_steps > 1 and args.verbose:
                 print(f"Using gradient accumulation with {grad_accumulation_steps} steps")
                 
-            for epoch in tqdm(range(1, args.epochs + 1), desc="Training", total=args.epochs):
+            for epoch in tqdm(range(start_epoch, args.epochs + 1), desc="Training", initial=start_epoch, total=args.epochs):
                 model.train()
                 graph_learner.train()
                 
-                # Check if we should use memory-efficient training
-                if hasattr(args, 'memory_efficient_training') and args.memory_efficient_training:
-                    # Use our memory-efficient training function
-                    loss, Adj = train_with_memory_optimization(
-                        self, model, graph_learner, features, anchor_adj,
-                        labels, args, optimizer_cl, optimizer_learner
-                    )
-                elif grad_accumulation_steps > 1:
-                    # Use gradient accumulation
+                # Simplified training loop: Removed mixed precision and logic for different ArcFace types
+                if grad_accumulation_steps > 1:
+                    # Gradient accumulation path (without mixed precision)
                     accumulated_loss = 0
                     optimizer_cl.zero_grad()
                     optimizer_learner.zero_grad()
-                    
+
                     for i in range(grad_accumulation_steps):
                         # Forward pass
                         if args.use_arcface:
-                            with torch.cuda.amp.autocast() if scaler else contextlib.nullcontext():
-                                mini_loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
-                                mini_loss = mini_loss / grad_accumulation_steps  # Scale loss
+                            # Always use batched version if ArcFace is enabled
+                            mini_loss, Adj = self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
                         else:
-                            with torch.cuda.amp.autocast() if scaler else contextlib.nullcontext():
-                                mini_loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
-                                mini_loss = mini_loss / grad_accumulation_steps  # Scale loss
-                        
-                        # Backward pass with scaling if using mixed precision
-                        if scaler:
-                            scaler.scale(mini_loss).backward()
-                        else:
-                            mini_loss.backward()
-                            
-                        accumulated_loss += mini_loss.item()
-                    
+                            mini_loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+
+                        mini_loss = mini_loss / grad_accumulation_steps # Scale loss
+
+                        # Backward pass (no scaler)
+                        mini_loss.backward()
+
+                        accumulated_loss += mini_loss.item() * grad_accumulation_steps # Unscale for reporting
+
+                    # --- Gradient Clipping ---
+                    if args.clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                        torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
+                    # --- End Gradient Clipping ---
+
                     # Update weights
-                    if scaler:
-                        scaler.step(optimizer_cl)
-                        scaler.step(optimizer_learner)
-                        scaler.update()
-                    else:
-                        optimizer_cl.step()
-                        optimizer_learner.step()
-                    
-                    loss = accumulated_loss
-                elif scaler:  # Mixed precision without gradient accumulation
-                    # Forward pass with mixed precision
-                    with torch.cuda.amp.autocast():
-                        if args.use_arcface:
-                            loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
-                        else:
-                            loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
-                    
-                    # Backward and optimize with scaling
+                    optimizer_cl.step()
+                    optimizer_learner.step()
+
+                    loss = accumulated_loss / grad_accumulation_steps # Average loss for the step
+
+                else:
+                    # Standard training path (no gradient accumulation, no mixed precision)
                     optimizer_cl.zero_grad()
                     optimizer_learner.zero_grad()
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer_cl)
-                    scaler.step(optimizer_learner)
-                    scaler.update()
-                else:
-                    # Original training code path
+
                     if args.use_arcface:
-                        loss, Adj = self.loss_arcface(model, graph_learner, features, anchor_adj, labels, args)
+                        # Always use batched version if ArcFace is enabled
+                        loss, Adj = self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
                     else:
                         loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
-                    optimizer_cl.zero_grad()
-                    optimizer_learner.zero_grad()
+                    # --- NaN Loss Check ---
+                    if torch.isnan(loss):
+                        print(f"\nWarning: NaN loss detected at epoch {epoch}. Attempting to reload last checkpoint.")
+                        if last_checkpoint_path:
+                            try:
+                                # Try reloading the last known good state
+                                model, graph_learner, optimizer_cl, optimizer_learner, _, loaded_anchor_adj = \
+                                    self.load_checkpoint(model, graph_learner, optimizer_cl, optimizer_learner, args)
+                                # Restore anchor_adj if it was loaded
+                                if loaded_anchor_adj is not None:
+                                     anchor_adj = loaded_anchor_adj
+                                print(f"Successfully reloaded checkpoint from {last_checkpoint_path}. Skipping optimizer step for epoch {epoch}.")
+                                continue # Skip the rest of the loop for this epoch
+                            except Exception as e:
+                                print(f"Error reloading checkpoint {last_checkpoint_path} after NaN loss: {e}")
+                                print("Stopping training trial due to unrecoverable NaN loss.")
+                                break # Exit the epoch loop for this trial
+                        else:
+                            print("No previous checkpoint found to revert to after NaN loss. Stopping training trial.")
+                            break # Exit the epoch loop for this trial
+                    # --- End NaN Loss Check ---
+
+                    # Backward and optimize
                     loss.backward()
+
+                    # --- Gradient Clipping ---
+                    if args.clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                        torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
+                    # --- End Gradient Clipping ---
+
                     optimizer_cl.step()
                     optimizer_learner.step()
                 
@@ -943,6 +760,13 @@ class Experiment:
                     except:
                         print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss), args.downstream_task)
 
+                # --- Periodic Checkpointing ---
+                if epoch > 0 and epoch % args.checkpoint_freq == 0:
+                    current_checkpoint_path = self.save_checkpoint(
+                        epoch, model, graph_learner, optimizer_cl, optimizer_learner, anchor_adj, args
+                    )
+                    last_checkpoint_path = current_checkpoint_path # Update last known good path
+                # --- End Periodic Checkpointing ---
 
                 if epoch % args.eval_freq == 0:
                     if args.downstream_task == 'classification':
@@ -988,11 +812,11 @@ class Experiment:
                             print("Final ARI: ", ari)
 
             if args.downstream_task == 'classification':
-                validation_accuracies.append(best_val.item())
+                validation_accuracies.append(best_val)
                 test_accuracies.append(best_val_test.item())
                 if args.verbose:
                     print("Trial: ", trial + 1)
-                    print("Best val ACC: ", best_val.item())
+                    print("Best val ACC: ", best_val)
                     print("Best test ACC: ", best_val_test.item())
             # elif args.downstream_task == 'clustering':
             #     if labels is not None:
@@ -1019,8 +843,80 @@ class Experiment:
         print(s_val)
         print(s_test)
 
+    def save_checkpoint(self, epoch, model, graph_learner, optimizer_cl, optimizer_learner, anchor_adj, args):
+        """Saves the training state to a checkpoint file."""
+        checkpoint_path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+        state = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'graph_learner_state_dict': graph_learner.state_dict(),
+            'optimizer_cl_state_dict': optimizer_cl.state_dict(),
+            'optimizer_learner_state_dict': optimizer_learner.state_dict(),
+            'anchor_adj': anchor_adj, # Save anchor_adj for bootstrapping
+            'args': args # Save args used for this run
+        }
+        torch.save(state, checkpoint_path)
+        if args.verbose:
+            print(f"Checkpoint saved to {checkpoint_path}")
+        return checkpoint_path # Return path for tracking
 
-if __name__ == '__main__':
+    def load_checkpoint(self, model, graph_learner, optimizer_cl, optimizer_learner, args):
+        """Loads the latest checkpoint from the checkpoint directory."""
+        latest_checkpoint_path = None
+        latest_epoch = -1
+
+        if not os.path.isdir(args.checkpoint_dir):
+            if args.verbose:
+                print(f"Checkpoint directory {args.checkpoint_dir} not found. Starting from scratch.")
+            return model, graph_learner, optimizer_cl, optimizer_learner, -1, None # Return initial state
+
+        for filename in os.listdir(args.checkpoint_dir):
+            if filename.startswith('checkpoint_epoch_') and filename.endswith('.pt'):
+                try:
+                    epoch_num = int(filename.split('_')[-1].split('.')[0])
+                    if epoch_num > latest_epoch:
+                        latest_epoch = epoch_num
+                        latest_checkpoint_path = os.path.join(args.checkpoint_dir, filename)
+                except ValueError:
+                    continue # Skip files that don't match the naming convention
+
+        if latest_checkpoint_path:
+            if args.verbose:
+                print(f"Loading checkpoint from {latest_checkpoint_path}")
+            try:
+                checkpoint = torch.load(latest_checkpoint_path, map_location=self.device)
+
+                # Load model and graph learner states
+                model.load_state_dict(checkpoint['model_state_dict'])
+                graph_learner.load_state_dict(checkpoint['graph_learner_state_dict'])
+
+                # Load optimizer states
+                optimizer_cl.load_state_dict(checkpoint['optimizer_cl_state_dict'])
+                optimizer_learner.load_state_dict(checkpoint['optimizer_learner_state_dict'])
+
+                start_epoch = checkpoint['epoch'] + 1
+                anchor_adj = checkpoint['anchor_adj'] # Load anchor_adj
+
+                # Move loaded anchor_adj to the correct device if it's a tensor/DGL graph
+                if isinstance(anchor_adj, torch.Tensor):
+                    anchor_adj = anchor_adj.to(self.device)
+                elif isinstance(anchor_adj, dgl.DGLGraph):
+                    anchor_adj = anchor_adj.to(self.device)
+
+                print(f"Resuming training from epoch {start_epoch}")
+                return model, graph_learner, optimizer_cl, optimizer_learner, start_epoch, anchor_adj
+            except Exception as e:
+                print(f"Error loading checkpoint {latest_checkpoint_path}: {e}")
+                print("Starting training from scratch.")
+                # Fall through to return initial state
+        else:
+            if args.verbose:
+                print("No valid checkpoint found. Starting training from scratch.")
+
+        return model, graph_learner, optimizer_cl, optimizer_learner, 0, None # Return initial state
+
+
+def create_parser():
     parser = argparse.ArgumentParser()
     # Experimental setting
     parser.add_argument('-dataset', type=str, default='person_data.csv',
@@ -1100,25 +996,29 @@ if __name__ == '__main__':
     parser.add_argument('-arcface_weight', type=float, default=1.0,
                        help='Weight for ArcFace loss when combining with contrastive loss')
     
-    # Memory optimization arguments
+    # Memory optimization arguments (kept batched arcface and grad accum)
     parser.add_argument('-use_batched_arcface', type=int, default=0,
                        help='Whether to use memory-efficient batched ArcFace implementation (0=disabled, 1=enabled)')
     parser.add_argument('-arcface_batch_size', type=int, default=1000,
                        help='Number of classes to process in each ArcFace batch (default: 1000)')
-    parser.add_argument('-debug_memory', type=int, default=0,
-                       help='Run memory debugging before training (0=disabled, 1=enabled)')
-    parser.add_argument('-max_debug_samples', type=int, default=10000,
-                       help='Maximum samples to use for memory debugging (default: 10000)')
-    
-    parser.add_argument('-use_mixed_precision', type=int, default=0,
-                       help='Use mixed precision training (FP16) to reduce memory usage (0=disabled, 1=enabled)')
     parser.add_argument('-grad_accumulation_steps', type=int, default=1,
                        help='Number of steps to accumulate gradients before updating weights (1=disabled)')
-    parser.add_argument('-memory_efficient_training', type=int, default=0,
-                       help='Use memory-efficient training with gradient accumulation and chunked processing (0=disabled, 1=enabled)')
 
+    # Checkpointing Arguments
+    parser.add_argument('-checkpoint_freq', type=int, default=200,
+                       help='Frequency of saving checkpoints (in epochs)')
+    parser.add_argument('-checkpoint_dir', type=str, default='checkpoints',
+                       help='Directory to save checkpoints')
 
-    args = parser.parse_args()
+    # Gradient Clipping
+    parser.add_argument('-clip_norm', type=float, default=1.0,
+                       help='Max norm for gradient clipping (0 to disable)')
+
+    return parser
+
+if __name__ == '__main__':
+    parent_parser = create_parser()
+    args = parent_parser.parse_args()
 
     experiment = Experiment()
     experiment.train(args, load_data)
