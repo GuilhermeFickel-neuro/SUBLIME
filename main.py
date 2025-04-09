@@ -20,8 +20,8 @@ from data_loader import load_data
 import random
 import os
 
-# Import batched ArcFace functionality
-from batched_arcface import BatchedArcFaceLayer, batched_arcface_loss
+# Add sampled ArcFace imports
+from sampled_arcface import SampledArcFaceLayer, arcface_loss_with_sampling
 # Import memory optimization utilities (only gradient accumulation remains relevant)
 from memory_optimizations import GradientAccumulation # Keep if grad_accumulation is used
 
@@ -89,23 +89,47 @@ class Experiment:
         # The learner embedding (emb2) will be used by loss_arcface_batched if called
         return loss, learned_adj, emb2
 
-    def loss_arcface_batched(self, model, graph_learner, features, anchor_adj, labels, args):
+    def loss_arcface_sampled(self, model, graph_learner, features, anchor_adj, labels, args):
         """
-        Memory-efficient version of ArcFace loss that processes data in batches
+        Memory-efficient implementation of ArcFace loss using class sampling.
+        This computes contrastive loss first, then computes ArcFace loss on the
+        learned graph embedding using a subset of classes.
+        """
+        # 1. Calculate contrastive loss and get learned adj/embedding
+        # We need the embedding from the learned graph view for ArcFace
+        contrastive_loss, learned_adj, learner_embedding = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+
+        # 2. Ensure the model is configured for sampled ArcFace
+        if not (hasattr(model, 'use_arcface') and model.use_arcface and 
+                hasattr(model, 'sampled_arcface') and model.sampled_arcface and 
+                isinstance(model.arcface, SampledArcFaceLayer)):
+            raise ValueError("Model is not correctly configured for Sampled ArcFace loss.")
+
+        # 3. Get ArcFace weight
+        arcface_weight = args.arcface_weight if hasattr(args, 'arcface_weight') else 1.0
+
+        # 4. Forward pass through the SampledArcFace layer
+        # The layer itself handles the sampling based on its initialization
+        arcface_output, sampled_labels = model.arcface(learner_embedding, labels)
+
+        # 5. Calculate the sampled ArcFace loss
+        arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
+
+        # 6. Combine losses
+        # Ensure tensors before combining if necessary (might depend on loss_gcl output type)
+        if not isinstance(contrastive_loss, torch.Tensor):
+            contrastive_loss = torch.tensor(contrastive_loss, device=arcface_output.device, requires_grad=True)
+        if not isinstance(arcface_loss, torch.Tensor):
+             # arcface_loss_with_sampling should return a tensor, but check just in case
+             arcface_loss = torch.tensor(arcface_loss, device=arcface_output.device, requires_grad=True)
+
+        combined_loss = contrastive_loss + arcface_weight * arcface_loss
         
-        Args:
-            model: The GCL model
-            graph_learner: The graph learner
-            features: Input features
-            anchor_adj: Anchor adjacency matrix
-            labels: Class labels (row indices in supervised mode)
-            args: Arguments
-            
-        Returns:
-            Tuple of (loss, learned_adjacency_matrix)
-        """
-        # Use the dedicated function from batched_arcface.py
-        return batched_arcface_loss(self, model, graph_learner, features, anchor_adj, labels, args)
+        if args.verbose and (not hasattr(args, '_sampled_loss_printed') or not args._sampled_loss_printed):
+             print(f"Sampled ArcFace Combined loss: contrastive={contrastive_loss.item():.4f}, arcface_sampled={arcface_loss.item():.4f}, weight={arcface_weight}")
+             args._sampled_loss_printed = True # Print only once if verbose
+
+        return combined_loss, learned_adj
 
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
         model = GCN(in_channels=nfeats, hidden_channels=args.hidden_dim_cls, out_channels=nclasses, num_layers=args.nlayers_cls,
@@ -247,6 +271,11 @@ class Experiment:
             f.write(f'num_classes: {model.arcface.weight.shape[0]}\n')
             f.write(f'arcface_scale: {model.arcface.s}\n')
             f.write(f'arcface_margin: {model.arcface.m}\n')
+            # Add sampled arcface config saving
+            if hasattr(model, 'sampled_arcface') and model.sampled_arcface:
+                f.write(f'use_sampled_arcface: True\n')
+                if hasattr(model.arcface, 'num_samples'):
+                    f.write(f'arcface_num_samples: {model.arcface.num_samples}\n')
 
     def load_model(self, input_dir='saved_models'):
         """
@@ -299,6 +328,12 @@ class Experiment:
             arcface_params['arcface_scale'] = float(config.get('arcface_scale', 30.0))
             arcface_params['arcface_margin'] = float(config.get('arcface_margin', 0.5))
             
+            # Add sampled arcface config loading
+            use_sampled_arcface = config.get('use_sampled_arcface', 'False').lower() in ['true', '1', 't', 'y', 'yes']
+            if use_sampled_arcface:
+                arcface_params['use_sampled_arcface'] = True
+                arcface_params['arcface_num_samples'] = int(config.get('arcface_num_samples', 5000))
+
         # Add flags to model loading defaults if needed (assuming they weren't saved)
         use_layer_norm_load = config.get('use_layer_norm', 'False').lower() in ['true', '1']
         use_residual_load = config.get('use_residual', 'False').lower() in ['true', '1']
@@ -319,6 +354,9 @@ class Experiment:
                        num_classes=arcface_params['num_classes'],
                        arcface_scale=arcface_params['arcface_scale'],
                        arcface_margin=arcface_params['arcface_margin'],
+                       # Add sampled arcface parameters to model init
+                       use_sampled_arcface=arcface_params.get('use_sampled_arcface', False),
+                       arcface_num_samples=arcface_params.get('arcface_num_samples', None)
                        )
         else:
             model = GCL(nlayers=model_params['nlayers'],
@@ -538,6 +576,7 @@ class Experiment:
                                      args.activation_learner, anchor_adj)
 
             if args.use_arcface:
+                # Add arguments for sampled arcface during initialization
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats,
                            hidden_dim=args.hidden_dim, emb_dim=args.rep_dim, proj_dim=args.proj_dim,
                            dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
@@ -545,44 +584,20 @@ class Experiment:
                            use_residual=bool(args.use_residual),
                            use_arcface=True, num_classes=nclasses,
                            arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
+                           # Pass sampled arcface args directly
+                           use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
+                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None
                            )
                 
-                # Logic for using BatchedArcFace remains
-                if args.use_batched_arcface:
-                    # Check if the model already has an ArcFace layer to replace
-                    if hasattr(model, 'arcface') and model.arcface is not None:
-                        try:
-                            original_arcface = model.arcface
-                            in_features = original_arcface.in_features
-                            out_features = original_arcface.out_features
-                            scale = original_arcface.s # Use .s for scale
-                            margin = original_arcface.m # Use .m for margin
-                            easy_margin = original_arcface.easy_margin
-                        except AttributeError as e:
-                            print(f"Error accessing attributes from original ArcFace layer: {e}")
-                            print("Skipping batched ArcFace replacement.")
-                        else:
-                            # Create new batched ArcFace layer
-                            batched_layer = BatchedArcFaceLayer(
-                                in_features=in_features,
-                                out_features=out_features,
-                                scale=scale,
-                                margin=margin,
-                                easy_margin=easy_margin,
-                                batch_size=args.arcface_batch_size
-                            )
-                            # Copy weights from original layer (important for fine-tuning)
-                            if original_arcface.weight is not None:
-                                batched_layer.weight.data.copy_(original_arcface.weight.data)
-                            # Replace the layer
-                            model.arcface = batched_layer
-                            if args.verbose:
-                                print(f"Using Batched ArcFace implementation with batch size {args.arcface_batch_size}")
-                    else:
-                         print("Warning: use_batched_arcface is True, but the model doesn't have an initial 'arcface' layer to replace.")
+                # Remove the logic for replacing with BatchedArcFaceLayer
+                # if args.use_batched_arcface: ... (Removed block)
 
                 if args.verbose:
-                    print(f"Using ArcFace loss with {nclasses} classes, scale={args.arcface_scale}, margin={args.arcface_margin}")
+                    # Adjust verbose message if using sampled
+                    if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
+                         print(f"Using Sampled ArcFace loss with {args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else 'default'} samples, scale={args.arcface_scale}, margin={args.arcface_margin}")
+                    else:
+                         print(f"Using Standard ArcFace loss with {nclasses} classes, scale={args.arcface_scale}, margin={args.arcface_margin}")
             else:
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
                           emb_dim=args.rep_dim, proj_dim=args.proj_dim,
@@ -666,7 +681,7 @@ class Experiment:
                         # Forward pass
                         if args.use_arcface:
                             # Always use batched version if ArcFace is enabled
-                            mini_loss, Adj = self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
+                            mini_loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
                         else:
                             mini_loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
@@ -696,7 +711,7 @@ class Experiment:
 
                     if args.use_arcface:
                         # Always use batched version if ArcFace is enabled
-                        loss, Adj = self.loss_arcface_batched(model, graph_learner, features, anchor_adj, labels, args)
+                        loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
                     else:
                         loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
@@ -996,11 +1011,14 @@ def create_parser():
     parser.add_argument('-arcface_weight', type=float, default=1.0,
                        help='Weight for ArcFace loss when combining with contrastive loss')
     
-    # Memory optimization arguments (kept batched arcface and grad accum)
-    parser.add_argument('-use_batched_arcface', type=int, default=0,
-                       help='Whether to use memory-efficient batched ArcFace implementation (0=disabled, 1=enabled)')
-    parser.add_argument('-arcface_batch_size', type=int, default=1000,
-                       help='Number of classes to process in each ArcFace batch (default: 1000)')
+    # Memory optimization arguments (Remove batched, add sampled)
+    # parser.add_argument('-use_batched_arcface', ...)
+    # parser.add_argument('-arcface_batch_size', ...)
+    parser.add_argument('-use_sampled_arcface', type=int, default=0,
+                       help='Whether to use ultra memory-efficient sampled ArcFace (0=disabled, 1=enabled)')
+    parser.add_argument('-arcface_num_samples', type=int, default=5000,
+                       help='Number of classes to sample in sampled ArcFace (default: 5000)')
+    
     parser.add_argument('-grad_accumulation_steps', type=int, default=1,
                        help='Number of steps to accumulate gradients before updating weights (1=disabled)')
 
