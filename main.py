@@ -48,6 +48,31 @@ class Experiment:
         accu = accuracy(logp[mask], labels[mask])
         return loss, accu
 
+    def loss_binary_cls(self, cls_output, binary_labels):
+        """
+        Calculate binary classification loss
+        
+        Args:
+            cls_output: Binary classification logits (N, 1)
+            binary_labels: Binary labels (N,) with values 0 or 1
+        
+        Returns:
+            loss: Binary cross entropy loss
+            accuracy: Classification accuracy
+        """
+        # Apply sigmoid to get probabilities
+        probs = torch.sigmoid(cls_output.squeeze())
+        
+        # Calculate binary cross entropy loss
+        loss = F.binary_cross_entropy(probs, binary_labels.float())
+        
+        # Calculate accuracy
+        predictions = (probs >= 0.5).float()
+        correct = (predictions == binary_labels.float()).float().sum()
+        accuracy = correct / binary_labels.size(0)
+        
+        return loss, accuracy
+
     def loss_gcl(self, model, graph_learner, features, anchor_adj, args):
         # view 1: anchor graph
         if args.maskfeat_rate_anchor:
@@ -88,6 +113,73 @@ class Experiment:
         # Return contrastive loss, learned adj, and the learner embedding
         # The learner embedding (emb2) will be used by loss_arcface_batched if called
         return loss, learned_adj, emb2
+
+    def loss_gcl_with_classification(self, model, graph_learner, features, anchor_adj, binary_labels, args):
+        """
+        Combined loss function that includes both contrastive learning and binary classification
+        
+        Args:
+            model: The GCL model with classification head
+            graph_learner: Graph structure learning module
+            features: Node features
+            anchor_adj: Anchor adjacency matrix
+            binary_labels: Binary labels for classification (0 or 1)
+            args: Training arguments
+            
+        Returns:
+            total_loss: Combined loss from contrastive learning and classification
+            learned_adj: Learned adjacency matrix
+            cls_accuracy: Accuracy of binary classification
+        """
+        # First get contrastive loss and learned adjacency
+        # view 1: anchor graph
+        if args.maskfeat_rate_anchor:
+            mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+            features_v1 = features * (1 - mask_v1)
+        else:
+            features_v1 = copy.deepcopy(features)
+
+        # Get projection (z1) and embedding (emb1) from anchor view
+        z1, emb1, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
+
+        # view 2: learned graph
+        if args.maskfeat_rate_learner:
+            mask, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+            features_v2 = features * (1 - mask)
+        else:
+            features_v2 = copy.deepcopy(features)
+
+        learned_adj = graph_learner(features)
+        if not args.sparse:
+            learned_adj = symmetrize(learned_adj)
+            learned_adj = normalize(learned_adj, 'sym', args.sparse)
+
+        # Get projection (z2), embedding (emb2), and classification output
+        z2, emb2, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
+
+        # Compute contrastive loss
+        if args.contrast_batch_size:
+            node_idxs = list(range(features.shape[0]))
+            batches = split_batch(node_idxs, args.contrast_batch_size)
+            contrastive_loss = 0
+            for batch in batches:
+                weight = len(batch) / features.shape[0]
+                contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
+        else:
+            contrastive_loss = model.calc_loss(z1, z2)
+
+        # Compute classification loss
+        cls_loss, cls_accuracy = self.loss_binary_cls(cls_output, binary_labels)
+        
+        # Combine losses using weight parameter
+        total_loss = contrastive_loss + args.annotation_loss_weight * cls_loss
+        
+        if args.verbose and (not hasattr(args, '_classification_loss_printed') or not args._classification_loss_printed):
+            print(f"Combined loss: contrastive={contrastive_loss.item():.4f}, classification={cls_loss.item():.4f}, "
+                  f"weight={args.annotation_loss_weight}, accuracy={cls_accuracy.item():.4f}")
+            args._classification_loss_printed = True
+            
+        return total_loss, learned_adj, cls_accuracy
 
     def loss_arcface_sampled(self, model, graph_learner, features, anchor_adj, labels, args):
         """
@@ -276,6 +368,12 @@ class Experiment:
                 f.write(f'use_sampled_arcface: True\n')
                 if hasattr(model.arcface, 'num_samples'):
                     f.write(f'arcface_num_samples: {model.arcface.num_samples}\n')
+        
+        # Save classification head parameters if present
+        if hasattr(model, 'use_classification_head') and model.use_classification_head:
+            f.write(f'use_classification_head: True\n')
+            if hasattr(model, 'classification_dropout') and hasattr(model.classification_dropout, 'p'):
+                f.write(f'classification_dropout: {model.classification_dropout.p}\n')
 
     def load_model(self, input_dir='saved_models'):
         """
@@ -292,11 +390,11 @@ class Experiment:
         with open(os.path.join(input_dir, 'config.txt'), 'r') as f:
             for line in f:
                 key, value = line.strip().split(': ')
-                if key == 'sparse':
-                    config[key] = value.lower() == '1'
-                elif key in ['feature_dim', 'num_nodes', 'nlayers', 'hidden_dim', 'emb_dim', 'proj_dim', 'k']:
+                if key in ['sparse', 'use_layer_norm', 'use_residual', 'use_arcface', 'use_sampled_arcface', 'use_classification_head']:
+                    config[key] = value.lower() in ['true', '1', 't', 'y', 'yes']
+                elif key in ['feature_dim', 'num_nodes', 'nlayers', 'hidden_dim', 'emb_dim', 'proj_dim', 'k', 'num_classes', 'arcface_num_samples']:
                     config[key] = int(value)
-                elif key in ['dropout', 'dropout_adj']:
+                elif key in ['dropout', 'dropout_adj', 'arcface_scale', 'arcface_margin', 'classification_dropout']:
                     config[key] = float(value)
                 else:
                     config[key] = value
@@ -320,55 +418,55 @@ class Experiment:
         }
         
         # Check for arcface parameters in config
-        use_arcface = config.get('use_arcface', 'False').lower() in ['true', '1', 't', 'y', 'yes']
+        use_arcface = config.get('use_arcface', False)
         arcface_params = {}
         if use_arcface:
             arcface_params['use_arcface'] = True
-            arcface_params['num_classes'] = int(config.get('num_classes', 0))
-            arcface_params['arcface_scale'] = float(config.get('arcface_scale', 30.0))
-            arcface_params['arcface_margin'] = float(config.get('arcface_margin', 0.5))
+            arcface_params['num_classes'] = config.get('num_classes', 0)
+            arcface_params['arcface_scale'] = config.get('arcface_scale', 30.0)
+            arcface_params['arcface_margin'] = config.get('arcface_margin', 0.5)
             
             # Add sampled arcface config loading
-            use_sampled_arcface = config.get('use_sampled_arcface', 'False').lower() in ['true', '1', 't', 'y', 'yes']
+            use_sampled_arcface = config.get('use_sampled_arcface', False)
             if use_sampled_arcface:
                 arcface_params['use_sampled_arcface'] = True
-                arcface_params['arcface_num_samples'] = int(config.get('arcface_num_samples', 5000))
+                arcface_params['arcface_num_samples'] = config.get('arcface_num_samples', 5000)
+
+        # Check for classification head parameters in config
+        use_classification_head = config.get('use_classification_head', False)
+        classification_params = {}
+        if use_classification_head:
+            classification_params['use_classification_head'] = True
+            classification_params['classification_dropout'] = config.get('classification_dropout', 0.3)
 
         # Add flags to model loading defaults if needed (assuming they weren't saved)
-        use_layer_norm_load = config.get('use_layer_norm', 'False').lower() in ['true', '1']
-        use_residual_load = config.get('use_residual', 'False').lower() in ['true', '1']
+        use_layer_norm_load = config.get('use_layer_norm', False)
+        use_residual_load = config.get('use_residual', False)
         
-        # Initialize models with arcface parameters if needed
+        # Initialize models with arcface and classification parameters if needed
+        init_params = {
+            'nlayers': model_params['nlayers'],
+            'in_dim': features.shape[1],
+            'hidden_dim': model_params['hidden_dim'],
+            'emb_dim': model_params['emb_dim'],
+            'proj_dim': model_params['proj_dim'],
+            'dropout': model_params['dropout'],
+            'dropout_adj': model_params['dropout_adj'],
+            'sparse': sparse,
+            'use_layer_norm': use_layer_norm_load,
+            'use_residual': use_residual_load
+        }
+        
+        # Add ArcFace parameters if needed
         if use_arcface:
-            model = GCL(nlayers=model_params['nlayers'],
-                       in_dim=features.shape[1],
-                       hidden_dim=model_params['hidden_dim'],
-                       emb_dim=model_params['emb_dim'],
-                       proj_dim=model_params['proj_dim'],
-                       dropout=model_params['dropout'],
-                       dropout_adj=model_params['dropout_adj'],
-                       sparse=sparse,
-                       use_layer_norm=use_layer_norm_load,
-                       use_residual=use_residual_load,
-                       use_arcface=arcface_params['use_arcface'],
-                       num_classes=arcface_params['num_classes'],
-                       arcface_scale=arcface_params['arcface_scale'],
-                       arcface_margin=arcface_params['arcface_margin'],
-                       # Add sampled arcface parameters to model init
-                       use_sampled_arcface=arcface_params.get('use_sampled_arcface', False),
-                       arcface_num_samples=arcface_params.get('arcface_num_samples', None)
-                       )
-        else:
-            model = GCL(nlayers=model_params['nlayers'],
-                       in_dim=features.shape[1],
-                       hidden_dim=model_params['hidden_dim'],
-                       emb_dim=model_params['emb_dim'],
-                       proj_dim=model_params['proj_dim'],
-                       dropout=model_params['dropout'],
-                       dropout_adj=model_params['dropout_adj'],
-                       sparse=sparse,
-                       use_layer_norm=use_layer_norm_load,
-                       use_residual=use_residual_load)
+            init_params.update(arcface_params)
+            
+        # Add classification head parameters if needed
+        if use_classification_head:
+            init_params.update(classification_params)
+            
+        # Initialize model with all collected parameters
+        model = GCL(**init_params)
         
         # Determine type of graph learner from config or saved file
         learner_type = config.get('type_learner', None)
@@ -462,7 +560,9 @@ class Experiment:
             faiss_index: Optional pre-built FAISS index for the graph_learner to use
             
         Returns:
-            torch.Tensor: The node embedding for the new point
+            dict: A dictionary containing:
+                - 'embedding': The node embedding for the new point
+                - 'classification': Binary classification prediction (if model has classification head)
         """
         # Ensure model and graph_learner are in evaluation mode
         model.eval()
@@ -501,15 +601,40 @@ class Experiment:
                 new_adj = symmetrize(new_adj)
                 new_adj = normalize(new_adj, 'sym', sparse)
             
-            # Get embeddings for all nodes including the new one.
-            # The if/else based on use_arcface was redundant here because labels are not passed.
-            _, embeddings = model(modified_features, new_adj)
+            # Get embeddings for all nodes including the new one
+            # Check if model has classification head to determine the right forward call
+            has_classification_head = hasattr(model, 'use_classification_head') and model.use_classification_head
             
-            # Return the embedding of the replaced point
-            new_point_embedding = embeddings[replace_idx].detach()
+            if has_classification_head:
+                # Call with include_features=True to get classification output
+                z, embedding, _, classification_output = model(modified_features, new_adj, include_features=True)
+                
+                # Get binary classification prediction if available
+                if classification_output is not None:
+                    classification_prob = torch.sigmoid(classification_output[replace_idx]).item()
+                    classification_pred = 1 if classification_prob >= 0.5 else 0
+                else:
+                    classification_prob = None
+                    classification_pred = None
+            else:
+                # Standard call for models without classification head
+                z, embedding = model(modified_features, new_adj)
+                classification_prob = None
+                classification_pred = None
             
-            return new_point_embedding
+            # Create return dictionary with embedding and optional classification results
+            result = {
+                'embedding': embedding[replace_idx].detach(),
+                'embedding_vector': embedding[replace_idx].detach().cpu().numpy()
+            }
             
+            # Add classification results if available
+            if classification_prob is not None:
+                result['classification_probability'] = classification_prob
+                result['classification_prediction'] = classification_pred
+            
+            return result
+
     def train(self, args, load_data_fn=None):
         """
         Train the model
@@ -527,6 +652,38 @@ class Experiment:
         elif args.gsl_mode == 'structure_inference':
             features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, _ = load_data_fn(args)
         
+        # Load annotated dataset if provided
+        annotated_features = None
+        binary_labels = None
+        if args.annotated_dataset is not None:
+            # Call the same load function but with annotated dataset
+            saved_dataset = args.dataset
+            args.dataset = args.annotated_dataset
+            
+            # Load annotated data (using the same loading function)
+            annotated_features, annotated_nfeats, _, _, _, _, _, _ = load_data_fn(args)
+            
+            # Restore original dataset path
+            args.dataset = saved_dataset
+            
+            # Check if dimensions match the main dataset
+            if annotated_nfeats != nfeats:
+                raise ValueError(f"Annotated dataset features dimension ({annotated_nfeats}) "
+                                f"doesn't match main dataset ({nfeats})")
+            
+            # Extract binary labels from the annotated dataset
+            # This assumes the binary labels are stored in the last column
+            # We'll need to modify the data_loader.py to support this properly
+            binary_labels = torch.tensor(annotated_features[:, -1].astype(int))
+            
+            # Remove the label column from features
+            annotated_features = annotated_features[:, :-1]
+            
+            if args.verbose:
+                print(f"Loaded annotated dataset with {len(binary_labels)} samples")
+                print(f"Binary label distribution: 0s={int((binary_labels == 0).sum())}, "
+                     f"1s={int((binary_labels == 1).sum())}")
+
         # For ArcFace, create labels as row indices if not provided
         if args.use_arcface:
             if labels is None:
@@ -575,6 +732,9 @@ class Experiment:
                 graph_learner = GNN_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                      args.activation_learner, anchor_adj)
 
+            # Determine if we should use classification head based on whether annotated_dataset was provided
+            use_classification_head = annotated_features is not None and binary_labels is not None
+
             if args.use_arcface:
                 # Add arguments for sampled arcface during initialization
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats,
@@ -586,12 +746,10 @@ class Experiment:
                            arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
                            # Pass sampled arcface args directly
                            use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
-                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None
-                           )
+                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None,
+                           # Pass classification head flag
+                           use_classification_head=use_classification_head)
                 
-                # Remove the logic for replacing with BatchedArcFaceLayer
-                # if args.use_batched_arcface: ... (Removed block)
-
                 if args.verbose:
                     # Adjust verbose message if using sampled
                     if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
@@ -601,7 +759,11 @@ class Experiment:
             else:
                 model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
                           emb_dim=args.rep_dim, proj_dim=args.proj_dim,
-                          dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse)
+                          dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
+                          use_layer_norm=bool(args.use_layer_norm),
+                          use_residual=bool(args.use_residual),
+                          # Pass classification head flag
+                          use_classification_head=use_classification_head)
 
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
@@ -655,11 +817,22 @@ class Experiment:
                 val_mask = val_mask.to(self.device)
             if test_mask is not None:
                 test_mask = test_mask.to(self.device)
+                
+            # Move annotated data to device if provided
+            if annotated_features is not None:
+                annotated_features = torch.tensor(annotated_features, dtype=torch.float32).to(self.device)
+            if binary_labels is not None:
+                binary_labels = binary_labels.to(self.device)
 
             if args.downstream_task == 'classification':
                 best_val = 0.0 # Initialize as float
                 best_val_test = 0
                 best_epoch = 0
+                
+            # For tracking classification performance if using annotated dataset
+            if use_classification_head:
+                best_cls_accuracy = 0.0
+                cls_accuracies = []
 
             # Initialize gradient accumulation steps
             grad_accumulation_steps = args.grad_accumulation_steps if hasattr(args, 'grad_accumulation_steps') else 1
@@ -670,33 +843,41 @@ class Experiment:
                 model.train()
                 graph_learner.train()
                 
-                # Simplified training loop: Removed mixed precision and logic for different ArcFace types
+                # Simplified training loop with annotated dataset support
                 if grad_accumulation_steps > 1:
-                    # Gradient accumulation path (without mixed precision)
+                    # Gradient accumulation path
                     accumulated_loss = 0
                     optimizer_cl.zero_grad()
                     optimizer_learner.zero_grad()
 
                     for i in range(grad_accumulation_steps):
                         # Forward pass
-                        if args.use_arcface:
-                            # Always use batched version if ArcFace is enabled
+                        if use_classification_head:
+                            # Use combined loss with classification
+                            mini_loss, Adj, cls_accuracy = self.loss_gcl_with_classification(
+                                model, graph_learner, annotated_features, anchor_adj, binary_labels, args
+                            )
+                            # Track classification accuracy
+                            if i == 0:  # only track for first accumulation step
+                                current_cls_accuracy = cls_accuracy
+                        elif args.use_arcface:
+                            # Use ArcFace loss
                             mini_loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
                         else:
-                            mini_loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                            # Use standard contrastive loss
+                            mini_loss, Adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
                         mini_loss = mini_loss / grad_accumulation_steps # Scale loss
 
-                        # Backward pass (no scaler)
+                        # Backward pass
                         mini_loss.backward()
 
                         accumulated_loss += mini_loss.item() * grad_accumulation_steps # Unscale for reporting
 
-                    # --- Gradient Clipping ---
+                    # Gradient Clipping
                     if args.clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
                         torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
-                    # --- End Gradient Clipping ---
 
                     # Update weights
                     optimizer_cl.step()
@@ -705,17 +886,27 @@ class Experiment:
                     loss = accumulated_loss / grad_accumulation_steps # Average loss for the step
 
                 else:
-                    # Standard training path (no gradient accumulation, no mixed precision)
+                    # Standard training path (no gradient accumulation)
                     optimizer_cl.zero_grad()
                     optimizer_learner.zero_grad()
 
-                    if args.use_arcface:
-                        # Always use batched version if ArcFace is enabled
+                    # Choose appropriate loss function based on available data
+                    if use_classification_head:
+                        # Use combined loss with classification
+                        loss, Adj, current_cls_accuracy = self.loss_gcl_with_classification(
+                            model, graph_learner, annotated_features, anchor_adj, binary_labels, args
+                        )
+                        # Track best classification accuracy
+                        if current_cls_accuracy > best_cls_accuracy:
+                            best_cls_accuracy = current_cls_accuracy
+                    elif args.use_arcface:
+                        # Use ArcFace loss
                         loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
                     else:
-                        loss, Adj = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                        # Use standard contrastive loss
+                        loss, Adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
 
-                    # --- NaN Loss Check ---
+                    # NaN Loss Check
                     if torch.isnan(loss):
                         print(f"\nWarning: NaN loss detected at epoch {epoch}. Attempting to reload last checkpoint.")
                         if last_checkpoint_path:
@@ -735,16 +926,14 @@ class Experiment:
                         else:
                             print("No previous checkpoint found to revert to after NaN loss. Stopping training trial.")
                             break # Exit the epoch loop for this trial
-                    # --- End NaN Loss Check ---
 
                     # Backward and optimize
                     loss.backward()
 
-                    # --- Gradient Clipping ---
+                    # Gradient Clipping
                     if args.clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
                         torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
-                    # --- End Gradient Clipping ---
 
                     optimizer_cl.step()
                     optimizer_learner.step()
@@ -771,17 +960,29 @@ class Experiment:
 
                 if args.verbose:
                     try:
-                        print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item()), args.downstream_task)
+                        loss_msg = "Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item())
+                        if use_classification_head:
+                            # Add classification accuracy to the message
+                            loss_msg += " | Cls Acc {:.4f}".format(current_cls_accuracy.item())
+                            cls_accuracies.append(current_cls_accuracy.item())
+                        loss_msg += " | " + args.downstream_task
+                        print(loss_msg)
                     except:
                         print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss), args.downstream_task)
 
-                # --- Periodic Checkpointing ---
+                # Periodic Checkpointing
                 if epoch > 0 and epoch % args.checkpoint_freq == 0:
                     current_checkpoint_path = self.save_checkpoint(
                         epoch, model, graph_learner, optimizer_cl, optimizer_learner, anchor_adj, args
                     )
                     last_checkpoint_path = current_checkpoint_path # Update last known good path
-                # --- End Periodic Checkpointing ---
+                    
+                    # Also report average classification accuracy over period if using classification head
+                    if use_classification_head and len(cls_accuracies) > 0:
+                        avg_cls_acc = sum(cls_accuracies) / len(cls_accuracies)
+                        if args.verbose:
+                            print(f"Average classification accuracy over last {len(cls_accuracies)} epochs: {avg_cls_acc:.4f}")
+                        cls_accuracies = []  # Reset for next period
 
                 if epoch % args.eval_freq == 0:
                     if args.downstream_task == 'classification':
@@ -833,13 +1034,10 @@ class Experiment:
                     print("Trial: ", trial + 1)
                     print("Best val ACC: ", best_val)
                     print("Best test ACC: ", best_val_test.item())
-            # elif args.downstream_task == 'clustering':
-            #     if labels is not None:
-            #         if args.verbose:
-            #             print("Final ACC: ", acc)
-            #             print("Final NMI: ", nmi)
-            #             print("Final F-score: ", f1)
-            #             print("Final ARI: ", ari)
+                    
+                    # Report best classification accuracy if used
+                    if use_classification_head:
+                        print("Best classification accuracy: ", best_cls_accuracy.item())
 
             # After training completes
             if args.save_model:
@@ -936,6 +1134,13 @@ def create_parser():
     # Experimental setting
     parser.add_argument('-dataset', type=str, default='person_data.csv',
                         help='Path to the dataset file')
+    # Add annotated dataset arguments
+    parser.add_argument('-annotated_dataset', type=str, default=None,
+                        help='Path to annotated dataset with binary target column')
+    parser.add_argument('-annotation_column', type=str, default='target',
+                        help='Name of the binary target column in annotated dataset (values 0 or 1)')
+    parser.add_argument('-annotation_loss_weight', type=float, default=1.0,
+                        help='Weight for the binary classification loss')
     parser.add_argument('-ntrials', type=int, default=5)
     parser.add_argument('-sparse', type=int, default=0)
     parser.add_argument('-gsl_mode', type=str, default="structure_refinement",

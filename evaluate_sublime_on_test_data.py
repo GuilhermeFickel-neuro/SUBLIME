@@ -171,6 +171,9 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     
     num_batches = (len(X) + batch_size - 1) // batch_size
     all_embeddings = []
+    # For storing classification results if available
+    all_classifications = []
+    has_classification = False
     
     # Set models to evaluation mode
     model.eval()
@@ -185,18 +188,33 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         
         # Process each point individually for better error handling
         batch_embeddings = []
+        batch_classifications = []
         
         for j in range(len(batch_X)):
             try:
                 point_tensor = torch.FloatTensor(batch_X[j]).to(device)
                 
                 # Extract embedding using process_new_point method, passing our pre-built FAISS index
-                embedding = experiment.process_new_point(
+                # The method now returns a dictionary with embeddings and possibly classification info
+                result_dict = experiment.process_new_point(
                     point_tensor, model, graph_learner, features, adj, sparse, faiss_index=faiss_index
                 )
                 
+                embedding_vector = result_dict['embedding_vector']
+                
                 # Append the embedding
-                batch_embeddings.append(embedding.cpu().detach().numpy())
+                batch_embeddings.append(embedding_vector)
+                
+                # Check if classification data is available (only needed on first point)
+                if j == 0 and i == 0 and 'classification_probability' in result_dict:
+                    has_classification = True
+                
+                # Store classification info if available
+                if has_classification and 'classification_probability' in result_dict:
+                    batch_classifications.append({
+                        'probability': result_dict['classification_probability'],
+                        'prediction': result_dict['classification_prediction']
+                    })
                 
             except Exception as e:
                 print(f"Error processing point {start_idx + j}: {str(e)}")
@@ -204,6 +222,8 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
                 
         # Add the batch embeddings to the overall results
         all_embeddings.extend(batch_embeddings)
+        if has_classification:
+            all_classifications.extend(batch_classifications)
     
     if len(all_embeddings) != len(X):
         print(f"WARNING: Expected {len(X)} embeddings but only got {len(all_embeddings)}!")
@@ -214,10 +234,22 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     if cache_file is not None:
         print(f"Saving embeddings to cache: {cache_file}")
         np.save(cache_file, embeddings_array)
+        
+        # If classification results are available, save them too
+        if has_classification:
+            classification_cache_file = os.path.join(cache_dir, f"sublime_classifications_{model_name}_{dataset_name}.npy")
+            classification_array = np.array([
+                [item['probability'], item['prediction']] 
+                for item in all_classifications
+            ])
+            np.save(classification_cache_file, classification_array)
+            print(f"Saving classification results to cache: {classification_cache_file}")
     
+    # Optionally, we could return classification info too, but for now just return embeddings
+    # to maintain backward compatibility with the rest of the script
     return embeddings_array
 
-def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, preprocessor=None, n_trials=50):
+def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, preprocessor=None, n_trials=50, classification_probs=None):
     """
     Train XGBoost, CatBoost and LightGBM classifiers on two different feature sets and compare performance
     
@@ -228,25 +260,44 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         dataset_name: Name of the dataset
         preprocessor: The column transformer used to preprocess dataset features (optional)
         n_trials: Number of optimization trials for Optuna
+        classification_probs: Model's binary classification probabilities (optional)
         
     Returns:
         dict: Results dictionary with accuracies and hyperparameters
     """
     results = {}
     
-    # Create concatenated features (dataset features + SUBLIME)
-    concat_features = np.hstack((dataset_features, sublime_embeddings))
+    # Create concatenated features (dataset features + SUBLIME + classification probability if available)
+    if classification_probs is not None:
+        # Add classification probability as additional feature
+        classification_probs_reshaped = classification_probs.reshape(-1, 1)
+        concat_features = np.hstack((dataset_features, sublime_embeddings, classification_probs_reshaped))
+        print(f"Including model's classification probability as an additional feature")
+    else:
+        # Just dataset features + SUBLIME embeddings
+        concat_features = np.hstack((dataset_features, sublime_embeddings))
     
     print(f"Dataset features shape: {dataset_features.shape}")
     print(f"SUBLIME features shape: {sublime_embeddings.shape}")
+    if classification_probs is not None:
+        print(f"Classification probability shape: {classification_probs_reshaped.shape}")
     print(f"Concatenated features shape: {concat_features.shape}")
     
     # Split the data into training and validation sets (70/30 split)
     from sklearn.model_selection import train_test_split
-    X_train, X_val, sublime_train, sublime_val, concat_train, concat_val, y_train, y_val = train_test_split(
-        dataset_features, sublime_embeddings, concat_features, y, 
-        test_size=0.3, random_state=42, stratify=y
-    )
+    
+    # Adjust the split to include classification probability if available
+    if classification_probs is not None:
+        X_train, X_val, sublime_train, sublime_val, cls_probs_train, cls_probs_val, concat_train, concat_val, y_train, y_val = train_test_split(
+            dataset_features, sublime_embeddings, classification_probs_reshaped, concat_features, y, 
+            test_size=0.3, random_state=42, stratify=y
+        )
+    else:
+        X_train, X_val, sublime_train, sublime_val, concat_train, concat_val, y_train, y_val = train_test_split(
+            dataset_features, sublime_embeddings, concat_features, y, 
+            test_size=0.3, random_state=42, stratify=y
+        )
+    
     # Define Optuna objective for dataset features - XGBoost
     def xgb_dataset_objective(trial):
         param = {
@@ -644,7 +695,11 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     sublime_feature_names = [f"SUBLIME_{i}" for i in range(sublime_embeddings.shape[1])]
     
     # Combined feature names for concatenated model
-    concat_feature_names = list(feature_names) + list(sublime_feature_names)
+    if classification_probs is not None:
+        # Add classification probability feature name
+        concat_feature_names = list(feature_names) + list(sublime_feature_names) + ["Model_Classification_Probability"]
+    else:
+        concat_feature_names = list(feature_names) + list(sublime_feature_names)
     
     # Define model classifiers for feature importance plots
     model_classifiers = {
@@ -763,6 +818,11 @@ def main(args):
     model, graph_learner, features, adj, sparse = experiment.load_model(input_dir=args.model_dir)
     print("Model loaded successfully!")
     
+    # Check if the model has a classification head
+    has_classification_head = hasattr(model, 'use_classification_head') and model.use_classification_head
+    if has_classification_head:
+        print("Model includes a binary classification head")
+    
     # 4. Build FAISS index once for the entire dataset (optimization)
     print("\nBuilding FAISS index for faster embedding extraction...")
     try:
@@ -775,18 +835,35 @@ def main(args):
         print(f"Failed to build FAISS index: {str(e)}. Continuing without index optimization.")
         faiss_index = None
     
+    # Dataset name for cache files
+    dataset_name = os.path.basename(args.neurolake_csv).split('.')[0]
+    
     # 5. Extract SUBLIME features from neurolake data
     print("\nExtracting SUBLIME features...")
     sublime_embeddings = extract_in_batches(
         X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
         batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir, 
-        dataset_name=os.path.basename(args.neurolake_csv).split('.')[0],
+        dataset_name=dataset_name,
         faiss_index=faiss_index
     )
     # Normalize SUBLIME embeddings
     sublime_embeddings = sublime_embeddings / np.linalg.norm(sublime_embeddings, axis=1, keepdims=True)
     
     print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
+    
+    # Check if classification results are available in cache
+    classification_results = None
+    classification_probs = None
+    if has_classification_head and args.cache_dir:
+        model_name = os.path.basename(os.path.normpath(args.model_dir))
+        classification_cache_file = os.path.join(args.cache_dir, f"sublime_classifications_{model_name}_{dataset_name}.npy")
+        if os.path.exists(classification_cache_file):
+            classification_results = np.load(classification_cache_file)
+            print(f"Loaded classification results from cache: {classification_cache_file}")
+            print(f"Classification results shape: {classification_results.shape}")
+            # Extract probabilities to use as features
+            classification_probs = classification_results[:, 0]
+            print(f"Extracted classification probabilities for use as features")
     
     # 5. If embeddings_output is provided, save embeddings to CSV
     if args.embeddings_output:
@@ -799,6 +876,12 @@ def main(args):
         # Add index from original neurolake data if it exists
         if 'id' in neurolake_df.columns:
             embeddings_df['id'] = neurolake_df['id'].values
+        
+        # Add classification results if available
+        if classification_results is not None:
+            embeddings_df['classification_probability'] = classification_results[:, 0]
+            embeddings_df['classification_prediction'] = classification_results[:, 1]
+            print("Added classification results to embeddings output")
             
         # Save to CSV
         embeddings_df.to_csv(args.embeddings_output, index=False)
@@ -830,6 +913,12 @@ def main(args):
             dataset_df = dataset_df[valid_mask].reset_index(drop=True)
             neurolake_df = neurolake_df[valid_mask].reset_index(drop=True)
             
+            # Also filter the embeddings and classification results
+            sublime_embeddings = sublime_embeddings[valid_mask]
+            if classification_results is not None:
+                classification_results = classification_results[valid_mask]
+                classification_probs = classification_probs[valid_mask]
+            
             print(f"After filtering: {len(dataset_df)} rows remaining")
     else:
         raise ValueError(f"Target column '{args.target_column}' not found in the dataset features")
@@ -837,10 +926,42 @@ def main(args):
     # Process dataset features with a new preprocessing pipeline
     X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
     
-    # 7. Evaluate using dataset features and SUBLIME embeddings
+    # Compare model's built-in classification with target values if available
+    if classification_results is not None:
+        from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
+        
+        model_predictions = classification_results[:, 1].astype(int)
+        model_probabilities = classification_results[:, 0]
+        
+        # Calculate accuracy and AUC for the model's built-in classifier
+        model_accuracy = accuracy_score(y, model_predictions)
+        model_auc = roc_auc_score(y, model_probabilities)
+        
+        print("\n" + "="*80)
+        print("BUILT-IN BINARY CLASSIFIER PERFORMANCE")
+        print("="*80)
+        print(f"Accuracy: {model_accuracy:.4f}")
+        print(f"AUC-ROC: {model_auc:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y, model_predictions))
+        print("="*80)
+        
+        # Save results to CSV
+        model_results_df = pd.DataFrame({
+            'target': y,
+            'model_prediction': model_predictions,
+            'model_probability': model_probabilities
+        })
+        model_results_path = os.path.join(args.output_dir, f"{dataset_name}_model_classification_results.csv")
+        model_results_df.to_csv(model_results_path, index=False)
+        print(f"Model classification results saved to {model_results_path}")
+    
+    # 7. Evaluate using dataset features and SUBLIME embeddings (and classification probabilities if available)
     print("\nEvaluating features with XGBoost, CatBoost, and LightGBM...")
     dataset_name = os.path.basename(args.dataset_features_csv).split('.')[0]
-    results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name, preprocessor=preprocessor, n_trials=args.n_trials)
+    results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name, 
+                               preprocessor=preprocessor, n_trials=args.n_trials,
+                               classification_probs=classification_probs)
     
     # 8. Print summary
     print("\n" + "="*80)

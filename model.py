@@ -189,7 +189,9 @@ class GCL(nn.Module):
     def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse,
                  use_layer_norm=False, use_residual=False, # <-- Pass flags here
                  use_arcface=False, num_classes=None, arcface_scale=30.0, arcface_margin=0.5,
-                 use_sampled_arcface=False, arcface_num_samples=None):
+                 use_sampled_arcface=False, arcface_num_samples=None,
+                 # Add classification head parameters
+                 use_classification_head=False, classification_dropout=0.3):
         super(GCL, self).__init__()
 
         # Pass the flags to the GraphEncoder
@@ -218,23 +220,48 @@ class GCL(nn.Module):
                 from layers import ArcFaceLayer
                 self.sampled_arcface = False
                 self.arcface = ArcFaceLayer(emb_dim, num_classes, scale=arcface_scale, margin=arcface_margin)
+                
+        # Add binary classification head if specified
+        self.use_classification_head = use_classification_head
+        if use_classification_head:
+            self.classification_dropout = nn.Dropout(classification_dropout)
+            self.classification_head = nn.Linear(emb_dim, 1)  # Binary classification
+            print(f"Using classification head for binary classification")
 
     def forward(self, x, Adj_, branch=None, labels=None, include_features=False):
         z, embedding = self.encoder(x, Adj_, branch)
         
-        # Return hidden features if requested (for use in loss functions)
-        if include_features:
-            return z, embedding, None
+        # Return values to collect
+        outputs = [z, embedding]
         
-        # If using ArcFace and we have labels, return ArcFace outputs too
+        # Include ArcFace outputs if using it with labels
         if self.use_arcface and hasattr(self, 'arcface') and labels is not None:
             if hasattr(self, 'sampled_arcface') and self.sampled_arcface:
                 arcface_output, _ = self.arcface(embedding, labels)
             else:
                 arcface_output = self.arcface(embedding, labels)
-            return z, embedding, arcface_output
+            outputs.append(arcface_output)
+        else:
+            outputs.append(None)  # No ArcFace output
+            
+        # Include classification head outputs if using it
+        if self.use_classification_head:
+            # Apply dropout before classification
+            cls_embedding = self.classification_dropout(embedding)
+            cls_output = self.classification_head(cls_embedding)
+            outputs.append(cls_output)
+        else:
+            outputs.append(None)  # No classification output
         
-        return z, embedding
+        # Return only what's needed based on the calling context
+        if include_features:
+            return tuple(outputs)
+        elif len(outputs) == 4 and (outputs[2] is not None or outputs[3] is not None):
+            # If we have ArcFace or classification outputs, return all
+            return tuple(outputs)
+        else:
+            # Basic case: just return z and embedding
+            return z, embedding
 
     @staticmethod
     def calc_loss(x, x_aug, temperature=0.2, sym=True):
