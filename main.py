@@ -305,9 +305,9 @@ class Experiment:
         
         # Save config using the dedicated function
         with open(os.path.join(output_dir, 'config.txt'), 'w') as f:
-            self.save_model_config(f, args, model, graph_learner, features, sparse)
+            self.save_model_config(f, args, model, graph_learner, features, sparse, adj)
 
-    def save_model_config(self, f, args, model, graph_learner, features, sparse):
+    def save_model_config(self, f, args, model, graph_learner, features, sparse, initial_graph_data):
         # Save all args parameters if provided
         if args:
             for arg_name, arg_value in vars(args).items():
@@ -374,6 +374,10 @@ class Experiment:
             f.write(f'use_classification_head: True\n')
             if hasattr(model, 'classification_dropout') and hasattr(model.classification_dropout, 'p'):
                 f.write(f'classification_dropout: {model.classification_dropout.p}\n')
+
+        # Add 'i' parameter for FGP learner if applicable
+        if isinstance(graph_learner, FGP_learner) and hasattr(graph_learner, 'i'):
+            f.write(f'fgp_elu_alpha: {graph_learner.i}\n')
 
     def load_model(self, input_dir='saved_models'):
         """
@@ -487,10 +491,16 @@ class Experiment:
                     # For now, assume MLP as default
                     learner_type = 'mlp'
         
+        # Load adjacency matrix *before* initializing graph learner if needed (e.g., FGP)
+        adj = self._load_adjacency(input_dir, sparse)
+        initial_graph_data_loaded = adj # Assume loaded adj is the initial graph
+
         # Create the appropriate graph learner
         if learner_type == 'fgp':
-            graph_learner = FGP_learner(features.cpu(), model_params['k'], 
-                                      model_params['sim_function'], 6, sparse)
+            # Pass the loaded initial graph data
+            fgp_elu_alpha = config.get('fgp_elu_alpha', 6) # Load alpha, default to 6
+            graph_learner = FGP_learner(k=model_params['k'], knn_metric=model_params['sim_function'], i=fgp_elu_alpha,
+                                      sparse=sparse, initial_graph_data=initial_graph_data_loaded)
         elif learner_type == 'mlp':
             graph_learner = MLP_learner(2, features.shape[1], model_params['k'], 
                                      model_params['sim_function'], 6, sparse,
@@ -501,47 +511,46 @@ class Experiment:
                                      model_params['activation_learner'])
         elif learner_type == 'gnn':
             # Need to load adjacency first
-            adj_data = self._load_adjacency(input_dir, sparse)
+            # Adjacency (initial_graph_data_loaded) is already loaded
             graph_learner = GNN_learner(2, features.shape[1], model_params['k'], 
                                      model_params['sim_function'], 6, sparse,
-                                     model_params['activation_learner'], adj_data)
+                                     model_params['activation_learner'], initial_graph_data_loaded)
         else:
             # Default to FGP learner if no specific type is found
-            graph_learner = FGP_learner(features.cpu(), model_params['k'], 
-                                      model_params['sim_function'], 6, sparse)
+            fgp_elu_alpha = config.get('fgp_elu_alpha', 6)
+            graph_learner = FGP_learner(k=model_params['k'], knn_metric=model_params['sim_function'], i=fgp_elu_alpha,
+                                      sparse=sparse, initial_graph_data=initial_graph_data_loaded)
         
         # Load model weights
         model.load_state_dict(torch.load(os.path.join(input_dir, 'model.pt')))
         graph_learner.load_state_dict(torch.load(os.path.join(input_dir, 'graph_learner.pt')))
         
-        # Load adjacency matrix
-        adj = self._load_adjacency(input_dir, sparse)
-        
         # Move models to device
         model = model.to(self.device)
         graph_learner = graph_learner.to(self.device)
         
-        return model, graph_learner, features, adj, sparse
-        
+        # Return the loaded components, including the initial graph data used by the learner
+        return model, graph_learner, features, initial_graph_data_loaded, sparse
+
     def _load_adjacency(self, input_dir, sparse):
         """Helper method to load adjacency matrix"""
-        adj_data = torch.load(os.path.join(input_dir, 'adjacency.pt'))
+        adj_path = os.path.join(input_dir, 'adjacency.pt')
         
         if sparse:
-            if isinstance(adj_data, dict):
+            if isinstance(adj_path, dict):
                 # This is a saved DGL graph
-                edges = adj_data['edges']
-                weights = adj_data['weights']
-                num_nodes = adj_data['num_nodes']
+                edges = adj_path['edges']
+                weights = adj_path['weights']
+                num_nodes = adj_path['num_nodes']
                 
                 # Recreate DGL graph
                 adj = dgl.graph(edges, num_nodes=num_nodes, device=self.device)
                 adj.edata['w'] = weights
             else:
                 # This is a torch sparse tensor
-                adj = adj_data.to(self.device)
+                adj = torch.load(adj_path).to(self.device)
         else:
-            adj = adj_data.to(self.device)
+            adj = torch.load(adj_path).to(self.device)
             
         return adj
 
@@ -642,16 +651,31 @@ class Experiment:
         Args:
             args: Arguments for training
             load_data_fn: Function to load the dataset. Should return:
-                (features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj)
+                (features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, initial_graph)
         """
         if load_data_fn is None:
             raise ValueError("Must provide a data loading function")
             
-        if args.gsl_mode == 'structure_refinement':
-            features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj_original = load_data_fn(args)
-        elif args.gsl_mode == 'structure_inference':
-            features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, _ = load_data_fn(args)
+        # Load data - Expected return: features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, initial_graph_data
+        # Note: nclasses might be n_clusters from args in clustering mode
+        features, nfeats, labels, nclasses_or_clusters, train_mask, val_mask, test_mask, initial_graph_data = load_data_fn(args)
         
+        # Assign nclasses based on downstream task
+        if args.downstream_task == 'clustering':
+            nclasses = nclasses_or_clusters # Use n_clusters from args
+            if labels is not None and args.verbose:
+                print("Warning: Labels provided but downstream task is clustering. Labels will be used for evaluation only.")
+        elif labels is not None:
+            nclasses = nclasses_or_clusters # Use nclasses derived from data
+        else:
+            # Handle case where labels are None but task is classification (e.g., if using ArcFace with row indices)
+            # Or if ArcFace is used in clustering without true labels
+            nclasses = nclasses_or_clusters # Should be num_nodes if using row indices for ArcFace
+            if args.use_arcface and labels is None:
+                nclasses = features.shape[0] # ArcFace uses row indices
+            elif args.verbose:
+                print("Warning: No labels provided for classification task or nclasses couldn't be determined.")
+
         # Load annotated dataset if provided
         annotated_features = None
         binary_labels = None
@@ -703,16 +727,24 @@ class Experiment:
         for trial in range(args.ntrials):
             self.setup_seed(trial)
 
-            if args.gsl_mode == 'structure_inference':
-                if args.sparse:
-                    anchor_adj_raw = torch_sparse_eye(features.shape[0])
-                else:
-                    anchor_adj_raw = torch.eye(features.shape[0]).to(self.device)
-            elif args.gsl_mode == 'structure_refinement':
-                if args.sparse:
-                    anchor_adj_raw = adj_original
-                else:
-                    anchor_adj_raw = torch.from_numpy(adj_original).to(self.device)
+            # --- Initialize Anchor Adjacency --- 
+            # The initial_graph_data IS the raw anchor adjacency before normalization.
+            # It might be a KNN graph (from load_person_data) or an identity/original graph (from other loaders).
+            anchor_adj_raw = initial_graph_data
+            # Ensure it's on the correct device (load_data should handle this, but double-check)
+            if isinstance(anchor_adj_raw, torch.Tensor):
+                 anchor_adj_raw = anchor_adj_raw.to(self.device)
+            elif isinstance(anchor_adj_raw, dgl.DGLGraph):
+                 anchor_adj_raw = anchor_adj_raw.to(self.device)
+            else:
+                 # Handle potential sparse scipy matrix if loader didn't convert fully
+                 try:
+                      if args.sparse:
+                           anchor_adj_raw = sparse_mx_to_torch_sparse_tensor(anchor_adj_raw).to(self.device)
+                      else:
+                           anchor_adj_raw = torch.FloatTensor(anchor_adj_raw.todense()).to(self.device)
+                 except AttributeError:
+                      raise TypeError(f"Unsupported type for initial_graph_data: {type(anchor_adj_raw)}")
 
             anchor_adj = normalize(anchor_adj_raw, 'sym', args.sparse)
 
@@ -721,7 +753,9 @@ class Experiment:
                 anchor_adj = torch_sparse_to_dgl_graph(anchor_adj)
 
             if args.type_learner == 'fgp':
-                graph_learner = FGP_learner(features.cpu(), args.k, args.sim_function, 6, args.sparse)
+                # Pass pre-computed initial graph data to FGP learner
+                graph_learner = FGP_learner(k=args.k, knn_metric=args.sim_function, i=6, # Note: i=6 seems hardcoded, consider making it an arg
+                                          sparse=args.sparse, initial_graph_data=initial_graph_data)
             elif args.type_learner == 'mlp':
                 graph_learner = MLP_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                      args.activation_learner)
@@ -1141,6 +1175,9 @@ def create_parser():
                         help='Name of the binary target column in annotated dataset (values 0 or 1)')
     parser.add_argument('-annotation_loss_weight', type=float, default=1.0,
                         help='Weight for the binary classification loss')
+    # Add argument for dropping columns during KNN graph creation
+    parser.add_argument('-drop_columns_file', type=str, default=None,
+                        help='Path to CSV file containing a single column named "col" with names of features to exclude from initial KNN graph construction.')
     parser.add_argument('-ntrials', type=int, default=5)
     parser.add_argument('-sparse', type=int, default=0)
     parser.add_argument('-gsl_mode', type=str, default="structure_refinement",

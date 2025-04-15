@@ -71,58 +71,70 @@ from utils import *
 #             return adj
 
 class FGP_learner(nn.Module):
-    def __init__(self, features, k, knn_metric, i, sparse):
+    def __init__(self, k, knn_metric, i, sparse, initial_graph_data=None):
+        """
+        Initializes the FGP Learner.
+
+        Args:
+            k (int): Number of neighbors (informational, not used for computation here).
+            knn_metric (str): KNN metric used (informational).
+            i (int): Parameter for the ELU non-linearity exponent.
+            sparse (bool): Whether the graph is sparse.
+            initial_graph_data (Tensor or Tuple): The pre-computed graph structure.
+                - If sparse: Should be a tuple (indices, values, size).
+                - If dense: Should be a dense Tensor.
+                If None, an error will be raised as it's now mandatory.
+        """
         super(FGP_learner, self).__init__()
 
-        self.k = k
-        self.knn_metric = knn_metric
+        self.k = k # Keep for potential future use or info
+        self.knn_metric = knn_metric # Keep for info
         self.i = i
         self.sparse = sparse
 
-        
-        if self.sparse:
-            # Get indices, values and shape directly in sparse format
-            indices, values, size = nearest_neighbors_pre_elu_sparse(features, self.k, self.knn_metric, self.i)
-            indices = torch.from_numpy(indices)
-            values = torch.from_numpy(values).to(torch.float32)
-            # Create sparse tensor directly
-            sparse_adj = torch.sparse_coo_tensor(indices, values, size).coalesce()
-            self.Adj = nn.Parameter(sparse_adj)
-        else:
-            # Only convert to dense if needed
-            adj_dense = torch.from_numpy(nearest_neighbors_pre_elu(features, self.k, self.knn_metric, self.i))
-            self.Adj = nn.Parameter(adj_dense)
+        if initial_graph_data is None:
+            raise ValueError("FGP_learner now requires pre-computed 'initial_graph_data'.")
 
-    def forward(self, h, faiss_index=None):
+        if self.sparse:
+            # Expecting a sparse tensor (already created in load_data)
+            if not isinstance(initial_graph_data, torch.Tensor) or not initial_graph_data.is_sparse:
+                 raise TypeError("Expected a sparse torch Tensor for initial_graph_data in sparse mode.")
+            # Initialize Adj directly with the sparse tensor
+            # Ensure it's coalesced and requires gradients
+            self.Adj = nn.Parameter(initial_graph_data.coalesce().requires_grad_(True))
+        else:
+            # Expecting a dense tensor
+            if not isinstance(initial_graph_data, torch.Tensor) or initial_graph_data.is_sparse:
+                 raise TypeError("Expected a dense torch Tensor for initial_graph_data in dense mode.")
+            # Initialize Adj directly with the dense tensor
+            self.Adj = nn.Parameter(initial_graph_data.requires_grad_(True))
+
+    def forward(self, h=None, faiss_index=None): # h and faiss_index are no longer used
+        """Applies ELU activation to the stored graph parameter."""
         if not self.sparse:
-            # For dense mode
-            Adj = F.elu(self.Adj) + 1
+            # For dense mode: Apply activation to the dense tensor parameter
+            Adj = F.elu(self.Adj, alpha=self.i) + 1 # Use self.i for alpha
             return Adj
         else:
-            # For sparse mode - ensure the tensor is coalesced
-            Adj = self.Adj.coalesce()
-            
-            # Debug info
-            print("Is sparse tensor:", Adj.is_sparse)
-            print("Is coalesced:", Adj.is_coalesced())
-            
-            # Get indices and values
-            indices = Adj._indices()
-            values = Adj._values()
-            
-            # Apply ELU and add 1
-            new_values = F.elu(values) + 1
-            
-            # Create new sparse tensor with processed values
-            processed_adj = torch.sparse_coo_tensor(
-                indices, new_values, Adj.size(), device=Adj.device
+            # For sparse mode: Apply activation to the values of the sparse tensor parameter
+            # Clone to avoid in-place modification if Adj is used elsewhere
+            Adj_activated = self.Adj.clone()
+            new_values = F.elu(Adj_activated.values(), alpha=self.i) + 1 # Use self.i
+
+            # Create a *new* sparse tensor with the activated values
+            # This is crucial because modifying Adj_activated.values() in-place might not work correctly
+            # or might affect gradient calculation.
+            processed_adj_sparse = torch.sparse_coo_tensor(
+                 Adj_activated.indices(), new_values, Adj_activated.size(),
+                 device=Adj_activated.device, requires_grad=True
             )
-            
-            # For DGL graph creation
-            src, dst = indices[0], indices[1]
-            graph = dgl.graph((src, dst), num_nodes=Adj.size(0), device=Adj.device)
-            graph.edata['w'] = new_values
-            
+
+            # Convert the processed *sparse tensor* to a DGL graph for compatibility
+            # with downstream layers (like GCNConv_dgl)
+            src, dst = processed_adj_sparse.indices()
+            graph = dgl.graph((src, dst), num_nodes=processed_adj_sparse.size(0), device=processed_adj_sparse.device)
+            graph.edata['w'] = processed_adj_sparse.values()
+
             return graph
 
 
