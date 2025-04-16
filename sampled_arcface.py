@@ -107,7 +107,8 @@ class SampledArcFaceLayer(nn.Module):
         cosine = F.linear(embeddings_norm, weights_norm)
         
         # Apply ArcFace formula
-        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        # Clamp the input to sqrt to prevent negative values due to floating point inaccuracies
+        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=1e-6))
         
         # Compute phi (add angular margin)
         phi = cosine * self.cos_m - sine * self.sin_m
