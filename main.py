@@ -374,6 +374,8 @@ class Experiment:
             f.write(f'use_classification_head: True\n')
             if hasattr(model, 'classification_dropout') and hasattr(model.classification_dropout, 'p'):
                 f.write(f'classification_dropout: {model.classification_dropout.p}\n')
+            if hasattr(model, 'classification_head_layers'):
+                f.write(f'classification_head_layers: {model.classification_head_layers}\n')
 
         # Add 'i' parameter for FGP learner if applicable
         if isinstance(graph_learner, FGP_learner) and hasattr(graph_learner, 'i'):
@@ -396,7 +398,7 @@ class Experiment:
                 key, value = line.strip().split(': ')
                 if key in ['sparse', 'use_layer_norm', 'use_residual', 'use_arcface', 'use_sampled_arcface', 'use_classification_head']:
                     config[key] = value.lower() in ['true', '1', 't', 'y', 'yes']
-                elif key in ['feature_dim', 'num_nodes', 'nlayers', 'hidden_dim', 'emb_dim', 'proj_dim', 'k', 'num_classes', 'arcface_num_samples']:
+                elif key in ['feature_dim', 'num_nodes', 'nlayers', 'hidden_dim', 'emb_dim', 'proj_dim', 'k', 'num_classes', 'arcface_num_samples', 'classification_head_layers']:
                     config[key] = int(value)
                 elif key in ['dropout', 'dropout_adj', 'arcface_scale', 'arcface_margin', 'classification_dropout']:
                     config[key] = float(value)
@@ -442,6 +444,7 @@ class Experiment:
         if use_classification_head:
             classification_params['use_classification_head'] = True
             classification_params['classification_dropout'] = config.get('classification_dropout', 0.3)
+            classification_params['classification_head_layers'] = config.get('classification_head_layers', 2)
 
         # Add flags to model loading defaults if needed (assuming they weren't saved)
         use_layer_norm_load = config.get('use_layer_norm', False)
@@ -537,18 +540,20 @@ class Experiment:
         adj_path = os.path.join(input_dir, 'adjacency.pt')
         
         if sparse:
-            if isinstance(adj_path, dict):
+            # Load the saved data (could be dict for DGL or sparse tensor)
+            saved_data = torch.load(adj_path)
+            if isinstance(saved_data, dict):
                 # This is a saved DGL graph
-                edges = adj_path['edges']
-                weights = adj_path['weights']
-                num_nodes = adj_path['num_nodes']
+                edges = saved_data['edges']
+                weights = saved_data['weights']
+                num_nodes = saved_data['num_nodes']
                 
                 # Recreate DGL graph
                 adj = dgl.graph(edges, num_nodes=num_nodes, device=self.device)
-                adj.edata['w'] = weights
+                adj.edata['w'] = weights.to(self.device)
             else:
                 # This is a torch sparse tensor
-                adj = torch.load(adj_path).to(self.device)
+                adj = saved_data.to(self.device)
         else:
             adj = torch.load(adj_path).to(self.device)
             
@@ -769,40 +774,47 @@ class Experiment:
             # Determine if we should use classification head based on whether annotated_dataset was provided
             use_classification_head = annotated_features is not None and binary_labels is not None
 
+            # Shared GCL parameters
+            gcl_params = {
+                'nlayers': args.nlayers,
+                'in_dim': nfeats,
+                'hidden_dim': args.hidden_dim,
+                'emb_dim': args.rep_dim,
+                'proj_dim': args.proj_dim,
+                'dropout': args.dropout,
+                'dropout_adj': args.dropedge_rate,
+                'sparse': args.sparse,
+                'use_layer_norm': bool(args.use_layer_norm),
+                'use_residual': bool(args.use_residual),
+                'use_arcface': args.use_arcface,
+                'use_classification_head': use_classification_head
+            }
+
             if args.use_arcface:
-                # Add arguments for sampled arcface during initialization
-                model = GCL(nlayers=args.nlayers, in_dim=nfeats,
-                           hidden_dim=args.hidden_dim, emb_dim=args.rep_dim, proj_dim=args.proj_dim,
-                           dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
-                           use_layer_norm=bool(args.use_layer_norm),
-                           use_residual=bool(args.use_residual),
-                           use_arcface=True, num_classes=nclasses,
-                           arcface_scale=args.arcface_scale, arcface_margin=args.arcface_margin,
-                           # Pass sampled arcface args directly
-                           use_sampled_arcface=args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
-                           arcface_num_samples=args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None,
-                           # Pass classification head flag
-                           use_classification_head=use_classification_head)
-                
+                gcl_params.update({
+                    'num_classes': nclasses,
+                    'arcface_scale': args.arcface_scale,
+                    'arcface_margin': args.arcface_margin,
+                    'use_sampled_arcface': args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
+                    'arcface_num_samples': args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else None
+                })
                 if args.verbose:
-                    # Adjust verbose message if using sampled
-                    if hasattr(args, 'use_sampled_arcface') and args.use_sampled_arcface:
-                         print(f"Using Sampled ArcFace loss with {args.arcface_num_samples if hasattr(args, 'arcface_num_samples') else 'default'} samples, scale={args.arcface_scale}, margin={args.arcface_margin}")
-                    else:
-                         print(f"Using Standard ArcFace loss with {nclasses} classes, scale={args.arcface_scale}, margin={args.arcface_margin}")
-            else:
-                model = GCL(nlayers=args.nlayers, in_dim=nfeats, hidden_dim=args.hidden_dim,
-                          emb_dim=args.rep_dim, proj_dim=args.proj_dim,
-                          dropout=args.dropout, dropout_adj=args.dropedge_rate, sparse=args.sparse,
-                          use_layer_norm=bool(args.use_layer_norm),
-                          use_residual=bool(args.use_residual),
-                          # Pass classification head flag
-                          use_classification_head=use_classification_head)
+                    arcface_msg = "Using Sampled ArcFace" if gcl_params['use_sampled_arcface'] else "Using Standard ArcFace"
+                    print(f"{arcface_msg} loss with scale={args.arcface_scale}, margin={args.arcface_margin}")
+            
+            if use_classification_head:
+                 gcl_params.update({
+                      'classification_dropout': args.classification_dropout,
+                      'classification_head_layers': args.classification_head_layers
+                 })
+
+            # Initialize the model
+            model = GCL(**gcl_params)
 
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
             
-            # --- Checkpoint Setup ---
+            # --- Checkpoint Setup --- 
             os.makedirs(args.checkpoint_dir, exist_ok=True)
             start_epoch = 0
             last_checkpoint_path = None
@@ -814,7 +826,7 @@ class Experiment:
             # If checkpoint loaded an anchor_adj, use it (important for resuming bootstrapping)
             if loaded_anchor_adj is not None:
                 anchor_adj = loaded_anchor_adj
-            # --- End Checkpoint Setup ---
+            # --- End Checkpoint Setup --- 
 
             # Set up OneCycleLR scheduler if enabled
             if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
@@ -1175,6 +1187,11 @@ def create_parser():
                         help='Name of the binary target column in annotated dataset (values 0 or 1)')
     parser.add_argument('-annotation_loss_weight', type=float, default=1.0,
                         help='Weight for the binary classification loss')
+    # Add argument for classification head layers
+    parser.add_argument('-classification_head_layers', type=int, default=2,
+                        help='Number of layers in the MLP classification head (default: 2)')
+    parser.add_argument('-classification_dropout', type=float, default=0.3,
+                        help='Dropout rate for the classification head MLP (default: 0.3)')
     # Add argument for dropping columns during KNN graph creation
     parser.add_argument('-drop_columns_file', type=str, default=None,
                         help='Path to CSV file containing a single column named "col" with names of features to exclude from initial KNN graph construction.')

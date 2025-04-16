@@ -191,7 +191,8 @@ class GCL(nn.Module):
                  use_arcface=False, num_classes=None, arcface_scale=30.0, arcface_margin=0.5,
                  use_sampled_arcface=False, arcface_num_samples=None,
                  # Add classification head parameters
-                 use_classification_head=False, classification_dropout=0.3):
+                 use_classification_head=False, classification_dropout=0.3,
+                 classification_head_layers=2): # <-- Added new parameter
         super(GCL, self).__init__()
 
         # Pass the flags to the GraphEncoder
@@ -200,7 +201,9 @@ class GCL(nn.Module):
                                     use_layer_norm=use_layer_norm, use_residual=use_residual)
         self.use_arcface = use_arcface
         self.use_sampled_arcface = use_sampled_arcface
-        
+        self.use_classification_head = use_classification_head
+        self.classification_head_layers = classification_head_layers # Store the number of layers
+
         # Add ArcFace layer if specified
         if use_arcface and num_classes is not None:
             if use_sampled_arcface and arcface_num_samples is not None:
@@ -220,20 +223,39 @@ class GCL(nn.Module):
                 from layers import ArcFaceLayer
                 self.sampled_arcface = False
                 self.arcface = ArcFaceLayer(emb_dim, num_classes, scale=arcface_scale, margin=arcface_margin)
-                
-        # Add binary classification head if specified
-        self.use_classification_head = use_classification_head
+
+        # Add MLP classification head if specified
         if use_classification_head:
             self.classification_dropout = nn.Dropout(classification_dropout)
-            self.classification_head = nn.Linear(emb_dim, 1)  # Binary classification
-            print(f"Using classification head for binary classification")
+            
+            mlp_layers = []
+            if classification_head_layers == 1:
+                # Direct linear layer if only 1 layer requested
+                mlp_layers.append(nn.Linear(emb_dim, 1))
+            else:
+                # Input layer
+                mlp_layers.append(nn.Linear(emb_dim, hidden_dim))
+                mlp_layers.append(nn.ReLU())
+                mlp_layers.append(self.classification_dropout)
+                
+                # Hidden layers
+                for _ in range(classification_head_layers - 2):
+                    mlp_layers.append(nn.Linear(hidden_dim, hidden_dim))
+                    mlp_layers.append(nn.ReLU())
+                    mlp_layers.append(self.classification_dropout)
+                    
+                # Output layer
+                mlp_layers.append(nn.Linear(hidden_dim, 1))
+                
+            self.classification_head = nn.Sequential(*mlp_layers)
+            print(f"Using {classification_head_layers}-layer MLP classification head for binary classification")
 
     def forward(self, x, Adj_, branch=None, labels=None, include_features=False):
         z, embedding = self.encoder(x, Adj_, branch)
-        
+
         # Return values to collect
         outputs = [z, embedding]
-        
+
         # Include ArcFace outputs if using it with labels
         if self.use_arcface and hasattr(self, 'arcface') and labels is not None:
             if hasattr(self, 'sampled_arcface') and self.sampled_arcface:
@@ -243,16 +265,15 @@ class GCL(nn.Module):
             outputs.append(arcface_output)
         else:
             outputs.append(None)  # No ArcFace output
-            
+
         # Include classification head outputs if using it
         if self.use_classification_head:
-            # Apply dropout before classification
-            cls_embedding = self.classification_dropout(embedding)
-            cls_output = self.classification_head(cls_embedding)
+            # No dropout here, it's inside the MLP now
+            cls_output = self.classification_head(embedding)
             outputs.append(cls_output)
         else:
             outputs.append(None)  # No classification output
-        
+
         # Return only what's needed based on the calling context
         if include_features:
             return tuple(outputs)
