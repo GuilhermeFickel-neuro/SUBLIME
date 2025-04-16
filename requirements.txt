@@ -19,3 +19,4 @@ xgboost
 catboost
 lightgbm
 optuna
+boto3
