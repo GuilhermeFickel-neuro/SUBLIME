@@ -913,7 +913,9 @@ class Experiment:
             if grad_accumulation_steps > 1 and args.verbose:
                 print(f"Using gradient accumulation with {grad_accumulation_steps} steps")
                 
-            for epoch in tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs):
+            # Get tqdm iterator
+            epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
+            for epoch in epoch_iterator:
                 model.train()
                 graph_learner.train()
                 
@@ -1138,10 +1140,10 @@ class Experiment:
                     scheduler_cl.step()
                     scheduler_learner.step()
                     
-                    # Print current learning rates periodically
-                    if args.verbose and epoch % 10 == 0:
-                        print(f"Epoch {epoch} - LR model: {optimizer_cl.param_groups[0]['lr']:.6f}, "
-                              f"LR learner: {optimizer_learner.param_groups[0]['lr']:.6f}")
+                # Print current learning rates periodically using tqdm.write
+                if args.verbose and epoch % 10 == 0:
+                    tqdm.write(f"Epoch {epoch} - LR model: {optimizer_cl.param_groups[0]['lr']:.6f}, " 
+                               f"LR learner: {optimizer_learner.param_groups[0]['lr']:.6f}")
 
                 # Structure Bootstrapping
                 if (1 - args.tau) and (args.c == 0 or epoch % args.c == 0):
@@ -1153,26 +1155,27 @@ class Experiment:
                     else:
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
-                if args.verbose:
-                    try:
-                        loss_msg = "Epoch {:05d} | Total Loss {:.4f}".format(epoch, loss.item())
-
-                        # Add individual loss components if they exist in the dictionary
-                        if 'contrastive' in print_loss_components:
-                             loss_msg += f" | Contrastive {print_loss_components['contrastive']:.4f}"
-                        if args.use_arcface and 'arcface_sampled' in print_loss_components:
-                             loss_msg += f" | ArcFace Sampled {print_loss_components['arcface_sampled']:.4f}"
-                        if use_classification_head and 'classification' in print_loss_components:
-                             loss_msg += f" | Cls Loss {print_loss_components['classification']:.4f}"
-                             # Keep classification accuracy as well
-                             loss_msg += " | Cls Acc {:.4f}".format(current_cls_accuracy.item())
-                             cls_accuracies.append(current_cls_accuracy.item()) # Still track accuracy
-
-                        loss_msg += " | " + args.downstream_task # Keep downstream task info
-                        print(loss_msg)
-                    except Exception as e: # Catch potential errors during logging
-                        print(f"Epoch {epoch:05d} | Error during logging: {e}")
-                        print(f"Raw loss value: {loss.item() if isinstance(loss, torch.Tensor) else loss}")
+                # --- Update tqdm postfix --- 
+                postfix_dict = {'Loss': f"{loss.item():.4f}"}
+                if use_classification_head:
+                    postfix_dict['ClsAcc'] = f"{current_cls_accuracy.item():.4f}"
+                    # Keep tracking accuracy for periodic average
+                    cls_accuracies.append(current_cls_accuracy.item())
+                
+                # Add individual loss components to postfix if available (only from standard path)
+                # Note: These might show values from the previous epoch if using grad accum.
+                # This is a compromise for simplicity. For exact per-step values, 
+                # the logic inside the accumulation loop would need more complex tracking.
+                if 'print_loss_components' in locals(): # Check if dict exists (standard path)
+                    if 'contrastive' in print_loss_components:
+                         postfix_dict['Contra'] = f"{print_loss_components['contrastive']:.4f}"
+                    if args.use_arcface and 'arcface_sampled' in print_loss_components:
+                         postfix_dict['ArcF'] = f"{print_loss_components['arcface_sampled']:.4f}"
+                    if use_classification_head and 'classification' in print_loss_components:
+                         postfix_dict['ClsLoss'] = f"{print_loss_components['classification']:.4f}"
+                
+                epoch_iterator.set_postfix(postfix_dict)
+                # --- End tqdm postfix update ---
 
                 # Periodic Checkpointing
                 if epoch > 0 and epoch % args.checkpoint_freq == 0:
@@ -1185,7 +1188,8 @@ class Experiment:
                     if use_classification_head and len(cls_accuracies) > 0:
                         avg_cls_acc = sum(cls_accuracies) / len(cls_accuracies)
                         if args.verbose:
-                            print(f"Average classification accuracy over last {len(cls_accuracies)} epochs: {avg_cls_acc:.4f}")
+                            # Use tqdm.write for this message
+                            tqdm.write(f"Checkpoint @ Epoch {epoch}: Avg classification accuracy over last {len(cls_accuracies)} epochs: {avg_cls_acc:.4f}") 
                         cls_accuracies = []  # Reset for next period
 
                 if epoch % args.eval_freq == 0:
