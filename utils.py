@@ -24,19 +24,19 @@ def get_memory_usage():
 # New function to build and return a FAISS index
 def build_faiss_index(features, k=10, use_gpu=False, nprobe=None):
     """
-    Build and return a FAISS index for the given features.
+    Build and return a FAISS index (now using IndexFlatIP) for the given features.
     This can be reused to avoid rebuilding the index on each call.
     
     Args:
         features (torch.Tensor): Input features (num_nodes x num_features).
-        k (int): Number of neighbors to find for each node (used to tune index).
+        k (int): Number of neighbors (no longer used for index tuning with IndexFlat).
         use_gpu (bool): If True, attempt to use GPU for FAISS operations.
-        nprobe (int, optional): Number of clusters to visit (higher improves recall).
+        nprobe (int, optional): Ignored for IndexFlat.
                                
     Returns:
-        faiss.Index: A trained FAISS index containing the features
+        faiss.Index: An FAISS index containing the features (IndexFlatIP or GpuIndexFlatIP).
     """
-    print("Building reusable FAISS index...")
+    print("Building reusable FAISS index (using IndexFlatIP)...")
     t_start = time.time()
     
     # Get device and dimensions
@@ -45,7 +45,7 @@ def build_faiss_index(features, k=10, use_gpu=False, nprobe=None):
     t0 = time.time()
     print(f"  [build_index] Input shape: {n}x{d} on {device}. Time: {t0-t_start:.4f}s")
     
-    # Normalize features for cosine similarity
+    # Normalize features for cosine similarity (since we use IndexFlatIP)
     X_normalized = F.normalize(features, dim=1, p=2)
     t1 = time.time()
     print(f"  [build_index] Normalization time: {t1-t0:.4f}s")
@@ -56,63 +56,35 @@ def build_faiss_index(features, k=10, use_gpu=False, nprobe=None):
     t2 = time.time()
     print(f"  [build_index] Data transfer & conversion time: {t2-t1:.4f}s")
     
-    # Calculate appropriate values for nlist (num of clusters) and M (num of subquantizers)
-    def get_valid_pq_m(d, max_m=16):
-        divisors = [i for i in range(1, min(max_m+1, d+1)) if d % i == 0]
-        return max(divisors) if divisors else 1
-    
-    if n < 10000:
-        nlist = min(int(np.sqrt(n)), n // 20)
-        nbits = 6
-    else:
-        nlist = min(4 * int(np.sqrt(n)), n // 10)
-        nbits = 8
-    
-    M = get_valid_pq_m(d)
-    t3 = time.time()
-    print(f"  [build_index] Parameter calculation time: {t3-t2:.4f}s")
-    print(f"  [build_index] Calculated params: nlist={nlist}, M={M}, nbits={nbits}")
-    
-    # Set nprobe
-    actual_nprobe = nprobe
-    if actual_nprobe is None:
-        actual_nprobe = min(nlist // 2, 100)
-    print(f"  [build_index] Using nprobe={actual_nprobe}")
+    # --- IndexFlat does not require training or complex parameter calculation --- 
+    # Removed nlist, M, nbits calculation
+    # Removed nprobe setting logic
     
     # Build the index
     actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
-    index_type = "IndexIVFPQ"
+    index_type = "IndexFlatIP"
     faiss_device_info = "CPU"
-    index = None
+    index = None # Initialize index
 
     if actual_use_gpu:
         try:
             faiss_device_info = "GPU"
             print(f"  [build_index] Building FAISS index on GPU with {index_type}")
             t_gpu_start = time.time()
-            res = faiss.StandardGpuResources()
+            res = faiss.StandardGpuResources() # Resources needed for index_cpu_to_gpu
             t_res = time.time()
             print(f"    [GPU Build] StandardGpuResources init time: {t_res-t_gpu_start:.4f}s")
             
             # Create CPU index first
-            cpu_quantizer = faiss.IndexFlatIP(d)
-            cpu_index = faiss.IndexIVFPQ(cpu_quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
+            cpu_index = faiss.IndexFlatIP(d) 
             t_cpu_idx = time.time()
             print(f"    [GPU Build] CPU index ({type(cpu_index).__name__}) creation time: {t_cpu_idx-t_res:.4f}s")
             
-            # Train on CPU
-            print(f"    [GPU Build] Training CPU index...")
-            cpu_index.train(X_np)
-            t_train = time.time()
-            print(f"    [GPU Build] CPU index training time: {t_train-t_cpu_idx:.4f}s")
-            
-            # Move index to GPU after training
+            # Move index to GPU 
+            # Note: GpuIndexFlatIP exists, but index_cpu_to_gpu is often more convenient
             gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
             t_gpu_conv = time.time()
-            print(f"    [GPU Build] Index CPU->GPU conversion time: {t_gpu_conv-t_train:.4f}s")
-            
-            # Set search parameters
-            gpu_index.nprobe = actual_nprobe
+            print(f"    [GPU Build] Index CPU->GPU conversion time: {t_gpu_conv-t_cpu_idx:.4f}s")
             
             # Add data to the index
             print(f"    [GPU Build] Adding data to GPU index...")
@@ -125,33 +97,23 @@ def build_faiss_index(features, k=10, use_gpu=False, nprobe=None):
         except Exception as e:
             print(f"FAISS GPU execution failed ({index_type}): {e}. Falling back to CPU.")
             actual_use_gpu = False
-            index = None
+            index = None # Reset index if GPU failed
 
     if not actual_use_gpu:
         faiss_device_info = "CPU"
         print(f"  [build_index] Building FAISS index on CPU with {index_type}")
         t_cpu_build_start = time.time()
         
-        # Create quantizer and IVFPQ index
-        quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
+        # Create IndexFlatIP directly
+        index = faiss.IndexFlatIP(d)
         t_idx_create = time.time()
         print(f"    [CPU Build] Index ({type(index).__name__}) creation time: {t_idx_create-t_cpu_build_start:.4f}s")
-        
-        # Train the index
-        print(f"    [CPU Build] Training CPU index...")
-        index.train(X_np)
-        t_train = time.time()
-        print(f"    [CPU Build] CPU index training time: {t_train-t_idx_create:.4f}s")
-        
-        # Set search parameters
-        index.nprobe = actual_nprobe
         
         # Add vectors to the index
         print(f"    [CPU Build] Adding data to CPU index...")
         index.add(X_np)
         t_add = time.time()
-        print(f"    [CPU Build] CPU index add time: {t_add-t_train:.4f}s")
+        print(f"    [CPU Build] CPU index add time: {t_add-t_idx_create:.4f}s")
         print(f"  [build_index] Total CPU build time: {t_add - t_cpu_build_start:.4f}s")
 
     if index is None:
@@ -391,17 +353,16 @@ def top_k(raw_graph, K):
 
 def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
     """
-    Optimized KNN implementation using FAISS with IndexIVFPQ.
+    Optimized KNN implementation using FAISS (now defaults to IndexFlatIP if building internally).
     Includes detailed timing prints and option to reuse a pre-built index.
 
     Args:
         X (torch.Tensor): Input features (num_nodes x num_features).
         k (int): Number of neighbors to find for each node.
         b (int): Batch size parameter (kept for backward compatibility, not used).
-        use_gpu (bool): If True, attempt to use GPU for FAISS operations. Defaults to False.
-        nprobe (int, optional): Number of clusters to visit (higher improves recall).
-                               If None, a suitable value is selected automatically.
-        faiss_index (faiss.Index, optional): A pre-built and trained FAISS index.
+        use_gpu (bool): If True, attempt to use GPU for FAISS operations when building internally. Defaults to False.
+        nprobe (int, optional): Ignored (relevant for IVF indices, not IndexFlat).
+        faiss_index (faiss.Index, optional): A pre-built and trained FAISS index (can be any type).
 
     Returns:
         tuple: (rows, cols, values) representing the graph in COO format
@@ -411,11 +372,11 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
     device = X.device
     n, d = X.shape
     print(f"\n--- knn_fast Start ---")
-    print(f"  Input: {n}x{d} features on {device}, k={k}, use_gpu={use_gpu}, nprobe={nprobe}, index_provided={faiss_index is not None}")
+    print(f"  Input: {n}x{d} features on {device}, k={k}, use_gpu_build={use_gpu}, index_provided={faiss_index is not None}") # Clarified use_gpu context
 
     # --- Preprocessing ---
     t0 = time.time()
-    X_normalized = F.normalize(X, dim=1, p=2)
+    X_normalized = F.normalize(X, dim=1, p=2) # Still normalize query for IP search
     t1 = time.time()
     print(f"  [knn_fast] Step 1: F.normalize time: {t1-t0:.4f}s")
     X_np = X_normalized.cpu().detach().numpy().astype('float32')
@@ -429,95 +390,71 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
     internal_index = None # Define here to ensure scope if building
 
     if faiss_index is None:
-        # --- Build and Train Index if not provided ---
-        print("  [knn_fast] Step 3a: Building internal FAISS index...")
+        # --- Build IndexFlatIP if not provided ---
+        print("  [knn_fast] Step 3a: Building internal FAISS index (using IndexFlatIP)...")
         index_built_or_trained = True
         t_build_start = time.time()
+        
+        # Removed IVFPQ parameter calculations and train step
 
-        def get_valid_pq_m(d, max_m=16): # Inner func ok
-            divisors = [i for i in range(1, min(max_m+1, d+1)) if d % i == 0]
-            return max(divisors) if divisors else 1
-
-        if n < 10000: nlist = min(int(np.sqrt(n)), n // 20); nbits = 6
-        else: nlist = min(4 * int(np.sqrt(n)), n // 10); nbits = 8
-        M = get_valid_pq_m(d)
-        actual_nprobe = nprobe if nprobe is not None else min(nlist // 2, 100)
-        print(f"    Index Params: nlist={nlist}, M={M}, nbits={nbits}, nprobe={actual_nprobe}")
-
-        actual_use_gpu = use_gpu and faiss.get_num_gpus() > 0
+        actual_use_gpu_build = use_gpu and faiss.get_num_gpus() > 0 # Renamed var for clarity
         faiss_device_info = "CPU"
         # internal_index already defined
 
-        if actual_use_gpu:
+        if actual_use_gpu_build:
             try:
                 faiss_device_info = "GPU"
                 t_gpu_build_i_start = time.time()
                 res = faiss.StandardGpuResources()
-                cpu_quantizer = faiss.IndexFlatIP(d)
-                cpu_index = faiss.IndexIVFPQ(cpu_quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT)
+                # Create CPU IndexFlatIP first
+                cpu_index = faiss.IndexFlatIP(d)
                 t_gpu_init_done = time.time()
-                print(f"      GPU: Resource/Index init time: {t_gpu_init_done - t_gpu_build_i_start:.4f}s")
-                cpu_index.train(X_np)
-                t_gpu_train_done = time.time()
-                print(f"      GPU: CPU training time: {t_gpu_train_done - t_gpu_init_done:.4f}s")
-                gpu_index_internal = faiss.index_cpu_to_gpu(res, 0, cpu_index) # Rename var
+                print(f"      GPU: Resource/CPU Index init time: {t_gpu_init_done - t_gpu_build_i_start:.4f}s")
+                # Convert to GPU
+                gpu_index_internal = faiss.index_cpu_to_gpu(res, 0, cpu_index)
                 t_gpu_conv_done = time.time()
-                print(f"      GPU: CPU->GPU conversion time: {t_gpu_conv_done - t_gpu_train_done:.4f}s")
-                gpu_index_internal.nprobe = actual_nprobe
+                print(f"      GPU: CPU->GPU conversion time: {t_gpu_conv_done - t_gpu_init_done:.4f}s")
+                # Add data (X_np contains the normalized features of the input X for *this* call)
+                # IMPORTANT: This builds an index containing ONLY the current batch X,
+                # which is likely NOT the intended use case if calling repeatedly.
+                # This internal build path assumes X represents the entire dataset to index.
                 gpu_index_internal.add(X_np)
                 t_gpu_add_done = time.time()
                 print(f"      GPU: Add data time: {t_gpu_add_done - t_gpu_conv_done:.4f}s")
-                internal_index = gpu_index_internal # Assign to local var
+                internal_index = gpu_index_internal
                 index_total_build_time = t_gpu_add_done - t_gpu_build_i_start
             except Exception as e:
                 print(f"    FAISS GPU build failed: {e}. Falling back to CPU.")
-                actual_use_gpu = False
+                actual_use_gpu_build = False
                 internal_index = None # Reset
 
-        if not actual_use_gpu: # This block will execute if GPU failed or was not requested
+        if not actual_use_gpu_build:
             faiss_device_info = "CPU"
             t_cpu_build_i_start = time.time()
-            quantizer = faiss.IndexFlatIP(d)
-            index_cpu_internal = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT) # Rename var
+            # Create CPU IndexFlatIP
+            index_cpu_internal = faiss.IndexFlatIP(d)
             t_cpu_init_done = time.time()
             print(f"      CPU: Index init time: {t_cpu_init_done - t_cpu_build_i_start:.4f}s")
-            index_cpu_internal.train(X_np)
-            t_cpu_train_done = time.time()
-            print(f"      CPU: Training time: {t_cpu_train_done - t_cpu_init_done:.4f}s")
-            index_cpu_internal.nprobe = actual_nprobe
+            # Add data (see IMPORTANT note above)
             index_cpu_internal.add(X_np)
             t_cpu_add_done = time.time()
-            print(f"      CPU: Add data time: {t_cpu_add_done - t_cpu_train_done:.4f}s")
-            internal_index = index_cpu_internal # Assign to local var
+            print(f"      CPU: Add data time: {t_cpu_add_done - t_cpu_init_done:.4f}s")
+            internal_index = index_cpu_internal
             index_total_build_time = t_cpu_add_done - t_cpu_build_i_start
 
         faiss_index = internal_index # Assign the newly built index to the main variable
-        if faiss_index is None: # Check if index build failed completely
+        if faiss_index is None:
              raise RuntimeError("Failed to build internal FAISS index on both CPU and GPU.")
-        print(f"  [knn_fast] Step 3a: Index built internally on {faiss_device_info}. Total build/train/add time: {index_total_build_time:.4f}s")
+        print(f"  [knn_fast] Step 3a: Index built internally on {faiss_device_info}. Total build/add time: {index_total_build_time:.4f}s")
         # ------------------------------------
     else:
-        # --- Use Provided Index ---
+        # --- Use Provided Index --- 
         print("  [knn_fast] Step 3b: Using pre-built FAISS index.")
         t_prebuilt_start = time.time()
-        actual_nprobe = nprobe # Use provided nprobe if any
-        if actual_nprobe is None:
-             if hasattr(faiss_index, 'nprobe') and faiss_index.nprobe > 0: # Check if nprobe is already set
-                 actual_nprobe = faiss_index.nprobe
-             else: # Estimate or default if not set
-                 if isinstance(faiss_index, faiss.IndexIVFPQ):
-                     nlist = faiss_index.nlist
-                     # Ensure nlist is positive before division
-                     actual_nprobe = min(nlist // 2, 100) if nlist > 0 else 10
-                 else: actual_nprobe = 10
-        # Ensure nprobe is set on the index for this search
-        if hasattr(faiss_index, 'nprobe'):
-            # print(f"    Setting nprobe={actual_nprobe} on provided index.")
-            faiss_index.nprobe = actual_nprobe
-        # else:
-            # print(f"    Warning: Cannot set nprobe on provided index type {type(faiss_index).__name__}.")
-
+        # nprobe is irrelevant for IndexFlat, no need to set/check
+        
         # Determine device info for provided index - FIXED LOGIC
+        # ... (logic for determining faiss_device_info remains the same as previous edit) ...
         faiss_device_info = "Unknown"
         # Use isinstance to check if it's a GPU index object directly
         try:
@@ -541,7 +478,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
              else:
                   faiss_device_info = f"Unknown Type ({type(faiss_index).__name__})"
 
-        print(f"    Index type: {type(faiss_index).__name__} on {faiss_device_info}, using nprobe={actual_nprobe}.")
+        print(f"    Index type: {type(faiss_index).__name__} on {faiss_device_info}") # Removed nprobe print
         t_prebuilt_end = time.time()
         print(f"  [knn_fast] Step 3b: Setup time for pre-built index: {t_prebuilt_end - t_prebuilt_start:.4f}s")
         # --------------------------
@@ -549,7 +486,8 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
     if faiss_index is None:
         raise RuntimeError("FAISS index is None after build/setup phase.")
 
-    # --- Search ---
+    # --- Search --- 
+    # ... (Search and Post-processing logic remains the same as previous version) ...
     t_search_start = time.time()
     # print(f"  [knn_fast] Step 4: Searching neighbors using {faiss_device_info} index...")
     # Search using X_np (features from *this* function call)
