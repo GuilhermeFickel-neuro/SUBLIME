@@ -1086,30 +1086,7 @@ class Experiment:
                             best_epoch = epoch
 
                     elif args.downstream_task == 'clustering' and labels is not None:
-                        model.eval()
-                        graph_learner.eval()
-                        # _, embedding = model(features, Adj) # Original line causing error
-                        # Unpack all potential return values, keep only embedding
-                        z, embedding, _, _ = model(features, Adj)
-
-                        embedding = embedding.cpu().detach().numpy()
-                        acc_mr, nmi_mr, f1_mr, ari_mr = [], [], [], []
-                        for clu_trial in range(n_clu_trials):
-                            kmeans = KMeans(n_clusters=nclasses, random_state=clu_trial).fit(embedding)
-                            predict_labels = kmeans.predict(embedding)
-                            cm_all = clustering_metrics(labels.cpu().numpy(), predict_labels)
-                            acc_, nmi_, f1_, ari_ = cm_all.evaluationClusterModelFromLabel(print_results=False)
-                            acc_mr.append(acc_)
-                            nmi_mr.append(nmi_)
-                            f1_mr.append(f1_)
-                            ari_mr.append(ari_)
-                        
-                        acc, nmi, f1, ari = np.mean(acc_mr), np.mean(nmi_mr), np.mean(f1_mr), np.mean(ari_mr)
-                        if args.verbose:
-                            print("Final ACC: ", acc)
-                            print("Final NMI: ", nmi)
-                            print("Final F-score: ", f1)
-                            print("Final ARI: ", ari)
+                        pass
 
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val)
