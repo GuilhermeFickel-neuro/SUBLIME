@@ -10,334 +10,332 @@ from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from main import Experiment
-from utils import sparse_mx_to_torch_sparse_tensor, faiss_kneighbors_graph
+from utils import sparse_mx_to_torch_sparse_tensor, faiss_kneighbors_graph, get_memory_usage
 from main import create_parser # Import the shared parser creation function
 
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def preprocess_mixed_data(df, model_dir='sublime_models', load_transformer=True):
+def _check_processed_data(data, dataset_name=""):
+    """Internal helper to check processed data for issues."""
+    print(f"\n--- Post-processing Checks ({dataset_name}) ---")
+    if not isinstance(data, np.ndarray):
+        print(f"Error ({dataset_name}): Processed data is not a numpy array (type: {type(data)}).")
+        return False, data # Return False indicating failure
+
+    try:
+        data = data.astype(np.float32) # Ensure float32
+    except ValueError as e:
+        print(f"Error ({dataset_name}): Could not convert processed data to float32: {e}")
+        return False, data # Return False indicating failure
+
+    if np.isnan(data).any() or np.isinf(data).any():
+        print(f"Warning ({dataset_name}): NaN or Infinite values found!")
+        nan_cols = np.where(np.isnan(data).any(axis=0))[0]
+        inf_cols = np.where(np.isinf(data).any(axis=0))[0]
+        print(f"  Indices of columns with NaN: {nan_cols}")
+        print(f"  Indices of columns with Inf: {inf_cols}")
+        # Option to impute: data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        # return False, data # Indicate potential issue even if imputed
+    else:
+        print(f"OK ({dataset_name}): No NaN or Infinite values found.")
+
+    try:
+        variances = np.var(data, axis=0)
+        low_variance_threshold = 1e-6
+        low_variance_indices = np.where(variances < low_variance_threshold)[0]
+        if len(low_variance_indices) > 0:
+            print(f"Warning ({dataset_name}): {len(low_variance_indices)} columns have variance < {low_variance_threshold}.")
+            print(f"  Indices of low-variance columns: {low_variance_indices}")
+        else:
+            print(f"OK ({dataset_name}): All columns have variance >= {low_variance_threshold}.")
+    except Exception as e:
+        print(f"Error ({dataset_name}) during variance check: {e}")
+        return False, data # Return False indicating failure
+
+    return True, data # Return True indicating success
+
+def preprocess_mixed_data(df_main, df_annotated=None, model_dir='sublime_models', target_column=None):
     """
-    Preprocess a dataframe with mixed data types (categorical, numerical, missing values)
-    
+    Preprocess main and optional annotated dataframes using a single transformer.
+    Transformer is fitted ONLY on df_main if not loaded.
+
     Args:
-        df: Pandas DataFrame with raw data
-        model_dir: Directory to save/load transformation models
-        load_transformer: Whether to load existing transformer or create a new one
-    
+        df_main: Main Pandas DataFrame.
+        df_annotated: Optional annotated Pandas DataFrame.
+        model_dir: Directory to save/load transformation models.
+        target_column: Name of the target column in df_annotated (if provided).
+
     Returns:
-        Tuple: (processed_data (np.ndarray), preprocessor (ColumnTransformer))
+        Tuple: (
+            processed_main (np.ndarray),
+            processed_annotated (np.ndarray or None),
+            preprocessor (ColumnTransformer)
+        )
+        Raises ValueError if preprocessing fails critical checks.
     """
     # Create model directory if it doesn't exist
     os.makedirs(model_dir, exist_ok=True)
     transformer_path = os.path.join(model_dir, 'data_transformer.joblib')
-    
-    # Separate numerical and categorical columns
-    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-    numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    
-    if load_transformer and joblib and os.path.exists(transformer_path):
-        # Load pre-fitted transformer
-        print(f"Loading transformer from {transformer_path}")
-        preprocessor = joblib.load(transformer_path)
-    else:
-        # Create preprocessing pipelines
-        numerical_pipeline = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),  # Handle missing values
-            ('scaler', MinMaxScaler(feature_range=(-1, 1)))  # Normalize to [-1, 1]
-        ])
-        
-        categorical_pipeline = Pipeline([
-            ('imputer', SimpleImputer(strategy='most_frequent')),  # Handle missing values
-            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))  # One-hot encode
-        ])
-        
-        # Combine pipelines into a single transformer
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('num', numerical_pipeline, numerical_cols),
-                ('cat', categorical_pipeline, categorical_cols)
-            ],
-            remainder='passthrough' # Keep other columns if any, though usually we define all
-        )
-        
-        # Fit the transformer
-        print(f"Fitting new transformer...")
-        preprocessor.fit(df)
-        
-        # Save the transformer if joblib is available
-        if joblib:
-            print(f"Saving transformer to {transformer_path}")
-            joblib.dump(preprocessor, transformer_path)
+    preprocessor = None
+
+    # Separate numerical and categorical columns from the *main* dataframe
+    # Assume the annotated dataframe has the same relevant columns for transformation
+    categorical_cols = df_main.select_dtypes(include=['object', 'category']).columns.tolist()
+    numerical_cols = df_main.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+    # Target column should not be part of numerical/categorical cols used for fitting
+    if target_column:
+        if target_column in categorical_cols:
+            categorical_cols.remove(target_column)
+        if target_column in numerical_cols:
+            numerical_cols.remove(target_column)
+
+    processed_main = None
+    processed_annotated = None
+
+    try:
+        # --- Load or Fit Transformer ---
+        if joblib and os.path.exists(transformer_path):
+            print(f"Loading transformer from {transformer_path}")
+            preprocessor = joblib.load(transformer_path)
         else:
-            print("joblib not installed. Cannot save transformer.")
-    
-    # Transform the data
-    processed_data = preprocessor.transform(df)
-    
-    # Print data statistics
-    print("\nData Transformation Summary:")
-    print(f"Original shape: {df.shape}")
-    print(f"Processed shape: {processed_data.shape}")
-    # Get feature names after transformation to count properly
-    try:
-        out_features = preprocessor.get_feature_names_out()
-        print(f"Features retained/created: {len(out_features)}")
-    except Exception: # Handle cases where get_feature_names_out might fail
-        print(f"Could not retrieve feature names from transformer.")
+            print("Transformer not found. Fitting new transformer ON MAIN DATA...")
+            # Create preprocessing pipelines
+            numerical_pipeline = Pipeline([
+                ('imputer', SimpleImputer(strategy='median')),
+                ('scaler', MinMaxScaler(feature_range=(-1, 1)))
+            ])
+            categorical_pipeline = Pipeline([
+                ('imputer', SimpleImputer(strategy='most_frequent')),
+                ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+            ])
+            # Combine pipelines
+            preprocessor = ColumnTransformer(
+                transformers=[
+                    ('num', numerical_pipeline, numerical_cols),
+                    ('cat', categorical_pipeline, categorical_cols)
+                ],
+                remainder='drop' # Drop columns not specified (like target column if present)
+            )
+            # Fit ONLY on main data
+            preprocessor.fit(df_main)
+            print("Transformer fitted.")
+            # Save the transformer
+            if joblib:
+                print(f"Saving transformer to {transformer_path}")
+                joblib.dump(preprocessor, transformer_path)
+            else:
+                print("joblib not installed. Cannot save transformer.")
 
-    # Check if processed_data is numpy array, if not, convert
-    if not isinstance(processed_data, np.ndarray):
-        try:
-            # Handle sparse matrix output from ColumnTransformer if necessary
-            if sp.issparse(processed_data):
-                 processed_data = processed_data.toarray()
-            else: # Convert potential list of lists or other formats
-                 processed_data = np.array(processed_data)
-        except Exception as e:
-             print(f"Error converting processed data to numpy array: {e}")
-             raise TypeError("Processed data could not be converted to a dense numpy array.")
+        # --- Transform Main Data ---
+        print("Transforming main data...")
+        processed_main = preprocessor.transform(df_main)
+        print(f"Original main shape: {df_main.shape}")
+        print(f"Processed main shape: {processed_main.shape}")
+        ok, processed_main = _check_processed_data(processed_main, "Main Data")
+        if not ok:
+            raise ValueError("Preprocessing check failed for main data.")
 
-    # Ensure data is float type for calculations
-    try:
-        processed_data = processed_data.astype(np.float32)
-    except ValueError as e:
-        print(f"Error converting processed data to float32: {e}. Check data types.")
-        # Attempt to identify problematic columns if possible
-        for col_idx in range(processed_data.shape[1]):
-            try:
-                processed_data[:, col_idx].astype(np.float32)
-            except ValueError:
-                print(f"  Column index {col_idx} likely contains non-numeric data.")
-        raise
+        # --- Transform Annotated Data (if provided) ---
+        if df_annotated is not None:
+            print("Transforming annotated data...")
+            processed_annotated = preprocessor.transform(df_annotated)
+            print(f"Original annotated shape: {df_annotated.shape}")
+            print(f"Processed annotated shape: {processed_annotated.shape}")
+            ok, processed_annotated = _check_processed_data(processed_annotated, "Annotated Data")
+            if not ok:
+                raise ValueError("Preprocessing check failed for annotated data.")
 
-    print(f"Data range: [{np.min(processed_data):.4f}, {np.max(processed_data):.4f}]")
-    print(f"Mean value: {np.mean(processed_data):.4f}, Std: {np.std(processed_data):.4f}")
+            # Check if feature dimensions match
+            if processed_main.shape[1] != processed_annotated.shape[1]:
+                 raise ValueError(f"Feature dimension mismatch after processing: "
+                                  f"Main data has {processed_main.shape[1]} features, "
+                                  f"Annotated data has {processed_annotated.shape[1]} features. "
+                                  "Ensure both datasets have compatible columns and the transformer is applied correctly.")
 
-    # --- Post-processing Checks ---
-    print("\n--- Post-processing Checks ---")
-    if np.isnan(processed_data).any() or np.isinf(processed_data).any():
-        print("Warning: NaN or Infinite values found in processed data!")
-        nan_cols = np.where(np.isnan(processed_data).any(axis=0))[0]
-        inf_cols = np.where(np.isinf(processed_data).any(axis=0))[0]
-        print(f"  Indices of columns with NaN: {nan_cols}")
-        print(f"  Indices of columns with Inf: {inf_cols}")
-        # Consider adding imputation here if necessary, e.g., replacing NaN/Inf with 0 or mean/median
-        # processed_data = np.nan_to_num(processed_data, nan=0.0, posinf=0.0, neginf=0.0)
-        # print("  NaN/Inf values replaced with 0.")
-    else:
-        print("OK: No NaN or Infinite values found.")
-
-    try:
-        variances = np.var(processed_data, axis=0)
-        low_variance_threshold = 1e-6
-        low_variance_indices = np.where(variances < low_variance_threshold)[0]
-
-        if len(low_variance_indices) > 0:
-            print(f"Warning: {len(low_variance_indices)} columns in the processed data have variance < {low_variance_threshold}.")
-            print(f"  Indices of low-variance columns: {low_variance_indices}")
-        else:
-            print(f"OK: All processed columns have variance >= {low_variance_threshold}.")
     except Exception as e:
-        print(f"Error during variance check: {e}")
-    # --- End of Added Post-processing Checks ---
+        print(f"Error during preprocessing: {e}")
+        raise # Re-raise the exception after logging
 
-    # Return both processed data and the fitted transformer
-    return processed_data, preprocessor
+    return processed_main, processed_annotated, preprocessor
+
 
 def load_person_data(args):
     """
-    Load person data, preprocess, calculate initial KNN graph potentially excluding
-    some features, and return data for SUBLIME training.
+    Loads main and annotated person data, preprocesses them using a single
+    transformer (fitted on main data if needed), combines them, calculates
+    a combined initial KNN graph, and returns data for SUBLIME training.
 
     Args:
-        args: Arguments containing dataset path, k, sparse flag, drop_columns_file, etc.
+        args: Arguments containing dataset paths, k, sparse flag, etc.
 
     Returns:
         Tuple: (
-            features: Full preprocessed features (Tensor).
+            features: Combined preprocessed features (Tensor).
             nfeats: Number of features.
-            labels: Labels from annotation_column (Tensor/None).
-            nclasses_or_clusters: Number of classes or target clusters.
+            combined_labels: Combined labels (Tensor, -1 for main, 0/1 for annotated).
+            nclasses_or_clusters: Target number for evaluation (based on args.downstream_task).
             train_mask, val_mask, test_mask: Dummy masks (Tensor).
-            initial_graph: The computed initial graph structure (Tensor, dense or sparse).
+            initial_graph: Combined initial graph structure (Tensor, dense or sparse).
         )
     """
-    # Load data
-    print(f"Loading dataset from {args.dataset}")
+    # === 1. Load Main Data ===
+    print(f"Loading main dataset from {args.dataset}")
     try:
-        df = pd.read_csv(args.dataset, delimiter='\t')
+        df_main = pd.read_csv(args.dataset, delimiter='\t')
+        n_main = len(df_main)
     except FileNotFoundError:
-        print(f"Error: Dataset file not found at {args.dataset}")
+        print(f"Error: Main dataset file not found at {args.dataset}")
         raise
     except Exception as e:
-        print(f"Error loading dataset: {e}")
+        print(f"Error loading main dataset: {e}")
         raise
 
-    # --- Check for and extract annotation column (only if loading the designated annotated dataset) --- 
-    labels = None 
-    # Determine nclasses_or_clusters: Default to args.n_clusters
-    nclasses_or_clusters = args.n_clusters
+    # === 2. Load Annotated Data (if specified) ===
+    df_annotated = None
+    extracted_binary_labels = None
+    n_annotated = 0
+    target_column = args.annotation_column if hasattr(args, 'annotation_column') else None
 
-    # Check if an annotated dataset is specified AND if the current dataset path matches it
-    is_loading_annotated = (hasattr(args, 'annotated_dataset') and 
-                            args.annotated_dataset is not None and 
-                            args.dataset == args.annotated_dataset)
-
-    if is_loading_annotated:
-        if not hasattr(args, 'annotation_column') or not args.annotation_column:
-            # If loading annotated dataset, annotation_column must be provided
-            error_msg = (
-                f"Error: Loading annotated dataset '{args.dataset}' but no 'annotation_column' was specified in arguments."
-            )
-            print(error_msg)
-            raise ValueError(error_msg)
-            
-        # Proceed with check only when loading the annotated dataset
-        if args.annotation_column not in df.columns:
-            error_msg = (
-                f"Error: Annotation column '{args.annotation_column}' not found in the specified annotated dataset "
-                f"'{args.dataset}'. Please check the column name and the dataset."
-                f"\nAvailable columns are: {df.columns.tolist()}"
-            )
-            print(error_msg)
-            raise ValueError(error_msg)
-        else:
-            print(f"Found annotation column '{args.annotation_column}' in annotated dataset. Extracting labels.")
-            # Extract labels before preprocessing and drop from features dataframe
-            labels = torch.tensor(df[args.annotation_column].values, dtype=torch.long).to(device)
-            df = df.drop(columns=[args.annotation_column])
-            # If labels are found, determine nclasses from them 
-            nclasses_or_clusters = len(torch.unique(labels))
-            print(f"  Number of unique classes found in annotated labels: {nclasses_or_clusters}")
-    # --- End annotation column handling ---
-
-    # Preprocess the data - convert to floats, handle missing values, normalize to [-1, 1]
-    # Pass the potentially modified df
-    processed_data, preprocessor = preprocess_mixed_data(df, model_dir='sublime_models')
-
-    # Full features for the GCL model training
-    features = torch.FloatTensor(processed_data).to(device)
-    nfeats = features.shape[1]
-    n_samples = features.shape[0]
-
-    # --- Determine features for initial KNN graph calculation ---
-    features_for_knn = processed_data # Default to all features
-    if args.drop_columns_file and os.path.exists(args.drop_columns_file):
-        print(f"Attempting to exclude columns specified in {args.drop_columns_file} for initial KNN graph construction.")
+    if args.annotated_dataset:
+        print(f"Loading annotated dataset from {args.annotated_dataset}")
         try:
-            drop_df = pd.read_csv(args.drop_columns_file)
-            if 'col' not in drop_df.columns:
-                print(f"Error: Column 'col' not found in {args.drop_columns_file}. Using all features for KNN.")
-            else:
-                cols_to_drop = drop_df['col'].unique().tolist()
-                print(f"Columns to exclude from KNN: {cols_to_drop}")
+            df_annotated = pd.read_csv(args.annotated_dataset, delimiter='\t')
+            n_annotated = len(df_annotated)
 
-                transformed_feature_names = preprocessor.get_feature_names_out()
-                drop_indices = []
-                dropped_feature_names = []
+            # Check for and extract target column
+            if not target_column:
+                raise ValueError(f"Annotated dataset '{args.annotated_dataset}' loaded, but 'annotation_column' not specified.")
+            if target_column not in df_annotated.columns:
+                 raise ValueError(f"Annotation column '{target_column}' not found in annotated dataset '{args.annotated_dataset}'. "
+                                  f"Available columns: {df_annotated.columns.tolist()}")
 
-                for i, name in enumerate(transformed_feature_names):
-                    # Extract base column name (handles 'num__col' and 'cat__col_val')
-                    try:
-                        # Split by '__', take the second part, then split by '_' and take the first
-                        # This aims to get the original column name back
-                        # Example: 'num__age' -> 'age', 'cat__country_USA' -> 'country'
-                        original_col = name.split('__')[1].split('_')[0]
-                    except IndexError:
-                        print(f"Warning: Could not parse original column name from transformed feature '{name}'. Skipping.")
-                        continue
-
-                    if original_col in cols_to_drop:
-                        drop_indices.append(i)
-                        dropped_feature_names.append(name)
-
-                if drop_indices:
-                    # Sort unique indices to avoid issues with np.delete
-                    drop_indices = sorted(list(set(drop_indices)))
-                    print(f"Found {len(drop_indices)} transformed features corresponding to columns to drop:")
-                    # Limit printing of dropped feature names if too many
-                    if len(dropped_feature_names) > 20:
-                         print(f"  Features: {dropped_feature_names[:10]}... (Total: {len(dropped_feature_names)})")
-                    else:
-                         print(f"  Features: {dropped_feature_names}")
-                    print(f"  Indices: {drop_indices[:20]}...")
-                    features_for_knn = np.delete(processed_data, drop_indices, axis=1)
-                    print(f"Shape of features used for KNN calculation: {features_for_knn.shape}")
-                    if features_for_knn.shape[1] == 0:
-                         print("Error: All features were dropped! Cannot compute KNN graph. Check drop_columns_file.")
-                         raise ValueError("All features dropped for KNN graph construction.")
-                else:
-                    print("Warning: No matching transformed features found for columns specified in drop_columns_file. Using all features for KNN.")
+            print(f"Extracting labels from target column '{target_column}'...")
+            try:
+                # Ensure labels are integer 0 or 1
+                label_values = df_annotated[target_column].values
+                unique_labels = np.unique(label_values)
+                if not np.all(np.isin(unique_labels, [0, 1])):
+                     raise ValueError(f"Target column '{target_column}' contains values other than 0 or 1: {unique_labels}")
+                extracted_binary_labels = torch.tensor(label_values, dtype=torch.long) # Keep on CPU for now
+                print(f"  Found {len(torch.unique(extracted_binary_labels))} unique binary labels.")
+                # Drop the target column *before* preprocessing
+                df_annotated = df_annotated.drop(columns=[target_column])
+            except Exception as e:
+                print(f"Error processing target column '{target_column}': {e}")
+                raise
 
         except FileNotFoundError:
-             print(f"Warning: drop_columns_file '{args.drop_columns_file}' not found. Using all features for KNN.")
+            print(f"Error: Annotated dataset file not found at {args.annotated_dataset}")
+            raise
         except Exception as e:
-            print(f"Error processing drop_columns_file '{args.drop_columns_file}': {e}. Using all features for KNN.")
-
+            print(f"Error loading or processing annotated dataset: {e}")
+            raise
     else:
-        print("No drop_columns_file specified or file not found. Using all features for initial KNN graph.")
-        print(f"Shape of features used for KNN calculation: {features_for_knn.shape}")
+        print("No annotated dataset specified.")
 
 
-    # Ensure features_for_knn is float32 for FAISS
-    if features_for_knn.dtype != np.float32:
-        features_for_knn = features_for_knn.astype(np.float32)
+    # === 3. Preprocess Data ===
+    # Pass both dataframes, preprocessor handles fitting/loading and transforming
+    processed_main, processed_annotated, preprocessor = preprocess_mixed_data(
+        df_main, df_annotated, model_dir='sublime_models', target_column=target_column
+    )
 
-    # Check for low variance *only* in the features used for KNN
+
+    # === 4. Combine Features ===
+    if processed_annotated is not None:
+        print("Combining processed main and annotated features...")
+        combined_features_np = np.vstack((processed_main, processed_annotated))
+    else:
+        print("Using only main features.")
+        combined_features_np = processed_main
+
+    n_total_samples = combined_features_np.shape[0]
+    nfeats = combined_features_np.shape[1]
+    print(f"Combined features shape: ({n_total_samples}, {nfeats})")
+    features = torch.FloatTensor(combined_features_np).to(device)
+
+
+    # === 5. Combine Labels ===
+    if extracted_binary_labels is not None:
+        print("Creating combined labels tensor (-1 for main, 0/1 for annotated)...")
+        main_placeholders = torch.full((n_main,), -1, dtype=torch.long)
+        combined_labels = torch.cat((main_placeholders, extracted_binary_labels)).to(device)
+        # Verify shape
+        if len(combined_labels) != n_total_samples:
+             raise ValueError(f"Combined labels length ({len(combined_labels)}) does not match total samples ({n_total_samples}).")
+        print(f"Combined labels shape: {combined_labels.shape}")
+    else:
+        # If no annotated data, create labels tensor of -1s or handle as needed
+        # For consistency, we'll create a tensor of -1s. Loss function needs to handle this.
+        print("No annotated data provided, creating labels tensor with -1 placeholders.")
+        combined_labels = torch.full((n_total_samples,), -1, dtype=torch.long).to(device)
+
+    # === 6. Determine nclasses/n_clusters for evaluation ===
+    if args.downstream_task == 'clustering':
+        nclasses_or_clusters = args.n_clusters if hasattr(args, 'n_clusters') else n_total_samples # Default to nodes if not specified
+        print(f"Downstream task is clustering. Using n_clusters = {nclasses_or_clusters} for evaluation.")
+    elif extracted_binary_labels is not None:
+        # If classification task and we have binary labels, nclasses for evaluation is 2
+        nclasses_or_clusters = 2
+        print(f"Downstream task is classification. Using n_classes = {nclasses_or_clusters} for evaluation.")
+    else:
+        # Fallback if classification task but no labels somehow (shouldn't happen with checks)
+        # Or if another task is added later.
+        nclasses_or_clusters = n_total_samples # Default to number of nodes
+        print(f"Warning: Downstream task '{args.downstream_task}' but labels are missing or not binary. Using n_nodes = {nclasses_or_clusters} for evaluation.")
+
+
+    # === 7. Determine Features for Initial KNN Graph ===
+    # (Optional: Logic to exclude columns for KNN based on args.drop_columns_file)
+    # For simplicity now, using *all* combined features for KNN.
+    # If column dropping is needed, apply it to combined_features_np *before* KNN.
+    features_for_knn = combined_features_np # Using combined features
+    print(f"Using combined features (shape: {features_for_knn.shape}) for initial KNN graph construction.")
+    # Add variance check for KNN features
+    ok, _ = _check_processed_data(features_for_knn, "KNN Features")
+    if not ok:
+        raise ValueError("Preprocessing check failed for features used in KNN.")
+
+
+    # === 8. Calculate Combined Initial Graph Structure ===
+    print(f"Constructing initial graph structure with k={args.k} using FAISS (cosine similarity) on COMBINED features ({n_total_samples} nodes)...")
+    initial_graph = None
     try:
-        variances_knn = np.var(features_for_knn, axis=0)
-        low_variance_threshold = 1e-6
-        low_variance_indices_knn = np.where(variances_knn < low_variance_threshold)[0]
-        if len(low_variance_indices_knn) > 0:
-            print(f"Warning: {len(low_variance_indices_knn)} columns in the data *used for KNN* have variance < {low_variance_threshold}.")
-            print(f"  Indices (within KNN features): {low_variance_indices_knn}")
-            print("  This might affect KNN graph quality.")
-        else:
-             print(f"OK: All features used for KNN have variance >= {low_variance_threshold}.")
-    except Exception as e:
-        print(f"Error during variance check for KNN features: {e}")
-
-    # --- Calculate initial graph structure ---
-    print(f"Constructing initial graph structure with k={args.k} using FAISS (cosine similarity) on selected features...")
-    initial_graph = None # Initialize to None
-    try:
-        # Ensure there's at least one feature to compute KNN on
         if features_for_knn.shape[1] == 0:
             raise ValueError("Cannot compute KNN graph with zero features.")
 
         initial_graph_sparse = faiss_kneighbors_graph(features_for_knn, k=args.k, metric='cosine')
-        print(f"Initial graph computed. Shape: {initial_graph_sparse.shape}, Non-zero entries: {initial_graph_sparse.nnz}")
+        print(f"Initial combined graph computed. Shape: {initial_graph_sparse.shape}, Non-zero entries: {initial_graph_sparse.nnz}")
 
-        # Prepare the initial graph data based on sparse flag
         if args.sparse:
             initial_graph = sparse_mx_to_torch_sparse_tensor(initial_graph_sparse).to(device)
-            print("Initial graph prepared as sparse torch tensor.")
+            print("Initial combined graph prepared as sparse torch tensor.")
         else:
             initial_graph = torch.FloatTensor(initial_graph_sparse.todense()).to(device)
-            print("Initial graph prepared as dense torch tensor.")
+            print("Initial combined graph prepared as dense torch tensor.")
 
     except Exception as e:
-        print(f"Error during FAISS KNN graph construction: {e}")
-        print("Falling back to identity matrix for initial graph.")
+        print(f"Error during FAISS KNN graph construction for combined data: {e}")
+        print("Falling back to identity matrix for initial combined graph.")
         if args.sparse:
-             initial_graph_sparse_fallback = sp.eye(n_samples, dtype=np.float32).tocoo()
+             initial_graph_sparse_fallback = sp.eye(n_total_samples, dtype=np.float32).tocoo()
              initial_graph = sparse_mx_to_torch_sparse_tensor(initial_graph_sparse_fallback).to(device)
         else:
-             initial_graph = torch.eye(n_samples, dtype=torch.float32).to(device)
-        print("Using identity matrix as initial graph.")
+             initial_graph = torch.eye(n_total_samples, dtype=torch.float32).to(device)
+        print("Using identity matrix as initial combined graph.")
 
 
-    # Create dummy labels and masks (consistent with original structure)
-    train_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
-    val_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
-    test_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
+    # === 9. Create Dummy Masks ===
+    train_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
+    val_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
+    test_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
 
-    print(f"Prepared dataset. Full features shape: {features.shape}. Initial graph type: {'Sparse' if args.sparse else 'Dense'}.")
+    print(f"Prepared combined dataset. Features shape: {features.shape}. Initial graph type: {'Sparse' if args.sparse else 'Dense'}. Labels shape: {combined_labels.shape}.")
 
-    # Return full features, metadata, masks, and the computed initial_graph
-    # Ensure n_clusters is passed correctly (it's used in clustering evaluation)
-    return features, nfeats, labels, nclasses_or_clusters, train_mask, val_mask, test_mask, initial_graph
+    # Return combined data
+    return features, nfeats, combined_labels, nclasses_or_clusters, train_mask, val_mask, test_mask, initial_graph
 
 def main():
     # Get the base parser from main.py
@@ -351,20 +349,21 @@ def main():
     # Set defaults specific to this script *if they need to override the parent*
     parser.set_defaults(
         dataset='person_data.csv', # Keep or change as needed
+        # annotated_dataset=None, # Let parent handle this default or set via command line
+        # annotation_column=None, # Let parent handle this default or set via command line
         ntrials=1,
         sparse=0,
         gsl_mode="structure_inference", # Changed default: inference makes more sense if we always compute KNN
         eval_freq=50,               # Example: adjusted eval freq
-        downstream_task='clustering',
+        downstream_task='clustering', # Default to clustering for this script
         epochs=50,                 # Example: Reduced epochs for person data
-        # contrast_batch_size=10000, # Let parent default handle this or set explicitly
         save_model=1,
         output_dir='sublime_models/',
         checkpoint_dir='sublime_checkpoints/', # Give specific checkpoint dir
         checkpoint_freq=25,          # Example: checkpoint freq
         verbose=1,
         k=10,                        # Example: adjusted k
-        n_clusters=5                 # Default cluster number
+        # n_clusters=5                 # Let parent handle default or set via command line
         # type_learner defaults to 'fgp' from parent
         # lr, hidden_dim etc. default from parent
     )
@@ -379,6 +378,15 @@ def main():
     # Ensure output directories exist
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # --- Configuration Validation ---
+    if args.annotated_dataset and not args.annotation_column:
+        parser.error("If --annotated_dataset is provided, --annotation_column must also be specified.")
+    if not args.annotated_dataset and args.annotation_column:
+        print("Warning: --annotation_column specified but --annotated_dataset is missing. The annotation column will be ignored.")
+        args.annotation_column = None # Ensure it's None if no annotated dataset
+    # --- End Validation ---
+
 
     # Print final config being used
     print("--- Running Training with Configuration ---")

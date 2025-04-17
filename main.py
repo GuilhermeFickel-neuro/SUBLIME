@@ -114,50 +114,52 @@ class Experiment:
         # The learner embedding (emb2) will be used by loss_arcface_batched if called
         return loss, learned_adj, emb2
 
-    def loss_gcl_with_classification(self, model, graph_learner, features, anchor_adj, binary_labels, args):
+    def loss_gcl_with_classification(self, model, graph_learner, features, anchor_adj, combined_labels, args):
         """
-        Combined loss function that includes both contrastive learning and binary classification
-        
+        Combined loss function: Contrastive on ALL data, Classification on subset.
+
         Args:
             model: The GCL model with classification head
             graph_learner: Graph structure learning module
-            features: Node features
-            anchor_adj: Anchor adjacency matrix
-            binary_labels: Binary labels for classification (0 or 1)
+            features: COMBINED node features (e.g., 57k)
+            anchor_adj: COMBINED anchor adjacency matrix
+            combined_labels: COMBINED labels (Tensor, -1 for main, 0/1 for annotated)
             args: Training arguments
-            
+
         Returns:
-            total_loss: Combined loss from contrastive learning and classification
-            learned_adj: Learned adjacency matrix
-            cls_accuracy: Accuracy of binary classification
+            total_loss: Combined loss from contrastive learning and masked classification
+            learned_adj: Learned adjacency matrix from the COMBINED data
+            cls_accuracy: Accuracy of binary classification on the annotated subset
         """
-        # First get contrastive loss and learned adjacency
+        # --- Contrastive Part (using ALL features and anchor_adj) ---
         # view 1: anchor graph
         if args.maskfeat_rate_anchor:
             mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
             features_v1 = features * (1 - mask_v1)
         else:
             features_v1 = copy.deepcopy(features)
+        # Get projection (z1) from anchor view
+        z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
-        # Get projection (z1) and embedding (emb1) from anchor view
-        z1, emb1, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
-
-        # view 2: learned graph
+        # view 2: learned graph (from ALL features)
         if args.maskfeat_rate_learner:
             mask, _ = get_feat_mask(features, args.maskfeat_rate_learner)
             features_v2 = features * (1 - mask)
         else:
             features_v2 = copy.deepcopy(features)
 
+        # Learn graph structure from ALL features (e.g., 57k graph)
+        # Note: FGP learner uses its stored initial graph, others compute dynamically
         learned_adj = graph_learner(features)
         if not args.sparse:
             learned_adj = symmetrize(learned_adj)
             learned_adj = normalize(learned_adj, 'sym', args.sparse)
 
-        # Get projection (z2), embedding (emb2), and classification output
-        z2, emb2, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
+        # Get projection (z2) and classification output from learner view
+        # This forward pass processes ALL nodes
+        z2, _, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
 
-        # Compute contrastive loss
+        # Compute contrastive loss (using z1, z2 from ALL features)
         if args.contrast_batch_size:
             node_idxs = list(range(features.shape[0]))
             batches = split_batch(node_idxs, args.contrast_batch_size)
@@ -168,15 +170,38 @@ class Experiment:
         else:
             contrastive_loss = model.calc_loss(z1, z2)
 
-        # Compute classification loss
-        cls_loss, cls_accuracy = self.loss_binary_cls(cls_output, binary_labels)
-        
-        # Combine losses using weight parameter
+
+        # --- Masked Classification Part (using subset of outputs based on combined_labels) ---
+        cls_loss = torch.tensor(0.0, device=features.device) # Default to 0 if no valid labels
+        cls_accuracy = torch.tensor(0.0, device=features.device)
+
+        if cls_output is not None and combined_labels is not None:
+            # Create a mask for nodes that have valid binary labels (0 or 1)
+            classification_mask = (combined_labels != -1)
+
+            if classification_mask.any():
+                # Select the logits and labels for the annotated nodes
+                masked_logits = cls_output[classification_mask]
+                masked_labels = combined_labels[classification_mask]
+
+                # Compute classification loss ONLY on the masked subset
+                cls_loss, cls_accuracy = self.loss_binary_cls(masked_logits, masked_labels)
+            else:
+                if args.verbose:
+                    print("Warning: Classification head is active, but no valid binary labels (0 or 1) found in combined_labels.")
+
+
+        # --- Combine losses ---
+        # Make sure cls_loss requires grad if it contributed to the graph
+        if not cls_loss.requires_grad and contrastive_loss.requires_grad:
+            cls_loss = cls_loss.detach().requires_grad_(False) # Ensure it doesn't affect contrastive grads if it was 0
+
         total_loss = contrastive_loss + args.annotation_loss_weight * cls_loss
-        
-        print(f"Combined loss: contrastive={contrastive_loss.item():.4f}, classification={cls_loss.item():.4f}, "
-                f"weight={args.annotation_loss_weight}, accuracy={cls_accuracy.item():.4f}")
-            
+
+        print(f"Combined loss: contrastive={contrastive_loss.item():.4f} (all_data), classification={cls_loss.item():.4f} (annotated_subset), "
+                f"weight={args.annotation_loss_weight}, cls_accuracy={cls_accuracy.item():.4f}")
+
+        # Return total loss, the LEARNED adj from COMBINED data, and cls accuracy on subset
         return total_loss, learned_adj, cls_accuracy
 
     def loss_arcface_sampled(self, model, graph_learner, features, anchor_adj, labels, args):
@@ -663,64 +688,47 @@ class Experiment:
         
         # Assign nclasses based on downstream task
         if args.downstream_task == 'clustering':
-            nclasses = nclasses_or_clusters # Use n_clusters from args
-            if labels is not None and args.verbose:
-                print("Warning: Labels provided but downstream task is clustering. Labels will be used for evaluation only.")
+            print("Warning: Labels provided but downstream task is clustering. Labels will be used for evaluation only.")
         elif labels is not None:
-            nclasses = nclasses_or_clusters # Use nclasses derived from data
+            # 'labels' now contains combined labels (-1 for main, 0/1 for annotated)
+            # If annotated data was provided, nclasses_or_clusters should be 2 (binary task)
+            # If only main data (all -1s), nclasses_or_clusters should be n_clusters or n_nodes
+            # The load_person_data function now correctly sets nclasses_or_clusters based on this.
+            nclasses = nclasses_or_clusters # Use value determined by load_person_data
         else:
-            # Handle case where labels are None but task is classification (e.g., if using ArcFace with row indices)
-            # Or if ArcFace is used in clustering without true labels
-            nclasses = nclasses_or_clusters # Should be num_nodes if using row indices for ArcFace
-            if args.use_arcface and labels is None:
-                nclasses = features.shape[0] # ArcFace uses row indices
+            # This case should ideally not happen if load_person_data returns correctly
+            # Handle case where labels are None (e.g., only main data, no annotation requested)
+            # Or if ArcFace is used without any real labels or annotation
+            nclasses = nclasses_or_clusters # Should be args.n_clusters or features.shape[0]
+            if args.use_arcface and labels is None: # labels SHOULD NOT be None if we combine
+                nclasses = features.shape[0] # ArcFace uses row indices over the combined set
             elif args.verbose:
-                print("Warning: No labels provided for classification task or nclasses couldn't be determined.")
+                print("Warning: Labels are None or downstream task needs clarification. Using nclasses/clusters = ", nclasses_or_clusters)
+            nclasses = nclasses_or_clusters
 
-        # Load annotated dataset if provided
-        annotated_features = None
-        binary_labels = None
-        if args.annotated_dataset is not None:
-            # Call the same load function but with annotated dataset
-            saved_dataset = args.dataset
-            args.dataset = args.annotated_dataset
-            
-            # Load annotated data (using the same loading function)
-            annotated_features, annotated_nfeats, annotated_labels, _, _, _, _, _ = load_data_fn(args)
-            
-            # Restore original dataset path
-            args.dataset = saved_dataset
-            
-            # Check if dimensions match the main dataset
-            if annotated_nfeats != nfeats:
-                raise ValueError(f"Annotated dataset features dimension ({annotated_nfeats}) "
-                                f"doesn't match main dataset ({nfeats})")
-            
-            # Extract binary labels from the annotated dataset
-            # The loader should return the correct binary labels based on annotation_column
-            binary_labels = annotated_labels # Use the labels returned by the loader
-
-            # Ensure binary labels are integers (0 or 1)
-            if binary_labels is None:
-                 raise ValueError("Data loader did not return labels for the annotated dataset.")
-            try:
-                 binary_labels = binary_labels.int()
-            except AttributeError:
-                 # Handle case where labels might be numpy array initially
-                 binary_labels = torch.tensor(binary_labels, dtype=torch.int)
-
-            if args.verbose:
-                print(f"Loaded annotated dataset with {len(binary_labels)} samples")
-
-        # For ArcFace, create labels as row indices if not provided
+        # Labels processing for ArcFace (if needed)
+        # 'labels' here refers to the combined labels tensor potentially containing -1
         if args.use_arcface:
-            if labels is None:
-                if args.verbose:
-                    print("Using row indices as labels for ArcFace")
-                labels = torch.arange(features.shape[0])
-                # Simplified nclasses assignment - only depends on feature shape now
-                nclasses = features.shape[0]
+            # If using ArcFace, typically requires class indices for *all* samples.
+            # The common practice is to use row indices if no ground truth classes exist
+            # for the full dataset (main + annotated).
+            if args.verbose:
+                print("ArcFace is enabled. Using combined row indices (0 to N-1) as labels for ArcFace loss.")
+            # Create row indices for the *combined* feature set
+            arcface_labels = torch.arange(features.shape[0], device=self.device)
+            # nclasses for ArcFace layer should be the total number of nodes
+            nclasses = features.shape[0]
+        else:
+            # If not using ArcFace, we don't need specific labels for it.
+            # The 'labels' variable holds the combined labels (-1, 0, 1) for the classification head.
+            arcface_labels = None # Explicitly set to None
+            # nclasses remains what was determined earlier (e.g., 2 for binary classification eval, or n_clusters)
 
+        # The variable `labels` now holds the combined labels (-1, 0, 1) from load_person_data
+        # The variable `arcface_labels` holds the row indices (0..N-1) if ArcFace is used.
+        # The variable `nclasses` holds the dimension for ArcFace OR the number for downstream evaluation.
+
+        # Downstream task setup (remains the same)
         if args.downstream_task == 'classification':
             test_accuracies = []
             validation_accuracies = []
@@ -750,11 +758,8 @@ class Experiment:
                  except AttributeError:
                       raise TypeError(f"Unsupported type for initial_graph_data: {type(anchor_adj_raw)}")
 
+            # Normalize the combined initial graph
             anchor_adj = normalize(anchor_adj_raw, 'sym', args.sparse)
-
-            if args.sparse:
-                anchor_adj_torch_sparse = copy.deepcopy(anchor_adj)
-                anchor_adj = torch_sparse_to_dgl_graph(anchor_adj)
 
             if args.type_learner == 'fgp':
                 # Pass pre-computed initial graph data to FGP learner
@@ -770,8 +775,8 @@ class Experiment:
                 graph_learner = GNN_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                      args.activation_learner, anchor_adj)
 
-            # Determine if we should use classification head based on whether annotated_dataset was provided
-            use_classification_head = annotated_features is not None and binary_labels is not None
+            # Determine if we should use classification head based on whether combined labels contain valid binary labels
+            use_classification_head = labels is not None and (labels != -1).any().item()
 
             # Shared GCL parameters
             gcl_params = {
@@ -791,7 +796,7 @@ class Experiment:
 
             if args.use_arcface:
                 gcl_params.update({
-                    'num_classes': nclasses,
+                    'num_classes': nclasses, # nclasses is N (total nodes) if using ArcFace
                     'arcface_scale': args.arcface_scale,
                     'arcface_margin': args.arcface_margin,
                     'use_sampled_arcface': args.use_sampled_arcface if hasattr(args, 'use_sampled_arcface') else False,
@@ -853,21 +858,12 @@ class Experiment:
 
             model = model.to(self.device)
             graph_learner = graph_learner.to(self.device)
-            features = features.to(self.device)
+            features = features.to(self.device) # Combined features
+            # Move combined labels and arcface_labels (if used) to device
             if labels is not None:
-                labels = labels.to(self.device)
-            if train_mask is not None:
-                train_mask = train_mask.to(self.device)
-            if val_mask is not None:
-                val_mask = val_mask.to(self.device)
-            if test_mask is not None:
-                test_mask = test_mask.to(self.device)
-                
-            # Move annotated data to device if provided
-            if annotated_features is not None:
-                annotated_features = torch.tensor(annotated_features, dtype=torch.float32).to(self.device)
-            if binary_labels is not None:
-                binary_labels = binary_labels.to(self.device)
+                labels = labels.to(self.device) # Combined labels (-1, 0, 1)
+            if arcface_labels is not None:
+                arcface_labels = arcface_labels.to(self.device) # Row indices (0..N-1)
 
             if args.downstream_task == 'classification':
                 best_val = 0.0 # Initialize as float
@@ -900,14 +896,18 @@ class Experiment:
                         if use_classification_head:
                             # Use combined loss with classification
                             mini_loss, Adj, cls_accuracy = self.loss_gcl_with_classification(
-                                model, graph_learner, annotated_features, anchor_adj, binary_labels, args
+                                model, graph_learner,
+                                features, # Pass combined features
+                                anchor_adj,
+                                labels, # Pass combined labels (-1, 0, 1)
+                                args
                             )
                             # Track classification accuracy
                             if i == 0:  # only track for first accumulation step
                                 current_cls_accuracy = cls_accuracy
                         elif args.use_arcface:
                             # Use ArcFace loss
-                            mini_loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
+                            mini_loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, arcface_labels, args)
                         else:
                             # Use standard contrastive loss
                             mini_loss, Adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
@@ -939,14 +939,18 @@ class Experiment:
                     if use_classification_head:
                         # Use combined loss with classification
                         loss, Adj, current_cls_accuracy = self.loss_gcl_with_classification(
-                            model, graph_learner, annotated_features, anchor_adj, binary_labels, args
+                            model, graph_learner,
+                            features, # Pass combined features
+                            anchor_adj,
+                            labels, # Pass combined labels (-1, 0, 1)
+                            args
                         )
                         # Track best classification accuracy
                         if current_cls_accuracy > best_cls_accuracy:
                             best_cls_accuracy = current_cls_accuracy
                     elif args.use_arcface:
                         # Use ArcFace loss
-                        loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, labels, args)
+                        loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, arcface_labels, args)
                     else:
                         # Use standard contrastive loss
                         loss, Adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
