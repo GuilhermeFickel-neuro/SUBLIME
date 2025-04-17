@@ -174,10 +174,8 @@ class Experiment:
         # Combine losses using weight parameter
         total_loss = contrastive_loss + args.annotation_loss_weight * cls_loss
         
-        if args.verbose and (not hasattr(args, '_classification_loss_printed') or not args._classification_loss_printed):
-            print(f"Combined loss: contrastive={contrastive_loss.item():.4f}, classification={cls_loss.item():.4f}, "
-                  f"weight={args.annotation_loss_weight}, accuracy={cls_accuracy.item():.4f}")
-            args._classification_loss_printed = True
+        print(f"Combined loss: contrastive={contrastive_loss.item():.4f}, classification={cls_loss.item():.4f}, "
+                f"weight={args.annotation_loss_weight}, accuracy={cls_accuracy.item():.4f}")
             
         return total_loss, learned_adj, cls_accuracy
 
@@ -217,10 +215,8 @@ class Experiment:
 
         combined_loss = contrastive_loss + arcface_weight * arcface_loss
         
-        if args.verbose and (not hasattr(args, '_sampled_loss_printed') or not args._sampled_loss_printed):
-             print(f"Sampled ArcFace Combined loss: contrastive={contrastive_loss.item():.4f}, arcface_sampled={arcface_loss.item():.4f}, weight={arcface_weight}")
-             args._sampled_loss_printed = True # Print only once if verbose
-
+        print(f"Sampled ArcFace Combined loss: contrastive={contrastive_loss.item():.4f}, arcface_sampled={arcface_loss.item():.4f}, weight={arcface_weight}")
+        
         return combined_loss, learned_adj
 
     def evaluate_adj_by_cls(self, Adj, features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, args):
@@ -703,8 +699,9 @@ class Experiment:
             # Extract binary labels from the annotated dataset
             # This assumes the binary labels are stored in the last column
             # We'll need to modify the data_loader.py to support this properly
-            binary_labels = torch.tensor(annotated_features[:, -1].astype(int))
-            
+            # binary_labels = torch.tensor(annotated_features[:, -1].astype(int)) # Comment out old line
+            binary_labels = annotated_features[:, -1].int() # Use PyTorch's .int() method
+
             # Remove the label column from features
             annotated_features = annotated_features[:, :-1]
             

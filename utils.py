@@ -427,7 +427,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
 
         if not actual_use_gpu:
             faiss_device_info = "CPU"
-            print(f"Using FAISS on CPU with {index_type}")
+            # print(f"Using FAISS on CPU with {index_type}")
             quantizer = faiss.IndexFlatIP(d)
             index = faiss.IndexIVFPQ(quantizer, d, nlist, M, nbits, faiss.METRIC_INNER_PRODUCT) # Use nbits
             index.train(X_np)
@@ -437,7 +437,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
         # --- End of Index Building/Training ---
     else:
         # --- Use Provided Index ---
-        print("Using pre-built FAISS index for search.")
+        # print("Using pre-built FAISS index for search.")
         # We assume the provided index is already trained and has data added.
         # We might need to set nprobe if it wasn't set previously or if we want a different value for this search.
         actual_nprobe = nprobe
@@ -453,7 +453,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
                      actual_nprobe = min(nlist // 2, 100)
                  else:
                      actual_nprobe = 10 # Default fallback nprobe
-             print(f"Using nprobe={actual_nprobe} for search.")
+            #  print(f"Using nprobe={actual_nprobe} for search.")
 
         if hasattr(faiss_index, 'nprobe'):
              faiss_index.nprobe = actual_nprobe
@@ -467,9 +467,9 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
 
     # --- Search using the index (either built here or provided) ---
     # We search using X_np (the features passed to this function call)
-    print(f"Searching neighbors using {faiss_device_info} index...")
+    # print(f"Searching neighbors using {faiss_device_info} index...")
     vals_np, inds_np = faiss_index.search(X_np, k + 1) # Search for k+1 neighbors
-    print("Search complete.")
+    # print("Search complete.")
 
     # Convert results back to PyTorch tensors
     vals = torch.from_numpy(vals_np).to(device)
@@ -513,7 +513,7 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
 
     end_time = time.time()
     index_source = "pre-built" if not index_built_or_trained else "built/trained"
-    print(f"knn_fast ({index_source} index, {k} neighbors) execution time: {end_time - start_time:.4f} seconds")
+    # print(f"knn_fast ({index_source} index, {k} neighbors) execution time: {end_time - start_time:.4f} seconds")
     
     return rows, cols, values
 
