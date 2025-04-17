@@ -917,42 +917,96 @@ class Experiment:
                 model.train()
                 graph_learner.train()
                 
-                # Simplified training loop with annotated dataset support
+                # Simplified training loop with combined loss calculation
                 if grad_accumulation_steps > 1:
-                    # Gradient accumulation path
+                    # --- Gradient Accumulation Path ---
                     accumulated_loss = 0
                     optimizer_cl.zero_grad()
                     optimizer_learner.zero_grad()
 
                     for i in range(grad_accumulation_steps):
-                        # Forward pass
-                        if use_classification_head:
-                            # Use combined loss with classification
-                            mini_loss, Adj, cls_accuracy = self.loss_gcl_with_classification(
-                                model, graph_learner,
-                                features, # Pass combined features
-                                anchor_adj,
-                                labels, # Pass combined labels (-1, 0, 1)
-                                args
-                            )
-                            # Track classification accuracy
-                            if i == 0:  # only track for first accumulation step
-                                current_cls_accuracy = cls_accuracy
-                        elif args.use_arcface:
-                            # Use ArcFace loss
-                            mini_loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, arcface_labels, args)
+                        # --- Forward passes ---
+                        # view 1: anchor graph
+                        if args.maskfeat_rate_anchor:
+                            mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+                            features_v1 = features * (1 - mask_v1)
                         else:
-                            # Use standard contrastive loss
-                            mini_loss, Adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                            features_v1 = copy.deepcopy(features)
+                        z1, emb1, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
-                        mini_loss = mini_loss / grad_accumulation_steps # Scale loss
+                        # view 2: learned graph
+                        if args.maskfeat_rate_learner:
+                            mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+                            features_v2 = features * (1 - mask_v2)
+                        else:
+                            features_v2 = copy.deepcopy(features)
+                        learned_adj = graph_learner(features) # Learn graph
+                        if not args.sparse:
+                             learned_adj = symmetrize(learned_adj)
+                             learned_adj = normalize(learned_adj, 'sym', args.sparse)
+                        Adj = learned_adj # Store for potential use later
+                        z2, emb2, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
 
-                        # Backward pass
-                        mini_loss.backward()
+                        # --- Loss Calculation ---
+                        # 1. Contrastive Loss
+                        if args.contrast_batch_size:
+                            node_idxs = list(range(features.shape[0]))
+                            batches = split_batch(node_idxs, args.contrast_batch_size)
+                            contrastive_loss = 0
+                            for batch in batches:
+                                weight = len(batch) / features.shape[0]
+                                contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
+                        else:
+                            contrastive_loss = model.calc_loss(z1, z2)
+                        
+                        mini_total_loss = contrastive_loss
+                        
+                        # 2. ArcFace Loss (if enabled)
+                        current_arcface_loss = torch.tensor(0.0, device=features.device)
+                        if args.use_arcface:
+                            if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
+                                try:
+                                    arcface_output, sampled_labels = model.arcface(emb2, arcface_labels)
+                                    current_arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
+                                    mini_total_loss += args.arcface_weight * current_arcface_loss
+                                except Exception as e:
+                                    print(f"Warning: Error during ArcFace calculation step {i}: {e}")
+                                    current_arcface_loss = torch.tensor(0.0, device=features.device)
+                            else:
+                                if i == 0: print("Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly.")
+                        
+                        # 3. Classification Loss (if enabled)
+                        current_cls_loss = torch.tensor(0.0, device=features.device)
+                        current_cls_accuracy = torch.tensor(0.0, device=features.device)
+                        if use_classification_head:
+                            if cls_output is not None and labels is not None:
+                                classification_mask = (labels != -1)
+                                if classification_mask.any():
+                                    masked_logits = cls_output[classification_mask]
+                                    masked_labels = labels[classification_mask]
+                                    current_cls_loss, current_cls_accuracy = self.loss_binary_cls(masked_logits, masked_labels)
+                                    mini_total_loss += args.annotation_loss_weight * current_cls_loss
+                                else:
+                                    # No valid labels found this step - possible if labels change?
+                                    pass 
+                            else:
+                                # Should not happen if use_classification_head is True
+                                if i == 0: print("Warning: use_classification_head=True but cls_output or labels are None.")
+                        
+                        # Scale loss for accumulation
+                        scaled_mini_loss = mini_total_loss / grad_accumulation_steps
 
-                        accumulated_loss += mini_loss.item() * grad_accumulation_steps # Unscale for reporting
+                        # Backward pass for this step
+                        scaled_mini_loss.backward()
 
-                    # Gradient Clipping
+                        accumulated_loss += mini_total_loss.item() # Accumulate unscaled loss for reporting
+
+                        # Store accuracy from first step for reporting
+                        if i == 0: 
+                           first_step_cls_accuracy = current_cls_accuracy 
+
+                    # --- After Accumulation Steps ---
+                    # Gradient Clipping (apply to accumulated grads)
                     if args.clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
                         torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
@@ -961,32 +1015,91 @@ class Experiment:
                     optimizer_cl.step()
                     optimizer_learner.step()
 
-                    loss = accumulated_loss / grad_accumulation_steps # Average loss for the step
+                    loss = accumulated_loss / grad_accumulation_steps # Average loss for the entire step
+                    # Use accuracy from the first mini-batch for reporting consistency
+                    if use_classification_head:
+                        current_cls_accuracy = first_step_cls_accuracy 
 
                 else:
-                    # Standard training path (no gradient accumulation)
+                    # --- Standard Training Path (no gradient accumulation) ---
                     optimizer_cl.zero_grad()
                     optimizer_learner.zero_grad()
 
-                    # Choose appropriate loss function based on available data
-                    if use_classification_head:
-                        # Use combined loss with classification
-                        loss, Adj, current_cls_accuracy = self.loss_gcl_with_classification(
-                            model, graph_learner,
-                            features, # Pass combined features
-                            anchor_adj,
-                            labels, # Pass combined labels (-1, 0, 1)
-                            args
-                        )
-                        # Track best classification accuracy
-                        if current_cls_accuracy > best_cls_accuracy:
-                            best_cls_accuracy = current_cls_accuracy
-                    elif args.use_arcface:
-                        # Use ArcFace loss
-                        loss, Adj = self.loss_arcface_sampled(model, graph_learner, features, anchor_adj, arcface_labels, args)
+                    # --- Forward passes ---
+                    # view 1: anchor graph
+                    if args.maskfeat_rate_anchor:
+                        mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+                        features_v1 = features * (1 - mask_v1)
                     else:
-                        # Use standard contrastive loss
-                        loss, Adj, _ = self.loss_gcl(model, graph_learner, features, anchor_adj, args)
+                        features_v1 = copy.deepcopy(features)
+                    z1, emb1, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
+
+                    # view 2: learned graph
+                    if args.maskfeat_rate_learner:
+                        mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+                        features_v2 = features * (1 - mask_v2)
+                    else:
+                        features_v2 = copy.deepcopy(features)
+                    learned_adj = graph_learner(features) # Learn graph
+                    if not args.sparse:
+                        learned_adj = symmetrize(learned_adj)
+                        learned_adj = normalize(learned_adj, 'sym', args.sparse)
+                    Adj = learned_adj # Store for potential use later
+                    z2, emb2, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
+
+                    # --- Loss Calculation ---
+                    # 1. Contrastive Loss
+                    if args.contrast_batch_size:
+                        node_idxs = list(range(features.shape[0]))
+                        batches = split_batch(node_idxs, args.contrast_batch_size)
+                        contrastive_loss = 0
+                        for batch in batches:
+                            weight = len(batch) / features.shape[0]
+                            contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
+                    else:
+                        contrastive_loss = model.calc_loss(z1, z2)
+
+                    total_loss = contrastive_loss
+                    print_loss_components = {'contrastive': contrastive_loss.item()}
+
+                    # 2. ArcFace Loss (if enabled)
+                    arcface_loss = torch.tensor(0.0, device=features.device)
+                    if args.use_arcface:
+                        if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
+                            try:
+                                arcface_output, sampled_labels = model.arcface(emb2, arcface_labels) # Use learner embedding (emb2)
+                                arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
+                                total_loss += args.arcface_weight * arcface_loss
+                                print_loss_components['arcface_sampled'] = arcface_loss.item()
+                            except Exception as e:
+                                print(f"Warning: Error during ArcFace calculation: {e}")
+                                arcface_loss = torch.tensor(0.0, device=features.device)
+                        else:
+                            print("Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly.")
+                    
+                    # 3. Classification Loss (if enabled)
+                    cls_loss = torch.tensor(0.0, device=features.device)
+                    current_cls_accuracy = torch.tensor(0.0, device=features.device)
+                    if use_classification_head:
+                        if cls_output is not None and labels is not None:
+                            classification_mask = (labels != -1)
+                            if classification_mask.any():
+                                masked_logits = cls_output[classification_mask]
+                                masked_labels = labels[classification_mask]
+                                cls_loss, current_cls_accuracy = self.loss_binary_cls(masked_logits, masked_labels)
+                                total_loss += args.annotation_loss_weight * cls_loss
+                                print_loss_components['classification'] = cls_loss.item()
+                                
+                                # Track best classification accuracy during training
+                                if current_cls_accuracy > best_cls_accuracy:
+                                    best_cls_accuracy = current_cls_accuracy
+                            else:
+                                if args.verbose: print("Warning: Classification head active, but no valid labels (0 or 1) found in this epoch.")
+                        else:
+                             print("Warning: use_classification_head=True but cls_output or labels are None.")
+
+                    # --- Combined Loss Backward Pass ---
+                    loss = total_loss # Assign to 'loss' variable for consistency
 
                     # NaN Loss Check
                     if torch.isnan(loss):
@@ -1042,15 +1155,24 @@ class Experiment:
 
                 if args.verbose:
                     try:
-                        loss_msg = "Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss.item())
-                        if use_classification_head:
-                            # Add classification accuracy to the message
-                            loss_msg += " | Cls Acc {:.4f}".format(current_cls_accuracy.item())
-                            cls_accuracies.append(current_cls_accuracy.item())
-                        loss_msg += " | " + args.downstream_task
+                        loss_msg = "Epoch {:05d} | Total Loss {:.4f}".format(epoch, loss.item())
+
+                        # Add individual loss components if they exist in the dictionary
+                        if 'contrastive' in print_loss_components:
+                             loss_msg += f" | Contrastive {print_loss_components['contrastive']:.4f}"
+                        if args.use_arcface and 'arcface_sampled' in print_loss_components:
+                             loss_msg += f" | ArcFace Sampled {print_loss_components['arcface_sampled']:.4f}"
+                        if use_classification_head and 'classification' in print_loss_components:
+                             loss_msg += f" | Cls Loss {print_loss_components['classification']:.4f}"
+                             # Keep classification accuracy as well
+                             loss_msg += " | Cls Acc {:.4f}".format(current_cls_accuracy.item())
+                             cls_accuracies.append(current_cls_accuracy.item()) # Still track accuracy
+
+                        loss_msg += " | " + args.downstream_task # Keep downstream task info
                         print(loss_msg)
-                    except:
-                        print("Epoch {:05d} | CL Loss {:.4f}".format(epoch, loss), args.downstream_task)
+                    except Exception as e: # Catch potential errors during logging
+                        print(f"Epoch {epoch:05d} | Error during logging: {e}")
+                        print(f"Raw loss value: {loss.item() if isinstance(loss, torch.Tensor) else loss}")
 
                 # Periodic Checkpointing
                 if epoch > 0 and epoch % args.checkpoint_freq == 0:
@@ -1098,7 +1220,7 @@ class Experiment:
                     
                     # Report best classification accuracy if used
                     if use_classification_head:
-                        print("Best classification accuracy: ", best_cls_accuracy.item())
+                        print("Best classification accuracy during training: ", best_cls_accuracy.item() if isinstance(best_cls_accuracy, torch.Tensor) else best_cls_accuracy) # Ensure it's a float
 
             # After training completes
             if args.save_model:
