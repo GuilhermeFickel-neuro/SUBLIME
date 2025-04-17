@@ -761,10 +761,37 @@ class Experiment:
             # Normalize the combined initial graph
             anchor_adj = normalize(anchor_adj_raw, 'sym', args.sparse)
 
+            # Convert to DGL graph if sparse (<<< THIS WAS THE MISSING STEP)
+            if args.sparse:
+                anchor_adj = torch_sparse_to_dgl_graph(anchor_adj)
+
+            # --- Initialize Graph Learner ---
+            # The graph learner type determines how the learned graph is generated.
+            # FGP uses the initial graph data directly, others compute dynamically.
             if args.type_learner == 'fgp':
-                # Pass pre-computed initial graph data to FGP learner
-                graph_learner = FGP_learner(k=args.k, knn_metric=args.sim_function, i=6, # Note: i=6 seems hardcoded, consider making it an arg
-                                          sparse=args.sparse, initial_graph_data=initial_graph_data)
+                # FGP requires the raw (pre-normalized, pre-DGL conversion) initial data
+                # It expects a sparse tensor if args.sparse is True
+                fgp_initial_data = anchor_adj_raw # Use the raw data before normalization/DGL
+                if args.sparse and not isinstance(fgp_initial_data, torch.Tensor) or not fgp_initial_data.is_sparse:
+                     # Ensure it's a sparse tensor if needed by FGP
+                     # This should be guaranteed by load_person_data returning sparse tensor when args.sparse=1
+                     print("Warning: Initial data for FGP sparse mode is not a sparse tensor. Attempting conversion.")
+                     try:
+                          # Example conversion, might need adjustment based on actual type
+                          if isinstance(fgp_initial_data, dgl.DGLGraph): # If it somehow became DGL
+                              fgp_initial_data = dgl_graph_to_torch_sparse(fgp_initial_data)
+                          elif isinstance(fgp_initial_data, np.ndarray):
+                              fgp_initial_data = sparse_mx_to_torch_sparse_tensor(sp.csr_matrix(fgp_initial_data))
+                          # Add other potential conversions if necessary
+                          if not fgp_initial_data.is_sparse:
+                              raise TypeError("Could not convert FGP initial data to sparse tensor.")
+                     except Exception as e:
+                          raise TypeError(f"Failed to ensure FGP initial data is sparse: {e}")
+
+                graph_learner = FGP_learner(
+                    k=args.k, knn_metric=args.sim_function, i=6,
+                    sparse=args.sparse, initial_graph_data=fgp_initial_data # Pass raw/sparse tensor
+                )
             elif args.type_learner == 'mlp':
                 graph_learner = MLP_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                      args.activation_learner)
@@ -772,8 +799,14 @@ class Experiment:
                 graph_learner = ATT_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                           args.activation_learner)
             elif args.type_learner == 'gnn':
-                graph_learner = GNN_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
-                                     args.activation_learner, anchor_adj)
+                 # GNN Learner needs the *normalized DGL graph* anchor_adj
+                 if args.sparse and not isinstance(anchor_adj, dgl.DGLGraph):
+                      raise TypeError("GNN Learner in sparse mode requires a DGL graph as anchor_adj.")
+                 elif not args.sparse and not isinstance(anchor_adj, torch.Tensor):
+                     raise TypeError("GNN Learner in dense mode requires a Tensor as anchor_adj.")
+
+                 graph_learner = GNN_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
+                                      args.activation_learner, anchor_adj)
 
             # Determine if we should use classification head based on whether combined labels contain valid binary labels
             use_classification_head = labels is not None and (labels != -1).any().item()
