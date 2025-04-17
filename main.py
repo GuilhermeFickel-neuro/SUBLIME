@@ -882,7 +882,7 @@ class Experiment:
             if grad_accumulation_steps > 1 and args.verbose:
                 print(f"Using gradient accumulation with {grad_accumulation_steps} steps")
                 
-            for epoch in tqdm(range(start_epoch, args.epochs + 1), desc="Training", initial=start_epoch, total=args.epochs):
+            for epoch in tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs):
                 model.train()
                 graph_learner.train()
                 
