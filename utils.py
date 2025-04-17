@@ -517,26 +517,29 @@ def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
         # else:
             # print(f"    Warning: Cannot set nprobe on provided index type {type(faiss_index).__name__}.")
 
-        # Determine device info for provided index - IMPROVED LOGIC
+        # Determine device info for provided index - FIXED LOGIC
         faiss_device_info = "Unknown"
-        if hasattr(faiss_index, 'getResources'): # Check if it's likely a GpuIndex variant
-            try:
-                 # Attempt to get device from resources if possible
-                 # This is heuristic as structure can vary
-                 res = faiss_index.getResources()
-                 # Check common attributes or types associated with GPU resources
-                 if hasattr(res, 'getGpuDevice'):
-                      faiss_device_info = f"GPU (device {res.getGpuDevice()})"
-                 elif hasattr(res, 'devices'): # For older/different resource types
-                      faiss_device_info = f"GPU (devices {res.devices})"
-                 else:
-                      faiss_device_info = "GPU (Unknown Device Details)"
-            except Exception:
-                 faiss_device_info = "GPU (Error getting details)" # Could be GPU but failed inspection
-        elif isinstance(faiss_index, faiss.Index) and not hasattr(faiss_index, 'getResources'): # Likely a CPU index
-            faiss_device_info = "CPU"
-        else:
-            faiss_device_info = f"Unknown Type ({type(faiss_index).__name__})"
+        # Use isinstance to check if it's a GPU index object directly
+        try:
+            # Check if faiss.GpuIndex exists (it might not if only faiss-cpu is installed)
+            if hasattr(faiss, 'GpuIndex') and isinstance(faiss_index, faiss.GpuIndex):
+                faiss_device_info = "GPU"
+                # Try to get specific device ID if possible
+                if hasattr(faiss_index, 'getDevice'): # Standard way for GpuIndex
+                    try:
+                         faiss_device_info = f"GPU (device {faiss_index.getDevice()})"
+                    except Exception:
+                         faiss_device_info = "GPU (Error getting device ID)"
+            elif isinstance(faiss_index, faiss.Index): # Otherwise, if it's a standard CPU index
+                faiss_device_info = "CPU"
+            else:
+                 faiss_device_info = f"Unknown Type ({type(faiss_index).__name__})"
+        except AttributeError:
+             # Handle cases where faiss.GpuIndex might not be defined (faiss-cpu installed)
+             if isinstance(faiss_index, faiss.Index):
+                  faiss_device_info = "CPU"
+             else:
+                  faiss_device_info = f"Unknown Type ({type(faiss_index).__name__})"
 
         print(f"    Index type: {type(faiss_index).__name__} on {faiss_device_info}, using nprobe={actual_nprobe}.")
         t_prebuilt_end = time.time()
