@@ -1088,8 +1088,10 @@ class Experiment:
                     elif args.downstream_task == 'clustering' and labels is not None:
                         model.eval()
                         graph_learner.eval()
-                        _, embedding = model(features, Adj)
-                        
+                        # _, embedding = model(features, Adj) # Original line causing error
+                        # Unpack all potential return values, keep only embedding
+                        z, embedding, _, _ = model(features, Adj)
+
                         embedding = embedding.cpu().detach().numpy()
                         acc_mr, nmi_mr, f1_mr, ari_mr = [], [], [], []
                         for clu_trial in range(n_clu_trials):
