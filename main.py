@@ -686,7 +686,7 @@ class Experiment:
             args.dataset = args.annotated_dataset
             
             # Load annotated data (using the same loading function)
-            annotated_features, annotated_nfeats, _, _, _, _, _, _ = load_data_fn(args)
+            annotated_features, annotated_nfeats, annotated_labels, _, _, _, _, _ = load_data_fn(args)
             
             # Restore original dataset path
             args.dataset = saved_dataset
@@ -697,18 +697,20 @@ class Experiment:
                                 f"doesn't match main dataset ({nfeats})")
             
             # Extract binary labels from the annotated dataset
-            # This assumes the binary labels are stored in the last column
-            # We'll need to modify the data_loader.py to support this properly
-            # binary_labels = torch.tensor(annotated_features[:, -1].astype(int)) # Comment out old line
-            binary_labels = annotated_features[:, -1].int() # Use PyTorch's .int() method
+            # The loader should return the correct binary labels based on annotation_column
+            binary_labels = annotated_labels # Use the labels returned by the loader
 
-            # Remove the label column from features
-            annotated_features = annotated_features[:, :-1]
-            
+            # Ensure binary labels are integers (0 or 1)
+            if binary_labels is None:
+                 raise ValueError("Data loader did not return labels for the annotated dataset.")
+            try:
+                 binary_labels = binary_labels.int()
+            except AttributeError:
+                 # Handle case where labels might be numpy array initially
+                 binary_labels = torch.tensor(binary_labels, dtype=torch.int)
+
             if args.verbose:
                 print(f"Loaded annotated dataset with {len(binary_labels)} samples")
-                print(f"Binary label distribution: 0s={int((binary_labels == 0).sum())}, "
-                     f"1s={int((binary_labels == 1).sum())}")
 
         # For ArcFace, create labels as row indices if not provided
         if args.use_arcface:

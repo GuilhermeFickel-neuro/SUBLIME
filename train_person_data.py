@@ -157,8 +157,8 @@ def load_person_data(args):
         Tuple: (
             features: Full preprocessed features (Tensor).
             nfeats: Number of features.
-            labels: None (unsupervised).
-            n_clusters: Number of clusters target (from args).
+            labels: Labels from annotation_column (Tensor/None).
+            nclasses_or_clusters: Number of classes or target clusters.
             train_mask, val_mask, test_mask: Dummy masks (Tensor).
             initial_graph: The computed initial graph structure (Tensor, dense or sparse).
         )
@@ -174,8 +174,46 @@ def load_person_data(args):
         print(f"Error loading dataset: {e}")
         raise
 
+    # --- Check for and extract annotation column (only if loading the designated annotated dataset) --- 
+    labels = None 
+    # Determine nclasses_or_clusters: Default to args.n_clusters
+    nclasses_or_clusters = args.n_clusters
+
+    # Check if an annotated dataset is specified AND if the current dataset path matches it
+    is_loading_annotated = (hasattr(args, 'annotated_dataset') and 
+                            args.annotated_dataset is not None and 
+                            args.dataset == args.annotated_dataset)
+
+    if is_loading_annotated:
+        if not hasattr(args, 'annotation_column') or not args.annotation_column:
+            # If loading annotated dataset, annotation_column must be provided
+            error_msg = (
+                f"Error: Loading annotated dataset '{args.dataset}' but no 'annotation_column' was specified in arguments."
+            )
+            print(error_msg)
+            raise ValueError(error_msg)
+            
+        # Proceed with check only when loading the annotated dataset
+        if args.annotation_column not in df.columns:
+            error_msg = (
+                f"Error: Annotation column '{args.annotation_column}' not found in the specified annotated dataset "
+                f"'{args.dataset}'. Please check the column name and the dataset."
+                f"\nAvailable columns are: {df.columns.tolist()}"
+            )
+            print(error_msg)
+            raise ValueError(error_msg)
+        else:
+            print(f"Found annotation column '{args.annotation_column}' in annotated dataset. Extracting labels.")
+            # Extract labels before preprocessing and drop from features dataframe
+            labels = torch.tensor(df[args.annotation_column].values, dtype=torch.long).to(device)
+            df = df.drop(columns=[args.annotation_column])
+            # If labels are found, determine nclasses from them 
+            nclasses_or_clusters = len(torch.unique(labels))
+            print(f"  Number of unique classes found in annotated labels: {nclasses_or_clusters}")
+    # --- End annotation column handling ---
+
     # Preprocess the data - convert to floats, handle missing values, normalize to [-1, 1]
-    # Also gets the fitted preprocessor needed for mapping dropped columns
+    # Pass the potentially modified df
     processed_data, preprocessor = preprocess_mixed_data(df, model_dir='sublime_models')
 
     # Full features for the GCL model training
@@ -291,7 +329,6 @@ def load_person_data(args):
 
 
     # Create dummy labels and masks (consistent with original structure)
-    labels = None # Unsupervised
     train_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
     val_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
     test_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
@@ -300,7 +337,7 @@ def load_person_data(args):
 
     # Return full features, metadata, masks, and the computed initial_graph
     # Ensure n_clusters is passed correctly (it's used in clustering evaluation)
-    return features, nfeats, labels, args.n_clusters, train_mask, val_mask, test_mask, initial_graph
+    return features, nfeats, labels, nclasses_or_clusters, train_mask, val_mask, test_mask, initial_graph
 
 def main():
     # Get the base parser from main.py
