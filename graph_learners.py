@@ -139,7 +139,7 @@ class FGP_learner(nn.Module):
 
 
 class ATT_learner(nn.Module):
-    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, mlp_act):
+    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, mlp_act, knn_threshold_type='none', knn_std_dev_factor=1.0):
         super(ATT_learner, self).__init__()
 
         self.i = i
@@ -151,6 +151,8 @@ class ATT_learner(nn.Module):
         self.non_linearity = 'relu'
         self.sparse = sparse
         self.mlp_act = mlp_act
+        self.knn_threshold_type = knn_threshold_type
+        self.knn_std_dev_factor = knn_std_dev_factor
 
     def internal_forward(self, h):
         for i, layer in enumerate(self.layers):
@@ -163,18 +165,24 @@ class ATT_learner(nn.Module):
         return h
 
     def forward(self, features, faiss_index=None):
+        embeddings = self.internal_forward(features)
+
         if self.sparse:
-            embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
-            rows_ = torch.cat((rows, cols))
-            cols_ = torch.cat((cols, rows))
-            values_ = torch.cat((values, values))
-            values_ = apply_non_linearity(values_, self.non_linearity, self.i)
-            adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device='cuda')
-            adj.edata['w'] = values_
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
+                                          knn_threshold_type=self.knn_threshold_type,
+                                          knn_std_dev_factor=self.knn_std_dev_factor)
+
+            rows_sym = torch.cat((rows, cols))
+            cols_sym = torch.cat((cols, rows))
+            values_sym = torch.cat((values, values))
+
+            values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
+
+            adj = dgl.graph((rows_sym, cols_sym), num_nodes=features.shape[0], device=features.device)
+            adj.edata['w'] = values_processed
             return adj
         else:
-            embeddings = self.internal_forward(features)
+            print("Warning: Dense mode in ATT_learner still uses top_k similarity, not knn_fast thresholding.")
             embeddings = F.normalize(embeddings, dim=1, p=2)
             similarities = cal_similarity_graph(embeddings)
             similarities = top_k(similarities, self.k + 1)
@@ -183,7 +191,7 @@ class ATT_learner(nn.Module):
 
 
 class MLP_learner(nn.Module):
-    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, act):
+    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, act, knn_threshold_type='none', knn_std_dev_factor=1.0):
         super(MLP_learner, self).__init__()
 
         self.layers = nn.ModuleList()
@@ -204,6 +212,8 @@ class MLP_learner(nn.Module):
         self.i = i
         self.sparse = sparse
         self.act = act
+        self.knn_threshold_type = knn_threshold_type
+        self.knn_std_dev_factor = knn_std_dev_factor
 
     def internal_forward(self, h):
         for i, layer in enumerate(self.layers):
@@ -217,21 +227,29 @@ class MLP_learner(nn.Module):
 
     def param_init(self):
         for layer in self.layers:
-            layer.weight = nn.Parameter(torch.eye(self.input_dim))
+            layer.weight.data.copy_(torch.eye(self.input_dim))
+            if layer.bias is not None:
+                 layer.bias.data.fill_(0)
 
     def forward(self, features, faiss_index=None):
+        embeddings = self.internal_forward(features)
+
         if self.sparse:
-            embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
-            rows_ = torch.cat((rows, cols))
-            cols_ = torch.cat((cols, rows))
-            values_ = torch.cat((values, values))
-            values_ = apply_non_linearity(values_, self.non_linearity, self.i)
-            adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device='cuda')
-            adj.edata['w'] = values_
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
+                                          knn_threshold_type=self.knn_threshold_type,
+                                          knn_std_dev_factor=self.knn_std_dev_factor)
+
+            rows_sym = torch.cat((rows, cols))
+            cols_sym = torch.cat((cols, rows))
+            values_sym = torch.cat((values, values))
+
+            values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
+
+            adj = dgl.graph((rows_sym, cols_sym), num_nodes=features.shape[0], device=features.device)
+            adj.edata['w'] = values_processed
             return adj
         else:
-            embeddings = self.internal_forward(features)
+            print("Warning: Dense mode in MLP_learner still uses top_k similarity, not knn_fast thresholding.")
             embeddings = F.normalize(embeddings, dim=1, p=2)
             similarities = cal_similarity_graph(embeddings)
             similarities = top_k(similarities, self.k + 1)
@@ -240,7 +258,7 @@ class MLP_learner(nn.Module):
 
 
 class GNN_learner(nn.Module):
-    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, mlp_act, adj):
+    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, mlp_act, adj, knn_threshold_type='none', knn_std_dev_factor=1.0):
         super(GNN_learner, self).__init__()
 
         self.adj = adj
@@ -262,6 +280,8 @@ class GNN_learner(nn.Module):
         self.i = i
         self.sparse = sparse
         self.mlp_act = mlp_act
+        self.knn_threshold_type = knn_threshold_type
+        self.knn_std_dev_factor = knn_std_dev_factor
 
     def internal_forward(self, h):
         for i, layer in enumerate(self.layers):
@@ -275,20 +295,29 @@ class GNN_learner(nn.Module):
 
     def param_init(self):
         for layer in self.layers:
-            layer.weight = nn.Parameter(torch.eye(self.input_dim))
+            layer.weight.data.copy_(torch.eye(self.input_dim))
+            if layer.bias is not None:
+                 layer.bias.data.fill_(0)
 
     def forward(self, features, faiss_index=None):
+        embeddings = self.internal_forward(features)
+
         if self.sparse:
-            embeddings = self.internal_forward(features)
-            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index)
-            rows_ = torch.cat((rows, cols))
-            cols_ = torch.cat((cols, rows))
-            values_ = torch.cat((values, values))
-            values_ = apply_non_linearity(values_, self.non_linearity, self.i)
-            adj = dgl.graph((rows_, cols_), num_nodes=features.shape[0], device='cuda')
-            adj.edata['w'] = values_
+            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
+                                          knn_threshold_type=self.knn_threshold_type,
+                                          knn_std_dev_factor=self.knn_std_dev_factor)
+
+            rows_sym = torch.cat((rows, cols))
+            cols_sym = torch.cat((cols, rows))
+            values_sym = torch.cat((values, values))
+
+            values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
+
+            adj = dgl.graph((rows_sym, cols_sym), num_nodes=features.shape[0], device=features.device)
+            adj.edata['w'] = values_processed
             return adj
         else:
+            print("Warning: Dense mode in GNN_learner still uses top_k similarity, not knn_fast thresholding.")
             embeddings = self.internal_forward(features)
             embeddings = F.normalize(embeddings, dim=1, p=2)
             similarities = cal_similarity_graph(embeddings)

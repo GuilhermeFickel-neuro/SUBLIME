@@ -351,44 +351,47 @@ def top_k(raw_graph, K):
     return sparse_graph
 
 
-def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None):
+def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_threshold_type='none', knn_std_dev_factor=1.0):
     """
-    Optimized KNN implementation using FAISS (now defaults to IndexFlatIP if building internally).
-    Includes detailed timing prints and option to reuse a pre-built index.
+    Optimized KNN implementation using FAISS.
+    Can optionally filter neighbors based on similarity threshold.
 
     Args:
         X (torch.Tensor): Input features (num_nodes x num_features).
         k (int): Number of neighbors to find for each node.
         b (int): Batch size parameter (kept for backward compatibility, not used).
-        use_gpu (bool): If True, attempt to use GPU for FAISS operations when building internally. Defaults to False.
-        nprobe (int, optional): Ignored (relevant for IVF indices, not IndexFlat).
-        faiss_index (faiss.Index, optional): A pre-built and trained FAISS index (can be any type).
+        use_gpu (bool): If True, attempt to use GPU for FAISS operations when building internally.
+        nprobe (int, optional): Ignored.
+        faiss_index (faiss.Index, optional): A pre-built FAISS index.
+        knn_threshold_type (str): Type of thresholding ('none', 'median_k', 'std_dev_k').
+        knn_std_dev_factor (float): Factor for 'std_dev_k' threshold (mean - factor * std_dev).
 
     Returns:
-        tuple: (rows, cols, values) representing the graph in COO format
-               with normalized edge weights.
+        tuple: (rows, cols, values) representing the filtered graph in COO format
+               with RAW similarity scores (higher is better).
     """
     t_start_knn = time.time()
     device = X.device
     n, d = X.shape
+    print(f"[knn_fast] Starting KNN search. Threshold type: {knn_threshold_type}, k: {k}, std_factor: {knn_std_dev_factor}")
 
-    # --- Preprocessing ---
+    # --- Preprocessing, Index Building/Loading, Search ---
+    t_preproc_start = time.time()
     X_normalized = F.normalize(X, dim=1, p=2)
     X_np = X_normalized.cpu().detach().numpy().astype('float32')
     X_np = np.ascontiguousarray(X_np)
-    # ---------------------
-
+    # print(f"  [knn_fast] Preprocessing time: {time.time() - t_preproc_start:.4f}s") # Less verbose
     index_built_or_trained = False
     internal_index = None
-
+    t_index_start = time.time()
     if faiss_index is None:
+        # print("  [knn_fast] Building internal FAISS index (IndexFlatIP)...") # Less verbose
         index_built_or_trained = True
-        
         actual_use_gpu_build = use_gpu and faiss.get_num_gpus() > 0
         faiss_device_info = "CPU"
-
         if actual_use_gpu_build:
             try:
+                # print("    [knn_fast] Attempting GPU index build...") # Less verbose
                 faiss_device_info = "GPU"
                 res = faiss.StandardGpuResources()
                 cpu_index = faiss.IndexFlatIP(d)
@@ -396,68 +399,131 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None):
                 gpu_index_internal.add(X_np)
                 internal_index = gpu_index_internal
             except Exception as e:
+                print(f"    [knn_fast] GPU index build failed: {e}. Falling back to CPU.")
                 actual_use_gpu_build = False
-                internal_index = None
-
+                internal_index = None # Reset
         if not actual_use_gpu_build:
+            # print("    [knn_fast] Building CPU index...") # Less verbose
             faiss_device_info = "CPU"
             index_cpu_internal = faiss.IndexFlatIP(d)
             index_cpu_internal.add(X_np)
             internal_index = index_cpu_internal
-
         faiss_index = internal_index
         if faiss_index is None:
              raise RuntimeError("Failed to build internal FAISS index on both CPU and GPU.")
-    else:
-        faiss_device_info = "Unknown"
-
-    if faiss_index is None:
-        raise RuntimeError("FAISS index is None after build/setup phase.")
-
-    # --- Search --- 
+        # print(f"  [knn_fast] Internal index built on {faiss_device_info}.") # Less verbose
+    # else: # Less verbose
+    #     print("  [knn_fast] Using pre-built FAISS index.")
+    #     try:
+    #          gpu_res = faiss.downcast_index(faiss_index).getResources()
+    #          faiss_device_info = "GPU (pre-built)"
+    #     except AttributeError:
+    #          faiss_device_info = "CPU or Unknown (pre-built)"
+    #     print(f"  [knn_fast] Pre-built index type: {type(faiss_index).__name__} on {faiss_device_info}")
+    # print(f"  [knn_fast] Index build/setup time: {time.time() - t_index_start:.4f}s") # Less verbose
+    # print(f"  [knn_fast] Searching for k+1={k+1} neighbors...") # Less verbose
+    t_search_start = time.time()
     vals_np, inds_np = faiss_index.search(X_np, k + 1)
+    # print(f"  [knn_fast] FAISS search time: {time.time() - t_search_start:.4f}s") # Less verbose
+    # --- End of setup part ---
 
-    # --- Post-processing ---
-    vals = torch.from_numpy(vals_np).to(device)
-    inds = torch.from_numpy(inds_np).to(device)
+    # --- Filtering and Thresholding ---
+    # print("  [knn_fast] Filtering neighbors...") # Less verbose
+    t_filter_start = time.time()
+    filtered_rows_list = []
+    filtered_cols_list = []
+    filtered_vals_list = []
 
-    valid_mask_faiss = (inds != -1)
-    vals = torch.clamp(vals, min=0.0)
+    similarity_threshold = -np.inf # Default: keep all valid neighbors
 
-    rows_full = torch.arange(n, device=device).view(-1, 1).repeat(1, k + 1)
-    rows = rows_full[valid_mask_faiss]
-    cols = inds[valid_mask_faiss]
-    values = vals[valid_mask_faiss]
+    # Calculate threshold if needed
+    if knn_threshold_type != 'none' and k > 0 and vals_np.shape[1] > k: # Check k and if thresholding enabled
+        # Get similarities of the k-th neighbor (index k)
+        kth_similarities = vals_np[:, k]
+        # Consider only valid neighbors for threshold calculation
+        valid_indices_mask = inds_np[:, k] != -1
+        if np.any(valid_indices_mask):
+            valid_kth_similarities = kth_similarities[valid_indices_mask]
 
-    # --- Normalization ---
-    vals_safe = vals.clone()
-    vals_safe[~valid_mask_faiss] = 0.0
+            if knn_threshold_type == 'median_k':
+                similarity_threshold = np.median(valid_kth_similarities)
+                print(f"    [knn_fast] Calculated 'median_k' threshold: {similarity_threshold:.4f} (based on {len(valid_kth_similarities)} nodes' k-th neighbor)")
 
-    norm_row = torch.sum(vals_safe, dim=1)
+            elif knn_threshold_type == 'std_dev_k':
+                mean_kth_sim = np.mean(valid_kth_similarities)
+                std_kth_sim = np.std(valid_kth_similarities)
+                # Handle std_dev being zero or very small
+                if std_kth_sim < EOS:
+                     print(f"    [knn_fast] Warning: Standard deviation of k-th similarities is near zero ({std_kth_sim:.4e}). Using mean ({mean_kth_sim:.4f}) as threshold.")
+                     similarity_threshold = mean_kth_sim
+                else:
+                     similarity_threshold = mean_kth_sim - knn_std_dev_factor * std_kth_sim
+                     print(f"    [knn_fast] Calculated 'std_dev_k' threshold: {similarity_threshold:.4f} (mean={mean_kth_sim:.4f}, std={std_kth_sim:.4f}, factor={knn_std_dev_factor})")
 
-    norm_col = torch.zeros(n, device=device)
-    if rows.numel() > 0:
-        valid_cols_mask = (cols >= 0) & (cols < n)
-        if not valid_cols_mask.all():
-            rows = rows[valid_cols_mask]
-            values = values[valid_cols_mask]
-            cols = cols[valid_cols_mask]
+            # Add elif for 'percentile_k' here if implemented later
 
-        if cols.numel() > 0:
-            norm_col.index_add_(0, cols, values)
+            else: # Should not happen if choices are enforced by argparse
+                 print(f"    [knn_fast] Unknown threshold type '{knn_threshold_type}'. Keeping all neighbors.")
 
-    norm = norm_row + norm_col + EOS
+        else: # No valid k-th neighbors found
+             print(f"    [knn_fast] Warning: No valid k-th neighbors found. Cannot compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
 
-    norm_rows_safe = torch.clamp(norm[rows], min=EOS)
-    norm_cols_safe = torch.clamp(norm[cols], min=EOS)
-    norm_rows_sqrt_inv = torch.pow(norm_rows_safe, -0.5)
-    norm_cols_sqrt_inv = torch.pow(norm_cols_safe, -0.5)
-    values *= norm_rows_sqrt_inv * norm_cols_sqrt_inv
+    elif knn_threshold_type != 'none': # k=0 or not enough neighbors found
+        print(f"    [knn_fast] Warning: k={k} is too small or not enough neighbors found to compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
 
-    rows = rows.long()
-    cols = cols.long()
+    # --- Filtering Logic ---
+    num_kept_edges = 0
+    for i in range(n):
+        kept_node_neighbors = 0
+        first_neighbor_idx = -1
+        first_neighbor_sim = -np.inf
+        closest_valid_neighbor_found = False
+        # Find and add the closest valid neighbor first
+        for j in range(1, k + 1):
+            if j >= inds_np.shape[1]: break
+            neighbor_idx = inds_np[i, j]
+            if neighbor_idx != -1 and neighbor_idx < n:
+                 first_neighbor_idx = neighbor_idx
+                 first_neighbor_sim = vals_np[i, j]
+                 closest_valid_neighbor_found = True
+                 filtered_rows_list.append(i)
+                 filtered_cols_list.append(first_neighbor_idx)
+                 filtered_vals_list.append(first_neighbor_sim)
+                 kept_node_neighbors += 1
+                 num_kept_edges += 1
+                 break # Added the closest one
+        # Skip if no valid neighbor was found at all
+        if not closest_valid_neighbor_found: continue
+        # Add other neighbors if they are above threshold
+        for j in range(1, k + 1):
+             if j >= inds_np.shape[1]: break
+             neighbor_idx = inds_np[i, j]
+             if neighbor_idx == -1 or neighbor_idx >= n: continue
+             if neighbor_idx == first_neighbor_idx: continue # Already added
+             similarity = vals_np[i, j]
+             # Keep if similarity meets threshold
+             if similarity >= similarity_threshold:
+                 filtered_rows_list.append(i)
+                 filtered_cols_list.append(neighbor_idx)
+                 filtered_vals_list.append(similarity)
+                 kept_node_neighbors += 1
+                 num_kept_edges += 1
+    # --- End Filtering ---
 
-    return rows, cols, values
+    # print(f"  [knn_fast] Filtering done. Kept {num_kept_edges} edges. Time: {time.time() - t_filter_start:.4f}s") # Less verbose
+
+    # Convert lists to tensors
+    if num_kept_edges > 0:
+        rows = torch.tensor(filtered_rows_list, dtype=torch.long, device=device)
+        cols = torch.tensor(filtered_cols_list, dtype=torch.long, device=device)
+        values = torch.tensor(filtered_vals_list, dtype=torch.float32, device=device)
+    else:
+        rows = torch.tensor([], dtype=torch.long, device=device)
+        cols = torch.tensor([], dtype=torch.long, device=device)
+        values = torch.tensor([], dtype=torch.float32, device=device)
+
+    # print(f"[knn_fast] Finished. Total time: {time.time() - t_start_knn:.4f}s. Returning {rows.shape[0]} edges.") # Less verbose
+    return rows, cols, values # Return raw similarities
 
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):

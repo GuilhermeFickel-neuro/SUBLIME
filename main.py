@@ -840,10 +840,10 @@ class Experiment:
                     print(f"{arcface_msg} loss with scale={args.arcface_scale}, margin={args.arcface_margin}")
             
             if use_classification_head:
-                 gcl_params.update({
-                      'classification_dropout': args.classification_dropout,
-                      'classification_head_layers': args.classification_head_layers
-                 })
+                gcl_params.update({
+                    'classification_dropout': args.classification_dropout,
+                    'classification_head_layers': args.classification_head_layers
+                })
 
             # Initialize the model
             model = GCL(**gcl_params)
@@ -1069,7 +1069,7 @@ class Experiment:
                     if args.use_arcface:
                         if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
                             try:
-                                arcface_output, sampled_labels = model.arcface(emb2, arcface_labels) # Use learner embedding (emb2)
+                                arcface_output, sampled_labels = model.arcface(emb2, arcface_labels)
                                 arcface_loss = arcface_loss_with_sampling(arcface_output, sampled_labels)
                                 total_loss += args.arcface_weight * arcface_loss
                                 print_loss_components['arcface_sampled'] = arcface_loss.item()
@@ -1446,6 +1446,15 @@ def create_parser():
     # New argument for relationship dataset
     parser.add_argument('-relationship_dataset', type=str, default=None,
                         help='Path to the relationship dataset CSV file (e.g., relationships.csv)')
+
+    # New argument for KNN threshold type
+    parser.add_argument('--knn_threshold_type', type=str, default='none', choices=['none', 'median_k', 'std_dev_k'],
+                        help='Type of thresholding for KNN graph learners (none, median_k, std_dev_k)')
+    parser.add_argument('--knn_std_dev_factor', type=float, default=1.0,
+                        help='Factor (alpha) for std_dev_k threshold (mean - alpha*std_dev)')
+
+    # Model Hyperparameters
+    parser.add_argument('--model_type', type=str, default='sublime', help='Model type (sublime)')
 
     return parser
 
