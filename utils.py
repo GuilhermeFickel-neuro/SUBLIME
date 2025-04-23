@@ -361,9 +361,10 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
         k (int): Number of neighbors to find for each node.
         b (int): Batch size parameter (kept for backward compatibility, not used).
         use_gpu (bool): If True, attempt to use GPU for FAISS operations when building internally.
-        nprobe (int, optional): Ignored.
+        nprobe (int, optional): Ignored for IndexFlatIP.
         faiss_index (faiss.Index, optional): A pre-built FAISS index.
         knn_threshold_type (str): Type of thresholding ('none', 'median_k', 'std_dev_k').
+                                  Ensures the closest valid neighbor is kept, others are thresholded.
         knn_std_dev_factor (float): Factor for 'std_dev_k' threshold (mean - factor * std_dev).
 
     Returns:
@@ -373,20 +374,20 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
     t_start_knn = time.time()
     device = X.device
     n, d = X.shape
-    print(f"[knn_fast] Starting KNN search. Threshold type: {knn_threshold_type}, k: {k}, std_factor: {knn_std_dev_factor}")
+    # print(f"[knn_fast] Starting KNN search. Threshold type: {knn_threshold_type}, k: {k}, std_factor: {knn_std_dev_factor}") # Less verbose
 
     # --- Preprocessing, Index Building/Loading, Search ---
     t_preproc_start = time.time()
     X_normalized = F.normalize(X, dim=1, p=2)
+    # Ensure data is contiguous AFTER normalization and potential device transfer
     X_np = X_normalized.cpu().detach().numpy().astype('float32')
-    X_np = np.ascontiguousarray(X_np)
+    X_np = np.ascontiguousarray(X_np) # Ensure contiguous array for FAISS
     # print(f"  [knn_fast] Preprocessing time: {time.time() - t_preproc_start:.4f}s") # Less verbose
-    index_built_or_trained = False
-    internal_index = None
+
+    internal_index = None # Keep track if we built one internally
     t_index_start = time.time()
     if faiss_index is None:
         # print("  [knn_fast] Building internal FAISS index (IndexFlatIP)...") # Less verbose
-        index_built_or_trained = True
         actual_use_gpu_build = use_gpu and faiss.get_num_gpus() > 0
         faiss_device_info = "CPU"
         if actual_use_gpu_build:
@@ -401,29 +402,35 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
             except Exception as e:
                 print(f"    [knn_fast] GPU index build failed: {e}. Falling back to CPU.")
                 actual_use_gpu_build = False
-                internal_index = None # Reset
+                # internal_index remains None, will be built on CPU below
+        # Build CPU index if GPU failed or wasn't requested/available
         if not actual_use_gpu_build:
             # print("    [knn_fast] Building CPU index...") # Less verbose
             faiss_device_info = "CPU"
             index_cpu_internal = faiss.IndexFlatIP(d)
             index_cpu_internal.add(X_np)
             internal_index = index_cpu_internal
-        faiss_index = internal_index
-        if faiss_index is None:
+
+        if internal_index is None: # Check if index building failed completely
              raise RuntimeError("Failed to build internal FAISS index on both CPU and GPU.")
+
+        faiss_index = internal_index # Use the internally built index
         # print(f"  [knn_fast] Internal index built on {faiss_device_info}.") # Less verbose
-    # else: # Less verbose
-    #     print("  [knn_fast] Using pre-built FAISS index.")
-    #     try:
-    #          gpu_res = faiss.downcast_index(faiss_index).getResources()
-    #          faiss_device_info = "GPU (pre-built)"
-    #     except AttributeError:
-    #          faiss_device_info = "CPU or Unknown (pre-built)"
-    #     print(f"  [knn_fast] Pre-built index type: {type(faiss_index).__name__} on {faiss_device_info}")
+    # else: # Using pre-built index
+        # Determine device of pre-built index (best effort)
+        # try:
+        #      gpu_res = faiss.downcast_index(faiss_index).getResources()
+        #      faiss_device_info = "GPU (pre-built)"
+        # except AttributeError:
+        #      faiss_device_info = "CPU or Unknown (pre-built)"
+        # print(f"  [knn_fast] Using pre-built FAISS index: {type(faiss_index).__name__} on {faiss_device_info}")
+
     # print(f"  [knn_fast] Index build/setup time: {time.time() - t_index_start:.4f}s") # Less verbose
+
     # print(f"  [knn_fast] Searching for k+1={k+1} neighbors...") # Less verbose
     t_search_start = time.time()
-    vals_np, inds_np = faiss_index.search(X_np, k + 1)
+    # Perform the search using the determined index (either provided or built)
+    vals_np, inds_np = faiss_index.search(X_np, k + 1) # Search for k+1 (includes self)
     # print(f"  [knn_fast] FAISS search time: {time.time() - t_search_start:.4f}s") # Less verbose
     # --- End of setup part ---
 
@@ -436,78 +443,69 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
 
     similarity_threshold = -np.inf # Default: keep all valid neighbors
 
-    # Calculate threshold if needed
-    if knn_threshold_type != 'none' and k > 0 and vals_np.shape[1] > k: # Check k and if thresholding enabled
-        # Get similarities of the k-th neighbor (index k)
-        kth_similarities = vals_np[:, k]
-        # Consider only valid neighbors for threshold calculation
-        valid_indices_mask = inds_np[:, k] != -1
-        if np.any(valid_indices_mask):
-            valid_kth_similarities = kth_similarities[valid_indices_mask]
+    # Calculate threshold if needed (only if type is not 'none' and k > 0)
+    if knn_threshold_type != 'none' and k > 0:
+        # Get similarities of the k-th neighbor (index k, since index 0 is self)
+        # Ensure we don't index out of bounds if k+1 > number of results
+        kth_neighbor_col_idx = min(k, vals_np.shape[1] - 1)
+        if kth_neighbor_col_idx > 0: # Only calculate if k > 0 and results exist
+            kth_similarities = vals_np[:, kth_neighbor_col_idx]
+            # Consider only valid neighbors for threshold calculation (index != -1)
+            valid_indices_mask = inds_np[:, kth_neighbor_col_idx] != -1
+            if np.any(valid_indices_mask):
+                valid_kth_similarities = kth_similarities[valid_indices_mask]
 
-            if knn_threshold_type == 'median_k':
-                similarity_threshold = np.median(valid_kth_similarities)
-                print(f"    [knn_fast] Calculated 'median_k' threshold: {similarity_threshold:.4f} (based on {len(valid_kth_similarities)} nodes' k-th neighbor)")
+                if knn_threshold_type == 'median_k':
+                    similarity_threshold = np.median(valid_kth_similarities)
+                    print(f"    [knn_fast] Calculated 'median_k' threshold: {similarity_threshold:.4f} (based on {len(valid_kth_similarities)} nodes' k-th neighbor)")
 
-            elif knn_threshold_type == 'std_dev_k':
-                mean_kth_sim = np.mean(valid_kth_similarities)
-                std_kth_sim = np.std(valid_kth_similarities)
-                # Handle std_dev being zero or very small
-                if std_kth_sim < EOS:
-                     print(f"    [knn_fast] Warning: Standard deviation of k-th similarities is near zero ({std_kth_sim:.4e}). Using mean ({mean_kth_sim:.4f}) as threshold.")
-                     similarity_threshold = mean_kth_sim
-                else:
-                     similarity_threshold = mean_kth_sim - knn_std_dev_factor * std_kth_sim
-                     print(f"    [knn_fast] Calculated 'std_dev_k' threshold: {similarity_threshold:.4f} (mean={mean_kth_sim:.4f}, std={std_kth_sim:.4f}, factor={knn_std_dev_factor})")
+                elif knn_threshold_type == 'std_dev_k':
+                    mean_kth_sim = np.mean(valid_kth_similarities)
+                    std_kth_sim = np.std(valid_kth_similarities)
+                    # Handle std_dev being zero or very small
+                    if std_kth_sim < EOS:
+                         print(f"    [knn_fast] Warning: Standard deviation of k-th similarities is near zero ({std_kth_sim:.4e}). Using mean ({mean_kth_sim:.4f}) as threshold.")
+                         similarity_threshold = mean_kth_sim
+                    else:
+                         similarity_threshold = mean_kth_sim - knn_std_dev_factor * std_kth_sim
+                         print(f"    [knn_fast] Calculated 'std_dev_k' threshold: {similarity_threshold:.4f} (mean={mean_kth_sim:.4f}, std={std_kth_sim:.4f}, factor={knn_std_dev_factor})")
+                else: # Should not happen if choices are enforced by argparse
+                     print(f"    [knn_fast] Unknown threshold type '{knn_threshold_type}'. Keeping all neighbors.")
+            else: # No valid k-th neighbors found
+                 print(f"    [knn_fast] Warning: No valid k-th neighbors found. Cannot compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
+        else: # k=0 or no neighbors found beyond self
+            print(f"    [knn_fast] Warning: k={k} is too small or not enough neighbors found to compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
 
-            # Add elif for 'percentile_k' here if implemented later
 
-            else: # Should not happen if choices are enforced by argparse
-                 print(f"    [knn_fast] Unknown threshold type '{knn_threshold_type}'. Keeping all neighbors.")
-
-        else: # No valid k-th neighbors found
-             print(f"    [knn_fast] Warning: No valid k-th neighbors found. Cannot compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
-
-    elif knn_threshold_type != 'none': # k=0 or not enough neighbors found
-        print(f"    [knn_fast] Warning: k={k} is too small or not enough neighbors found to compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
-
-    # --- Filtering Logic ---
+    # --- Filtering Logic (Single Pass) ---
     num_kept_edges = 0
-    for i in range(n):
-        kept_node_neighbors = 0
-        first_neighbor_idx = -1
-        first_neighbor_sim = -np.inf
-        closest_valid_neighbor_found = False
-        # Find and add the closest valid neighbor first
-        for j in range(1, k + 1):
-            if j >= inds_np.shape[1]: break
+    for i in range(n): # For each node
+        closest_valid_neighbor_added = False
+        # Iterate through neighbors found by FAISS (excluding self at index 0)
+        for j in range(1, inds_np.shape[1]): # Iterate up to k+1 potential neighbors
             neighbor_idx = inds_np[i, j]
-            if neighbor_idx != -1 and neighbor_idx < n:
-                 first_neighbor_idx = neighbor_idx
-                 first_neighbor_sim = vals_np[i, j]
-                 closest_valid_neighbor_found = True
-                 filtered_rows_list.append(i)
-                 filtered_cols_list.append(first_neighbor_idx)
-                 filtered_vals_list.append(first_neighbor_sim)
-                 kept_node_neighbors += 1
-                 num_kept_edges += 1
-                 break # Added the closest one
-        # Skip if no valid neighbor was found at all
-        if not closest_valid_neighbor_found: continue
-        # Add other neighbors if they are above threshold
-        for j in range(1, k + 1):
-             if j >= inds_np.shape[1]: break
-             neighbor_idx = inds_np[i, j]
-             if neighbor_idx == -1 or neighbor_idx >= n: continue
-             if neighbor_idx == first_neighbor_idx: continue # Already added
-             similarity = vals_np[i, j]
-             # Keep if similarity meets threshold
-             if similarity >= similarity_threshold:
-                 filtered_rows_list.append(i)
-                 filtered_cols_list.append(neighbor_idx)
-                 filtered_vals_list.append(similarity)
-                 kept_node_neighbors += 1
-                 num_kept_edges += 1
+            similarity = vals_np[i, j]
+
+            # Check if the neighbor index is valid
+            if neighbor_idx == -1 or neighbor_idx >= n:
+                continue # Skip invalid neighbors
+
+            # Logic:
+            # 1. If we haven't added the closest valid neighbor yet, add this one.
+            # 2. If we have added the closest, only add subsequent neighbors if they meet the threshold.
+            add_edge = False
+            if not closest_valid_neighbor_added:
+                add_edge = True
+                closest_valid_neighbor_added = True # Mark that we've added the first valid one
+            elif similarity >= similarity_threshold:
+                add_edge = True
+
+            if add_edge:
+                filtered_rows_list.append(i)
+                filtered_cols_list.append(neighbor_idx)
+                filtered_vals_list.append(similarity)
+                num_kept_edges += 1
+
     # --- End Filtering ---
 
     # print(f"  [knn_fast] Filtering done. Kept {num_kept_edges} edges. Time: {time.time() - t_filter_start:.4f}s") # Less verbose
