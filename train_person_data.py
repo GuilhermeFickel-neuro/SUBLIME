@@ -251,7 +251,7 @@ def load_person_data(args):
     if hasattr(args, 'relationship_dataset') and args.relationship_dataset:
         print(f"Loading relationship dataset from {args.relationship_dataset}")
         try:
-            df_relationships = pd.read_csv(args.relationship_dataset) # Assuming default delimiter is comma, adjust if needed
+            df_relationships = pd.read_csv(args.relationship_dataset, sep='\t') # Assuming default delimiter is comma, adjust if needed
             # Minimal validation: Check if required columns exist
             required_rel_cols = ['CPF', 'CPF_VINCULO'] # Assuming these are the linking columns
             # Use find_column_case_insensitive
