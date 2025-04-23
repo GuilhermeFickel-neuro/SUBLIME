@@ -28,6 +28,7 @@ echo "Installing PyTorch and dependencies..."
 conda install -y -c nvidia/label/cuda-11.7.1 cuda-toolkit=11.7.1
 conda install -y pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
 conda install -y -c dglteam/label/cu117 'dgl<2'
+conda install faiss-gpu cudatoolkit=11.7 -c pytorch -c nvidia
 
 echo "Installing requirements from requirements.txt..."
 # Install pip requirements

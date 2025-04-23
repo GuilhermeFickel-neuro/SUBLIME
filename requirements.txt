@@ -14,9 +14,10 @@ torch_scatter
 ogb
 numpy<2
 munkres
-faiss-cpu
 xgboost
 catboost
 lightgbm
 optuna
 boto3
+optuna-integration
+setuptools==59.5.0
