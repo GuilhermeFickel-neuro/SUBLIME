@@ -22,7 +22,7 @@ def get_memory_usage():
     return process.memory_info().rss / (1024 * 1024 * 1024)  # Convert bytes to GB
 
 # New function to build and return a FAISS index
-def build_faiss_index(features, k=10, use_gpu=False, nprobe=None):
+def build_faiss_index(features, k=10, use_gpu=True, nprobe=None):
     """
     Build and return a FAISS index (now using IndexFlatIP) for the given features.
     This can be reused to avoid rebuilding the index on each call.
@@ -351,7 +351,7 @@ def top_k(raw_graph, K):
     return sparse_graph
 
 
-def knn_fast(X, k, b=None, use_gpu=False, nprobe=None, faiss_index=None):
+def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None):
     """
     Optimized KNN implementation using FAISS (now defaults to IndexFlatIP if building internally).
     Includes detailed timing prints and option to reuse a pre-built index.
