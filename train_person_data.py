@@ -512,8 +512,6 @@ def load_person_data(args):
               initial_graph = torch.eye(n_total_samples, dtype=torch.float32, device=device)
          print(f"Using identity matrix ({ 'sparse' if args.sparse else 'dense'}) on {device}.")
 
-    # Delete features_for_knn as it's now embedded in adj_knn_sparse
-    del features_for_knn
     # <<< DELETE START
     del adj_knn_sparse # No longer needed after combination
     if adj_rel_sparse is not None:
