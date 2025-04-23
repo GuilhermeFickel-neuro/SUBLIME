@@ -1294,6 +1294,17 @@ class Experiment:
                 optimizer_cl.load_state_dict(checkpoint['optimizer_cl_state_dict'])
                 optimizer_learner.load_state_dict(checkpoint['optimizer_learner_state_dict'])
 
+                # Manually move optimizer state tensors to the correct device
+                for state in optimizer_cl.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
+                
+                for state in optimizer_learner.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
+
                 start_epoch = checkpoint['epoch'] + 1
                 anchor_adj = checkpoint['anchor_adj'] # Load anchor_adj
 
@@ -1431,6 +1442,10 @@ def create_parser():
     # Gradient Clipping
     parser.add_argument('-clip_norm', type=float, default=1.0,
                        help='Max norm for gradient clipping (0 to disable)')
+
+    # New argument for relationship dataset
+    parser.add_argument('-relationship_dataset', type=str, default=None,
+                        help='Path to the relationship dataset CSV file (e.g., relationships.csv)')
 
     return parser
 
