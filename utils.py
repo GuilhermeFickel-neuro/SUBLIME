@@ -364,8 +364,8 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
         nprobe (int, optional): Ignored for IndexFlatIP.
         faiss_index (faiss.Index, optional): A pre-built FAISS index.
         knn_threshold_type (str): Type of thresholding ('none', 'median_k', 'std_dev_k').
-                                  Ensures the closest valid neighbor is kept, others are thresholded.
-        knn_std_dev_factor (float): Factor for 'std_dev_k' threshold (mean - factor * std_dev).
+                                  Ensures the closest valid neighbor is kept, others are thresholded based on similarity.
+        knn_std_dev_factor (float): Factor for 'std_dev_k' threshold (mean - factor * std_dev of k-th similarities).
 
     Returns:
         tuple: (rows, cols, values) representing the filtered graph in COO format
@@ -467,6 +467,7 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
                          print(f"    [knn_fast] Warning: Standard deviation of k-th similarities is near zero ({std_kth_sim:.4e}). Using mean ({mean_kth_sim:.4f}) as threshold.")
                          similarity_threshold = mean_kth_sim
                     else:
+                         # Higher similarity is better, so threshold is mean - factor * std
                          similarity_threshold = mean_kth_sim - knn_std_dev_factor * std_kth_sim
                          print(f"    [knn_fast] Calculated 'std_dev_k' threshold: {similarity_threshold:.4f} (mean={mean_kth_sim:.4f}, std={std_kth_sim:.4f}, factor={knn_std_dev_factor})")
                 else: # Should not happen if choices are enforced by argparse
@@ -497,7 +498,7 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
             if not closest_valid_neighbor_added:
                 add_edge = True
                 closest_valid_neighbor_added = True # Mark that we've added the first valid one
-            elif similarity >= similarity_threshold:
+            elif similarity >= similarity_threshold: # Higher similarity is better
                 add_edge = True
 
             if add_edge:

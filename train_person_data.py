@@ -10,11 +10,22 @@ from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from main import Experiment
-from utils import sparse_mx_to_torch_sparse_tensor, faiss_kneighbors_graph, get_memory_usage
+from utils import sparse_mx_to_torch_sparse_tensor, knn_fast, get_memory_usage
 from main import create_parser # Import the shared parser creation function
+import warnings
+import gc # Import garbage collector
 
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# <<< INSERT START
+def find_column_case_insensitive(df_columns, target_name_lower):
+    """Finds the actual column name in a list of columns, ignoring case."""
+    for col in df_columns:
+        if col.lower() == target_name_lower:
+            return col
+    return None
+# <<< INSERT END
 
 def _check_processed_data(data, dataset_name=""):
     """Internal helper to check processed data for issues."""
@@ -235,13 +246,35 @@ def load_person_data(args):
     else:
         print("No annotated dataset specified.")
 
+    # === 2.5 Load Relationship Data (if specified) ===
+    df_relationships = None
+    if hasattr(args, 'relationship_dataset') and args.relationship_dataset:
+        print(f"Loading relationship dataset from {args.relationship_dataset}")
+        try:
+            df_relationships = pd.read_csv(args.relationship_dataset) # Assuming default delimiter is comma, adjust if needed
+            # Minimal validation: Check if required columns exist
+            required_rel_cols = ['CPF', 'CPF_VINCULO'] # Assuming these are the linking columns
+            # Use find_column_case_insensitive
+            actual_cpf_rel_col1 = find_column_case_insensitive(df_relationships.columns, required_rel_cols[0].lower())
+            actual_cpf_rel_col2 = find_column_case_insensitive(df_relationships.columns, required_rel_cols[1].lower())
+            if not actual_cpf_rel_col1 or not actual_cpf_rel_col2:
+                raise ValueError(f"Relationship dataset missing required columns '{required_rel_cols}' (case-insensitive). Found columns: {df_relationships.columns.tolist()}")
+            print(f"Found relationship columns: '{actual_cpf_rel_col1}', '{actual_cpf_rel_col2}'")
+        except FileNotFoundError:
+            print(f"Error: Relationship dataset file not found at {args.relationship_dataset}")
+            raise
+        except Exception as e:
+            print(f"Error loading or validating relationship dataset: {e}")
+            # Optionally decide whether to raise or just continue without relationships
+            raise
+    else:
+        print("No relationship dataset specified.")
 
     # === 3. Preprocess Data ===
     # Pass both dataframes, preprocessor handles fitting/loading and transforming
     processed_main, processed_annotated, preprocessor = preprocess_mixed_data(
         df_main, df_annotated, model_dir='sublime_models', target_column=target_column
     )
-
 
     # === 4. Combine Features ===
     if processed_annotated is not None:
@@ -256,6 +289,45 @@ def load_person_data(args):
     print(f"Combined features shape: ({n_total_samples}, {nfeats})")
     features = torch.FloatTensor(combined_features_np).to(device)
 
+    # === 4.5 Create CPF to Index Mapping ===
+    print("Creating CPF to index mapping...")
+    # IMPORTANT ASSUMPTION: The 'CPF' column exists in the original df_main and df_annotated
+    # and their concatenation order matches combined_features_np. Need case-insensitive find.
+    cpf_col_target_name = 'CPF'
+    actual_cpf_col_main = find_column_case_insensitive(df_main.columns, cpf_col_target_name.lower())
+    if actual_cpf_col_main is None:
+        raise ValueError(f"Main dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive).")
+
+    all_cpfs_list = [df_main[actual_cpf_col_main]]
+
+    # Reload annotated df briefly JUST to get CPF column if needed, then discard
+    df_annotated_temp_for_cpf = None
+    actual_cpf_col_annotated = None
+    if args.annotated_dataset:
+        try:
+            df_annotated_temp_for_cpf = pd.read_csv(args.annotated_dataset, delimiter='\t')
+            actual_cpf_col_annotated = find_column_case_insensitive(df_annotated_temp_for_cpf.columns, cpf_col_target_name.lower())
+            if actual_cpf_col_annotated is None:
+                 raise ValueError(f"Annotated dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive).")
+            all_cpfs_list.append(df_annotated_temp_for_cpf[actual_cpf_col_annotated])
+        except Exception as e:
+            print(f"Error loading annotated dataset for CPF mapping: {e}")
+            raise
+        finally:
+             if df_annotated_temp_for_cpf is not None:
+                 del df_annotated_temp_for_cpf # Free memory
+
+    combined_cpfs = pd.concat(all_cpfs_list, ignore_index=True)
+    if len(combined_cpfs) != n_total_samples:
+         raise ValueError(f"Length of combined CPFs ({len(combined_cpfs)}) does not match total samples ({n_total_samples}).")
+
+    cpf_to_index = {cpf: idx for idx, cpf in enumerate(combined_cpfs)}
+    print(f"Created CPF to index mapping for {len(cpf_to_index)} unique CPFs / {n_total_samples} total samples.")
+    # Delete combined CPF series and original dataframes no longer needed
+    del combined_cpfs, df_main # df_main is no longer needed after preprocessing and CPF extraction
+    if 'df_annotated' in locals(): del df_annotated # Delete the potentially modified annotated df
+    gc.collect()
+    print(f"Original dataframes and combined CPFs deleted. Memory usage: {get_memory_usage():.2f} GB")
 
     # === 5. Combine Labels ===
     if extracted_binary_labels is not None:
@@ -300,32 +372,156 @@ def load_person_data(args):
 
 
     # === 8. Calculate Combined Initial Graph Structure ===
-    print(f"Constructing initial graph structure with k={args.k} using FAISS (cosine similarity) on COMBINED features ({n_total_samples} nodes)...")
-    initial_graph = None
+    initial_graph = None # Initialize final graph variable
+
+    # --- 8a. KNN Graph (Feature Similarity) ---
+    print(f"\nConstructing KNN graph (k={args.k}, cosine, threshold={args.knn_threshold_type}) on processed features...")
+    adj_knn_sparse = None
     try:
         if features_for_knn.shape[1] == 0:
             raise ValueError("Cannot compute KNN graph with zero features.")
 
-        initial_graph_sparse = faiss_kneighbors_graph(features_for_knn, k=args.k, metric='cosine')
-        print(f"Initial combined graph computed. Shape: {initial_graph_sparse.shape}, Non-zero entries: {initial_graph_sparse.nnz}")
+        # Use knn_fast which returns rows, cols, values tensors
+        # Convert numpy features to tensor first
+        features_knn_tensor = torch.tensor(features_for_knn, dtype=torch.float32).to(device)
+        knn_rows, knn_cols, knn_vals = knn_fast(
+            features_knn_tensor,
+            k=args.k,
+            use_gpu=(device.type == 'cuda'),
+            knn_threshold_type=args.knn_threshold_type,
+            knn_std_dev_factor=args.knn_std_dev_factor
+        )
+        # Create sparse scipy matrix from the COO tensors (move to CPU)
+        n = features_knn_tensor.shape[0]
+        adj_knn_sparse = sp.csr_matrix((knn_vals.cpu().numpy(), (knn_rows.cpu().numpy(), knn_cols.cpu().numpy())),
+                                      shape=(n, n))
+        # Make knn graph binary (0/1) as base for combination
+        adj_knn_sparse = adj_knn_sparse.astype(bool).astype(np.float32)
+        # Symmetrize the KNN graph (A = A + A.T)
+        adj_knn_sparse = adj_knn_sparse + adj_knn_sparse.T
+        adj_knn_sparse = adj_knn_sparse.astype(bool).astype(np.float32)
 
-        if args.sparse:
-            initial_graph = sparse_mx_to_torch_sparse_tensor(initial_graph_sparse).to(device)
-            print("Initial combined graph prepared as sparse torch tensor.")
+        print(f"  KNN graph computed using knn_fast. Shape: {adj_knn_sparse.shape}, Non-zero entries: {adj_knn_sparse.nnz}")
+    except Exception as e:
+        print(f"Error during KNN graph construction with knn_fast: {e}")
+        adj_knn_sparse = sp.eye(n_total_samples, dtype=np.float32, format='csr') # Fallback
+        print(f"  Using identity matrix for KNN graph. Shape: {adj_knn_sparse.shape}, nnz: {adj_knn_sparse.nnz}")
+
+    # Delete tensor used only for KNN computation
+    if 'features_knn_tensor' in locals():
+        del features_knn_tensor
+        gc.collect()
+        print(f"  KNN features tensor deleted. Memory: {get_memory_usage():.2f} GB")
+
+    # Delete features_for_knn as it's now embedded in adj_knn_sparse
+    del features_for_knn
+
+    # --- 8b. Relationship Graph (Explicit Links) ---
+    adj_rel_sparse = None
+    if df_relationships is not None:
+        print("Constructing relationship graph...")
+        rows, cols, data = [], [], []
+        valid_edges = 0
+        skipped_edges = 0
+        skipped_self_loops = 0
+        missing_cpf1 = 0
+        missing_cpf2 = 0
+
+        # Use actual column names found earlier
+        actual_cpf_rel_col1_used = actual_cpf_rel_col1
+        actual_cpf_rel_col2_used = actual_cpf_rel_col2
+
+        for _, row in df_relationships.iterrows():
+            cpf1 = row[actual_cpf_rel_col1_used]
+            cpf2 = row[actual_cpf_rel_col2_used]
+
+            idx1 = cpf_to_index.get(cpf1)
+            idx2 = cpf_to_index.get(cpf2)
+
+            if idx1 is not None and idx2 is not None:
+                if idx1 != idx2:
+                    rows.extend([idx1, idx2]) # Add edge in both directions for symmetry
+                    cols.extend([idx2, idx1])
+                    data.extend([1.0, 1.0])   # Use weight 1.0 for explicit relationships
+                    valid_edges += 1
+                else:
+                    skipped_self_loops += 1
+            else:
+                skipped_edges += 1
+                if idx1 is None: missing_cpf1 += 1
+                if idx2 is None: missing_cpf2 += 1
+
+        if valid_edges > 0:
+            adj_rel_sparse = sp.csr_matrix((data, (rows, cols)), shape=(n_total_samples, n_total_samples), dtype=np.float32)
+            adj_rel_sparse.sum_duplicates() # Remove duplicates
+            adj_rel_sparse = adj_rel_sparse.astype(bool).astype(np.float32) # Ensure binary 0/1
+            print(f"  Relationship graph computed. Shape: {adj_rel_sparse.shape}, Non-zero entries: {adj_rel_sparse.nnz}")
+            print(f"  (Found {valid_edges} valid relationship pairs. Skipped {skipped_edges} edges due to missing CPFs "
+                  f"[{missing_cpf1} missing {actual_cpf_rel_col1_used}, {missing_cpf2} missing {actual_cpf_rel_col2_used}] and {skipped_self_loops} self-loops)")
         else:
+            print(f"  No valid relationship edges created. Total skipped edges: {skipped_edges}, self-loops: {skipped_self_loops}.")
+            adj_rel_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32) # Empty sparse matrix
+
+        # Delete relationship dataframe after use
+        del df_relationships
+        gc.collect()
+        print(f"Relationship dataframe deleted. Memory usage: {get_memory_usage():.2f} GB")
+
+    # --- 8c. Combine Graphs ---
+    print("Combining KNN and Relationship graphs...")
+    if adj_rel_sparse is not None and adj_rel_sparse.nnz > 0:
+        # Combine using maximum: Edges in either graph are kept.
+        # Relationship edges (value 1.0) take precedence over KNN edges (value 1.0).
+        initial_graph_sparse = adj_knn_sparse.maximum(adj_rel_sparse)
+        # Ensure it's float32 after maximum operation
+        initial_graph_sparse = initial_graph_sparse.astype(np.float32)
+        print(f"  Combined graph non-zero entries: {initial_graph_sparse.nnz} (using maximum)")
+    else:
+        print("  Using only KNN graph as initial graph (no valid relationships found/created).")
+        initial_graph_sparse = adj_knn_sparse # Use only KNN graph
+
+    # Add self-loops (Important for GCNs, do this *after* combining)
+    print("Adding self-loops...")
+    initial_graph_sparse = initial_graph_sparse + sp.eye(initial_graph_sparse.shape[0], dtype=np.float32, format='csr')
+    # Ensure values are clipped to 1 after adding self-loops (making it unweighted)
+    initial_graph_sparse = initial_graph_sparse.astype(bool).astype(np.float32)
+    print(f"  Combined graph + self-loops non-zero entries: {initial_graph_sparse.nnz}")
+
+    # --- 8d. Convert Final Sparse Graph to Tensor ---
+    # This final `initial_graph_sparse` is what will be passed to the training loop
+    print("Converting final graph structure to required format...")
+    try:
+        if args.sparse:
+            # Convert the final scipy sparse matrix to torch sparse tensor
+            initial_graph = sparse_mx_to_torch_sparse_tensor(initial_graph_sparse).to(device)
+            print(f"Initial combined graph prepared as sparse torch tensor on {device}.")
+        else:
+            # Convert final scipy sparse matrix to dense torch tensor
             initial_graph = torch.FloatTensor(initial_graph_sparse.todense()).to(device)
-            print("Initial combined graph prepared as dense torch tensor.")
+            print(f"Initial combined graph prepared as dense torch tensor on {device}.")
 
     except Exception as e:
-        print(f"Error during FAISS KNN graph construction for combined data: {e}")
-        print("Falling back to identity matrix for initial combined graph.")
-        if args.sparse:
-             initial_graph_sparse_fallback = sp.eye(n_total_samples, dtype=np.float32).tocoo()
-             initial_graph = sparse_mx_to_torch_sparse_tensor(initial_graph_sparse_fallback).to(device)
-        else:
-             initial_graph = torch.eye(n_total_samples, dtype=torch.float32).to(device)
-        print("Using identity matrix as initial combined graph.")
+         print(f"Error during final sparse/dense conversion: {e}")
+         print("Falling back to identity matrix.")
+         # Create fallback directly as torch tensor on the correct device
+         if args.sparse:
+              eye_indices = torch.arange(n_total_samples, device=device).unsqueeze(0).repeat(2, 1)
+              eye_values = torch.ones(n_total_samples, device=device)
+              initial_graph = torch.sparse_coo_tensor(eye_indices, eye_values, (n_total_samples, n_total_samples))
+         else:
+              initial_graph = torch.eye(n_total_samples, dtype=torch.float32, device=device)
+         print(f"Using identity matrix ({ 'sparse' if args.sparse else 'dense'}) on {device}.")
 
+    # Delete features_for_knn as it's now embedded in adj_knn_sparse
+    del features_for_knn
+    # <<< DELETE START
+    del adj_knn_sparse # No longer needed after combination
+    if adj_rel_sparse is not None:
+        del adj_rel_sparse # No longer needed after combination
+    del initial_graph_sparse # No longer needed after conversion to tensor
+    gc.collect()
+    print(f"Intermediate sparse matrices deleted. Memory: {get_memory_usage():.2f} GB")
+    # <<< DELETE END
 
     # === 9. Create Dummy Masks ===
     train_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
