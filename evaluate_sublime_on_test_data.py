@@ -930,6 +930,52 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     else:
         print("  No improvement found over dataset features for any setup.")
 
+    # --- Final KS Comparison --- 
+    best_dataset_ks = -1.0
+    best_dataset_model = "N/A"
+    overall_best_enhanced_ks = -1.0
+    overall_best_enhanced_model = "N/A"
+    overall_best_enhanced_feature_key = "N/A"
+
+    for model_name, model_type_results in all_results.items():
+        # Find best KS for dataset-only for this model
+        if 'dataset' in model_type_results and model_type_results['dataset'].get('ks') is not None:
+            current_dataset_ks = model_type_results['dataset']['ks']
+            if current_dataset_ks > best_dataset_ks:
+                best_dataset_ks = current_dataset_ks
+                best_dataset_model = model_name
+        
+        # Find best KS among enhanced features for this model
+        for feature_key, data in model_type_results.items():
+            if feature_key != 'dataset' and data.get('ks') is not None:
+                current_enhanced_ks = data['ks']
+                if current_enhanced_ks > overall_best_enhanced_ks:
+                    overall_best_enhanced_ks = current_enhanced_ks
+                    overall_best_enhanced_model = model_name
+                    overall_best_enhanced_feature_key = feature_key
+
+    print("\n" + "="*80)
+    print("OVERALL KS PERFORMANCE COMPARISON (ACROSS ALL MODELS)")
+    print("="*80)
+
+    if best_dataset_ks >= 0:
+        print(f"Best KS using Dataset Features Only:      {best_dataset_ks:.4f} (Model: {best_dataset_model.upper()})")
+    else:
+        print("Best KS using Dataset Features Only:      N/A (No valid results)")
+
+    if overall_best_enhanced_ks >= 0:
+        print(f"Best KS using Enhanced Features:          {overall_best_enhanced_ks:.4f} (Model: {overall_best_enhanced_model.upper()}, Features: {overall_best_enhanced_feature_key})")
+        if best_dataset_ks >= 0:
+            ks_improvement = overall_best_enhanced_ks - best_dataset_ks
+            print(f"Improvement in KS vs. Best Dataset Only:  {ks_improvement:.4f}")
+        else:
+            print("Improvement in KS vs. Best Dataset Only:  N/A")
+    else:
+        print("Best KS using Enhanced Features:          N/A (No valid results)")
+        print("Improvement in KS vs. Best Dataset Only:  N/A")
+
+    print("\n" + "="*80)
+
     # Return the nested results dictionary
     return all_results
 
@@ -1195,6 +1241,52 @@ def main(args):
     
     print("\n" + "="*80)
 
+    # --- Final KS Comparison --- 
+    best_dataset_ks = -1.0
+    best_dataset_model = "N/A"
+    overall_best_enhanced_ks = -1.0
+    overall_best_enhanced_model = "N/A"
+    overall_best_enhanced_feature_key = "N/A"
+
+    for model_name, model_type_results in all_results.items():
+        # Find best KS for dataset-only for this model
+        if 'dataset' in model_type_results and model_type_results['dataset'].get('ks') is not None:
+            current_dataset_ks = model_type_results['dataset']['ks']
+            if current_dataset_ks > best_dataset_ks:
+                best_dataset_ks = current_dataset_ks
+                best_dataset_model = model_name
+        
+        # Find best KS among enhanced features for this model
+        for feature_key, data in model_type_results.items():
+            if feature_key != 'dataset' and data.get('ks') is not None:
+                current_enhanced_ks = data['ks']
+                if current_enhanced_ks > overall_best_enhanced_ks:
+                    overall_best_enhanced_ks = current_enhanced_ks
+                    overall_best_enhanced_model = model_name
+                    overall_best_enhanced_feature_key = feature_key
+
+    print("\n" + "="*80)
+    print("OVERALL KS PERFORMANCE COMPARISON (ACROSS ALL MODELS)")
+    print("="*80)
+
+    if best_dataset_ks >= 0:
+        print(f"Best KS using Dataset Features Only:      {best_dataset_ks:.4f} (Model: {best_dataset_model.upper()})")
+    else:
+        print("Best KS using Dataset Features Only:      N/A (No valid results)")
+
+    if overall_best_enhanced_ks >= 0:
+        print(f"Best KS using Enhanced Features:          {overall_best_enhanced_ks:.4f} (Model: {overall_best_enhanced_model.upper()}, Features: {overall_best_enhanced_feature_key})")
+        if best_dataset_ks >= 0:
+            ks_improvement = overall_best_enhanced_ks - best_dataset_ks
+            print(f"Improvement in KS vs. Best Dataset Only:  {ks_improvement:.4f}")
+        else:
+            print("Improvement in KS vs. Best Dataset Only:  N/A")
+    else:
+        print("Best KS using Enhanced Features:          N/A (No valid results)")
+        print("Improvement in KS vs. Best Dataset Only:  N/A")
+
+    print("\n" + "="*80)
+    
     # 9. Save the preprocessor for future use
     preprocessor_path = os.path.join(args.output_dir, 'dataset_features_preprocessor.joblib')
     joblib.dump(preprocessor, preprocessor_path)
