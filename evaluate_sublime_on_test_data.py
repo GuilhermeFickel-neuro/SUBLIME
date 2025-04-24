@@ -1097,10 +1097,9 @@ def main(args):
     
     # 7. Evaluate using dataset features and SUBLIME embeddings (and classification probabilities if available)
     print("\nEvaluating features with XGBoost, CatBoost, and LightGBM...")
-    dataset_name = os.path.basename(args.dataset_features_csv).split('.')[0]
+    dataset_name = os.path.basename(args.dataset_features_csv).split('.')[-1]
     # Pass the list of k values from args
     all_results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name,
-    results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name,
                                preprocessor=preprocessor, n_trials=args.n_trials,
                                classification_probs=classification_probs,
                                k_neighbors_list=args.k_neighbors, # Pass the list using the correct keyword
