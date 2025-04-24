@@ -483,7 +483,7 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         split_outputs.insert(2, 'cls_probs')
 
     split_results_tv_test = train_test_split(*split_inputs, test_size=0.2, random_state=42, stratify=y)
-    train_val_indices = [i for i, name in enumerate(split_outputs) for _ in range(2)][::2]
+    train_val_indices = [i * 2 for i in range(len(split_outputs))]
     split_inputs_train_val = [split_results_tv_test[i] for i in train_val_indices]
     stratify_y_train_val = split_results_tv_test[split_outputs.index('y') * 2]
     split_results_train_val = train_test_split(*split_inputs_train_val, test_size=0.25, random_state=42, stratify=stratify_y_train_val)
