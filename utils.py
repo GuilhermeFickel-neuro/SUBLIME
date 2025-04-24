@@ -478,44 +478,58 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
             print(f"    [knn_fast] Warning: k={k} is too small or not enough neighbors found to compute '{knn_threshold_type}' threshold. Keeping all neighbors.")
 
 
-    # --- Filtering Logic (Single Pass) ---
-    num_kept_edges = 0
-    for i in range(n): # For each node
-        closest_valid_neighbor_added = False
-        # Iterate through neighbors found by FAISS (excluding self at index 0)
-        for j in range(1, inds_np.shape[1]): # Iterate up to k+1 potential neighbors
-            neighbor_idx = inds_np[i, j]
-            similarity = vals_np[i, j]
+    # --- Filtering Logic (Vectorized NumPy) ---
+    t_filter_start = time.time()
+    # print("  [knn_fast] Filtering neighbors (vectorized)...") # Less verbose
 
-            # Check if the neighbor index is valid
-            if neighbor_idx == -1 or neighbor_idx >= n:
-                continue # Skip invalid neighbors
+    # Exclude self (column 0)
+    neighbor_inds = inds_np[:, 1:] # Shape (n, k)
+    neighbor_vals = vals_np[:, 1:] # Shape (n, k)
 
-            # Logic:
-            # 1. If we haven't added the closest valid neighbor yet, add this one.
-            # 2. If we have added the closest, only add subsequent neighbors if they meet the threshold.
-            add_edge = False
-            if not closest_valid_neighbor_added:
-                add_edge = True
-                closest_valid_neighbor_added = True # Mark that we've added the first valid one
-            elif similarity >= similarity_threshold: # Higher similarity is better
-                add_edge = True
+    # 1. Basic Validity Mask
+    valid_mask = (neighbor_inds != -1) & (neighbor_inds < n) # Shape (n, k)
 
-            if add_edge:
-                filtered_rows_list.append(i)
-                filtered_cols_list.append(neighbor_idx)
-                filtered_vals_list.append(similarity)
-                num_kept_edges += 1
+    # 2. Threshold Mask
+    # Apply threshold: keep if similarity is >= threshold
+    threshold_keep_mask = neighbor_vals >= similarity_threshold # Shape (n, k)
 
-    # --- End Filtering ---
+    # 3. Identify neighbors kept based *only* on threshold and validity
+    preliminary_keep_mask = valid_mask & threshold_keep_mask # Shape (n, k)
+
+    # 4. Ensure the *first valid* neighbor is always kept (original logic)
+    final_keep_mask = preliminary_keep_mask.copy() # Start with thresholded neighbors
+    # Find the column index of the first valid neighbor for each row
+    # Need np.where to handle rows with no valid neighbors (argmax would return 0)
+    rows_with_valid, first_valid_col_indices = np.where(valid_mask)
+    # Use unique rows to find the *first* occurrence index per row
+    unique_rows, first_occurrence_indices = np.unique(rows_with_valid, return_index=True)
+    cols_to_force_keep = first_valid_col_indices[first_occurrence_indices]
+
+    # If there are rows with valid neighbors, force-keep the first valid one
+    if len(unique_rows) > 0:
+        final_keep_mask[unique_rows, cols_to_force_keep] = True
+
+    # 5. Apply the final mask to get the edges
+    # Generate row indices corresponding to the neighbor_inds array
+    row_indices_np = np.arange(n).reshape(-1, 1) # Shape (n, 1)
+    # Apply the mask
+    final_rows_np = np.broadcast_to(row_indices_np, neighbor_inds.shape)[final_keep_mask]
+    final_cols_np = neighbor_inds[final_keep_mask]
+    final_vals_np = neighbor_vals[final_keep_mask]
+
+    num_kept_edges = final_rows_np.shape[0]
+    # --- End Vectorized Filtering ---
 
     # print(f"  [knn_fast] Filtering done. Kept {num_kept_edges} edges. Time: {time.time() - t_filter_start:.4f}s") # Less verbose
 
     # Convert lists to tensors
     if num_kept_edges > 0:
-        rows = torch.tensor(filtered_rows_list, dtype=torch.long, device=device)
-        cols = torch.tensor(filtered_cols_list, dtype=torch.long, device=device)
-        values = torch.tensor(filtered_vals_list, dtype=torch.float32, device=device)
+        # rows = torch.tensor(filtered_rows_list, dtype=torch.long, device=device)
+        # cols = torch.tensor(filtered_cols_list, dtype=torch.long, device=device)
+        # values = torch.tensor(filtered_vals_list, dtype=torch.float32, device=device)
+        rows = torch.from_numpy(final_rows_np).to(device=device, dtype=torch.long)
+        cols = torch.from_numpy(final_cols_np).to(device=device, dtype=torch.long)
+        values = torch.from_numpy(final_vals_np).to(device=device, dtype=torch.float32)
     else:
         rows = torch.tensor([], dtype=torch.long, device=device)
         cols = torch.tensor([], dtype=torch.long, device=device)
