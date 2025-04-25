@@ -164,12 +164,47 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
         # If cache file exists, load and return it
         if os.path.exists(cache_file):
             print(f"Loading cached embeddings from {cache_file}")
-            return np.load(cache_file)
+            loaded_embeddings = np.load(cache_file)
+            
+            print(f"Cached embeddings loaded. Type: {type(loaded_embeddings)}, Shape: {loaded_embeddings.shape}")
+            # Get more details about the array content
+            try:
+                print(f"Embeddings dtype: {loaded_embeddings.dtype}")
+                print(f"First row shape: {loaded_embeddings[0].shape if len(loaded_embeddings) > 0 else 'No data'}")
+                if len(loaded_embeddings) > 0:
+                    print(f"First row type: {type(loaded_embeddings[0])}")
+                    if hasattr(loaded_embeddings[0], 'shape'):
+                        print(f"Is first row 1D? {len(loaded_embeddings[0].shape) == 1}")
+            except Exception as e:
+                print(f"Error inspecting loaded embeddings: {e}")
+            
+            # Ensure the loaded data is 2D
+            if len(loaded_embeddings.shape) == 1:
+                # Check if this is an array of arrays with different sizes
+                is_array_of_arrays = False
+                if len(loaded_embeddings) > 0 and isinstance(loaded_embeddings[0], np.ndarray):
+                    print("Loaded data appears to be an array of arrays")
+                    is_array_of_arrays = True
+                    # Try to properly stack the arrays
+                    try:
+                        print("Attempting to properly stack cached embeddings")
+                        loaded_embeddings = np.vstack([np.array(x).reshape(1, -1) if len(np.array(x).shape) == 1 
+                                                     else np.array(x) for x in loaded_embeddings])
+                        print(f"Successfully stacked. New shape: {loaded_embeddings.shape}")
+                    except Exception as e:
+                        print(f"Failed to stack arrays: {e}")
+                
+                if not is_array_of_arrays:
+                    print(f"Reshaping cached embeddings from 1D array {loaded_embeddings.shape} to 2D array")
+                    loaded_embeddings = loaded_embeddings.reshape(-1, 1)
+                    print(f"New cached embeddings shape: {loaded_embeddings.shape}")
+            
+            return loaded_embeddings
         else:
             print(f"Cache file not found. Extracting embeddings and saving to {cache_file}")
     elif cache_dir is not None and (model_dir is None or dataset_name is None):
         print("Caching disabled: Both model_dir and dataset_name must be provided to enable caching.")
-    
+        
     # Build FAISS index from features if not provided (performance optimization)
     if faiss_index is None and hasattr(graph_learner, 'k'):
         try:
@@ -247,7 +282,30 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
     
     # Save to cache only if cache_file is defined (requires cache_dir, model_dir, and dataset_name)
     if cache_file is not None:
+        # Add diagnostics before saving
+        print(f"Preparing to save embeddings to cache. Type: {type(embeddings_array)}, Shape: {embeddings_array.shape}")
+        
+        # Check if we have a proper 2D array before saving
+        if len(embeddings_array.shape) == 1:
+            print(f"Warning: embeddings_array is 1D with shape {embeddings_array.shape}")
+            
+            # Check if this is an array of arrays (each embedding might be an array)
+            if len(embeddings_array) > 0 and isinstance(embeddings_array[0], np.ndarray):
+                print("Embeddings is an array of arrays - reshaping for proper cache storage")
+                try:
+                    # Try to vstack the arrays
+                    embeddings_array = np.vstack([np.array(x).reshape(1, -1) if len(np.array(x).shape) == 1 
+                                               else np.array(x) for x in embeddings_array])
+                    print(f"Successfully reshaped before saving. New shape: {embeddings_array.shape}")
+                except Exception as e:
+                    print(f"Failed to reshape arrays before saving: {e}")
+            else:
+                # Simple reshape for a 1D array
+                print("Reshaping 1D array to 2D column vector")
+                embeddings_array = embeddings_array.reshape(-1, 1)
+        
         print(f"Saving embeddings to cache: {cache_file}")
+        print(f"Final shape before saving: {embeddings_array.shape}")
         np.save(cache_file, embeddings_array)
         
         # If classification results are available, save them too
@@ -522,16 +580,64 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
               Inner keys are feature set types ('dataset', 'concat', 'knn_k{k}').
               Values contain test metrics, params, models, etc.
     """
+    # --- Enhanced Diagnostics ---
+    print("\n--- DETAILED DIAGNOSTICS ---")
+    print(f"Type of dataset_features: {type(dataset_features)}")
+    print(f"Type of sublime_embeddings: {type(sublime_embeddings)}")
+    if hasattr(dataset_features, 'format_name'):
+        print(f"Dataset features format: {dataset_features.format_name}")
+    if hasattr(dataset_features, 'toarray'):
+        print("Dataset features is a sparse matrix - converting to dense array")
+        dataset_features = dataset_features.toarray()
+    print(f"Dataset features shape: {dataset_features.shape if hasattr(dataset_features, 'shape') else 'No shape attribute'}")
+    print(f"SUBLIME embeddings shape: {sublime_embeddings.shape if hasattr(sublime_embeddings, 'shape') else 'No shape attribute'}")
+    
     # --- Feature Set Preparation ---
     # Ensure dataset_features is a 2D array
+    if not isinstance(dataset_features, np.ndarray):
+        print(f"Converting dataset_features from {type(dataset_features)} to numpy array")
+        dataset_features = np.array(dataset_features)
+    
     if len(dataset_features.shape) == 1:
         print(f"Reshaping dataset_features from 1D array {dataset_features.shape} to 2D array")
         dataset_features = dataset_features.reshape(-1, 1)
         print(f"New dataset_features shape: {dataset_features.shape}")
     
+    # Ensure sublime_embeddings is a 2D array
+    if not isinstance(sublime_embeddings, np.ndarray):
+        print(f"Converting sublime_embeddings from {type(sublime_embeddings)} to numpy array")
+        sublime_embeddings = np.array(sublime_embeddings)
+        
+    if len(sublime_embeddings.shape) == 1:
+        print(f"Reshaping sublime_embeddings from 1D array {sublime_embeddings.shape} to 2D array")
+        sublime_embeddings = sublime_embeddings.reshape(-1, 1)
+        print(f"New sublime_embeddings shape: {sublime_embeddings.shape}")
+    
+    print("After conversion and reshaping:")
+    print(f"Dataset features shape: {dataset_features.shape}")
+    print(f"SUBLIME embeddings shape: {sublime_embeddings.shape}")
+    print("--- END DIAGNOSTICS ---\n")
+    
     feature_sets = {'dataset': dataset_features} # Start with base features
 
-    base_concat_features = np.hstack((dataset_features, sublime_embeddings))
+    # Debug the concatenation process
+    print("Attempting to concatenate features...")
+    try:
+        base_concat_features = np.hstack((dataset_features, sublime_embeddings))
+        print(f"Successfully concatenated! Shape: {base_concat_features.shape}")
+    except Exception as e:
+        print(f"Error during concatenation: {e}")
+        print(f"dataset_features shape: {dataset_features.shape}, type: {type(dataset_features)}")
+        print(f"sublime_embeddings shape: {sublime_embeddings.shape}, type: {type(sublime_embeddings)}")
+        # Try a different approach
+        print("Trying a different concatenation approach...")
+        try:
+            base_concat_features = np.concatenate([dataset_features, sublime_embeddings], axis=1)
+            print(f"Alternative concatenation successful! Shape: {base_concat_features.shape}")
+        except Exception as e2:
+            print(f"Alternative approach also failed: {e2}")
+            raise  # Re-raise to fail more gracefully
+    
     if classification_probs is not None:
         classification_probs_reshaped = classification_probs.reshape(-1, 1)
         concat_features = np.hstack((base_concat_features, classification_probs_reshaped))
@@ -1219,6 +1325,12 @@ def main(args):
     # Process dataset features with a new preprocessing pipeline
     X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
     
+    # Ensure X_dataset is a 2D array
+    if len(X_dataset.shape) == 1:
+        print(f"Reshaping X_dataset from 1D array {X_dataset.shape} to 2D array")
+        X_dataset = X_dataset.reshape(-1, 1)
+        print(f"New X_dataset shape: {X_dataset.shape}")
+    
     # Compare model's built-in classification with target values if available
     if classification_results is not None:
         from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
@@ -1252,6 +1364,43 @@ def main(args):
     # 7. Evaluate using dataset features and SUBLIME embeddings (and classification probabilities if available)
     print("\nEvaluating features with XGBoost, CatBoost, and LightGBM...")
     dataset_name = os.path.basename(args.dataset_features_csv).split('.')[-1]
+    
+    # Add detailed diagnostics before calling evaluate_features
+    print("\n=== PRE-EVALUATION DIAGNOSTICS ===")
+    print(f"X_dataset type: {type(X_dataset)}")
+    print(f"X_dataset shape: {X_dataset.shape if hasattr(X_dataset, 'shape') else 'No shape attribute'}")
+    print(f"sublime_embeddings type: {type(sublime_embeddings)}")
+    print(f"sublime_embeddings shape: {sublime_embeddings.shape if hasattr(sublime_embeddings, 'shape') else 'No shape attribute'}")
+    print(f"y type: {type(y)}")
+    print(f"y shape: {y.shape if hasattr(y, 'shape') else 'No shape attribute'}")
+    
+    # Force conversion to numpy arrays if needed
+    if hasattr(X_dataset, 'toarray'):
+        print("Converting X_dataset from sparse matrix to dense array")
+        X_dataset = X_dataset.toarray()
+    
+    if not isinstance(X_dataset, np.ndarray):
+        print(f"Converting X_dataset from {type(X_dataset)} to numpy array")
+        X_dataset = np.array(X_dataset)
+    
+    if not isinstance(sublime_embeddings, np.ndarray):
+        print(f"Converting sublime_embeddings from {type(sublime_embeddings)} to numpy array")
+        sublime_embeddings = np.array(sublime_embeddings)
+    
+    # Ensure both are 2D arrays
+    if len(X_dataset.shape) == 1:
+        print(f"Reshaping X_dataset from 1D ({X_dataset.shape}) to 2D")
+        X_dataset = X_dataset.reshape(-1, 1)
+    
+    if len(sublime_embeddings.shape) == 1:
+        print(f"Reshaping sublime_embeddings from 1D ({sublime_embeddings.shape}) to 2D")
+        sublime_embeddings = sublime_embeddings.reshape(-1, 1)
+    
+    print("After conversion:")
+    print(f"X_dataset shape: {X_dataset.shape}")
+    print(f"sublime_embeddings shape: {sublime_embeddings.shape}")
+    print("=== END PRE-EVALUATION DIAGNOSTICS ===\n")
+    
     # Pass the list of k values from args
     all_results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name,
                                preprocessor=preprocessor, n_trials=args.n_trials,
