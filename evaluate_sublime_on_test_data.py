@@ -1049,6 +1049,39 @@ def main(args):
     print(f"\nLoading neurolake data from {args.neurolake_csv}")
     neurolake_df = pd.read_csv(args.neurolake_csv, delimiter='\t')
     
+    # Load dataset features early if evaluation is needed
+    dataset_df = None
+    if args.dataset_features_csv and args.target_column:
+        print(f"Loading dataset features from {args.dataset_features_csv}")
+        dataset_df = pd.read_csv(args.dataset_features_csv, delimiter='\t')
+        
+        # Verify that both datasets have the same number of rows (must be aligned)
+        if len(neurolake_df) != len(dataset_df):
+            raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
+    
+    # Apply data sampling before any processing
+    if args.data_fraction < 0 or args.data_fraction > 1:
+        raise ValueError(f"data_fraction must be between 0 and 1, got {args.data_fraction}")
+    
+    if args.data_fraction < 1.0:
+        # Calculate how many rows to keep
+        n_samples = int(len(neurolake_df) * args.data_fraction)
+        if n_samples <= 0:
+            raise ValueError(f"data_fraction {args.data_fraction} results in 0 samples, please increase it")
+            
+        # Sample the same indices from both datasets to keep them aligned
+        # Use a fixed random_state for reproducibility
+        sampled_indices = np.random.RandomState(42).choice(
+            len(neurolake_df), size=n_samples, replace=False
+        )
+        
+        # Apply the same sampling to both dataframes
+        neurolake_df = neurolake_df.iloc[sampled_indices].reset_index(drop=True)
+        if dataset_df is not None:
+            dataset_df = dataset_df.iloc[sampled_indices].reset_index(drop=True)
+                
+        print(f"\nUsing {args.data_fraction:.1%} of the data: {n_samples} samples")
+    
     # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
     X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
     print(f"Neurolake data processed: {X_neurolake.shape}")
@@ -1133,47 +1166,13 @@ def main(args):
             return
     
     # 6. Load and process dataset features (only needed for evaluation)
-    print(f"\nLoading dataset features from {args.dataset_features_csv}")
-    dataset_df = pd.read_csv(args.dataset_features_csv, delimiter='\t')
-    
-    # Verify that both datasets have the same number of rows (must be aligned)
-    if len(neurolake_df) != len(dataset_df):
-        raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
-    
-    # Sample data if data_fraction is less than 1.0
-    if args.data_fraction < 0 or args.data_fraction > 1:
-        raise ValueError(f"data_fraction must be between 0 and 1, got {args.data_fraction}")
-    
-    if args.data_fraction < 1.0:
-        # Calculate how many rows to keep
-        n_samples = int(len(neurolake_df) * args.data_fraction)
-        if n_samples <= 0:
-            raise ValueError(f"data_fraction {args.data_fraction} results in 0 samples, please increase it")
-            
-        # Sample the same indices from both datasets to keep them aligned
-        # Use a fixed random_state for reproducibility
-        sampled_indices = np.random.RandomState(42).choice(
-            len(neurolake_df), size=n_samples, replace=False
-        )
+    if dataset_df is None and args.dataset_features_csv:  # Only load if not already loaded
+        print(f"\nLoading dataset features from {args.dataset_features_csv}")
+        dataset_df = pd.read_csv(args.dataset_features_csv, delimiter='\t')
         
-        # Apply the same sampling to both dataframes
-        neurolake_df = neurolake_df.iloc[sampled_indices].reset_index(drop=True)
-        dataset_df = dataset_df.iloc[sampled_indices].reset_index(drop=True)
-        
-        # Also sample the preprocessed neurolake data
-        X_neurolake = X_neurolake[sampled_indices]
-        
-        # Also sample the embeddings if they have been already extracted
-        if 'sublime_embeddings' in locals() and len(sublime_embeddings) == len(X_neurolake):
-            sublime_embeddings = sublime_embeddings[sampled_indices]
-        
-        # Sample classification results if they exist
-        if classification_results is not None:
-            classification_results = classification_results[sampled_indices]
-            if classification_probs is not None:
-                classification_probs = classification_probs[sampled_indices]
-                
-        print(f"\nUsing {args.data_fraction:.1%} of the data: {n_samples} samples")
+        # Verify that both datasets have the same number of rows (must be aligned)
+        if len(neurolake_df) != len(dataset_df):
+            raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
     
     # Filter out rows where target values are not 0 or 1
     if args.target_column in dataset_df.columns:
