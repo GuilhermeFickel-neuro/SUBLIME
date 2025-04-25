@@ -1140,6 +1140,41 @@ def main(args):
     if len(neurolake_df) != len(dataset_df):
         raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
     
+    # Sample data if data_fraction is less than 1.0
+    if args.data_fraction < 0 or args.data_fraction > 1:
+        raise ValueError(f"data_fraction must be between 0 and 1, got {args.data_fraction}")
+    
+    if args.data_fraction < 1.0:
+        # Calculate how many rows to keep
+        n_samples = int(len(neurolake_df) * args.data_fraction)
+        if n_samples <= 0:
+            raise ValueError(f"data_fraction {args.data_fraction} results in 0 samples, please increase it")
+            
+        # Sample the same indices from both datasets to keep them aligned
+        # Use a fixed random_state for reproducibility
+        sampled_indices = np.random.RandomState(42).choice(
+            len(neurolake_df), size=n_samples, replace=False
+        )
+        
+        # Apply the same sampling to both dataframes
+        neurolake_df = neurolake_df.iloc[sampled_indices].reset_index(drop=True)
+        dataset_df = dataset_df.iloc[sampled_indices].reset_index(drop=True)
+        
+        # Also sample the preprocessed neurolake data
+        X_neurolake = X_neurolake[sampled_indices]
+        
+        # Also sample the embeddings if they have been already extracted
+        if 'sublime_embeddings' in locals() and len(sublime_embeddings) == len(X_neurolake):
+            sublime_embeddings = sublime_embeddings[sampled_indices]
+        
+        # Sample classification results if they exist
+        if classification_results is not None:
+            classification_results = classification_results[sampled_indices]
+            if classification_probs is not None:
+                classification_probs = classification_probs[sampled_indices]
+                
+        print(f"\nUsing {args.data_fraction:.1%} of the data: {n_samples} samples")
+    
     # Filter out rows where target values are not 0 or 1
     if args.target_column in dataset_df.columns:
         # Create a mask for valid target values (0 or 1)
@@ -1361,6 +1396,8 @@ if __name__ == "__main__":
     parser.add_argument('--embeddings-output', type=str, help='Path to save the extracted embeddings CSV. If specified without evaluation parameters, only embeddings will be extracted.')
     parser.add_argument('--k-neighbors', type=int, nargs='+', default=[5, 10, 20], 
                         help='List of neighbor counts (k) for KNN features. Set to 0 in the list to disable KNN for that value, though typically just omit 0.')
+    parser.add_argument('--data-fraction', type=float, default=1.0,
+                        help='Fraction of the input datasets to use (between 0 and 1). Defaults to 1.0 (use all data).')
     
     args = parser.parse_args()
     
