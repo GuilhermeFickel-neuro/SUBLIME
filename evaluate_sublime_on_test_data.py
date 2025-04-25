@@ -255,7 +255,7 @@ def extract_in_batches(X, model, graph_learner, features, adj, sparse, experimen
 # Helper function to calculate KNN features using FAISS
 def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, device, query_is_index=False):
     """
-    Calculates KNN features (mean distance, mean label) using FAISS.
+    Calculates KNN features (statistics of distances and labels) using FAISS.
 
     Args:
         query_embeddings (np.ndarray or torch.Tensor): Embeddings to find neighbors for.
@@ -266,14 +266,14 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
         query_is_index (bool): True if query_embeddings are the same as index_embeddings.
 
     Returns:
-        np.ndarray: Array of shape (num_query_points, 2) with [mean_distance, mean_label].
+        np.ndarray: Array of shape (num_query_points, NUM_FEATURES) with various statistics.
     """
     t_start = time.time()
     print(f"Calculating KNN features for {query_embeddings.shape[0]} query points using {index_embeddings.shape[0]} index points (k={k}, query_is_index={query_is_index}).")
 
     if query_embeddings.shape[0] == 0 or index_embeddings.shape[0] == 0:
         print("Warning: Empty query or index embeddings provided to calculate_knn_features.")
-        return np.zeros((query_embeddings.shape[0], 2)) # Return dummy features
+        return np.zeros((query_embeddings.shape[0], 8))  # Return dummy features (now with more features)
 
     # Ensure embeddings are numpy arrays on CPU for FAISS
     query_np = query_embeddings.cpu().detach().numpy().astype('float32') if torch.is_tensor(query_embeddings) else np.array(query_embeddings, dtype='float32')
@@ -285,7 +285,7 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
 
     if k <= 0:
         print("Warning: k <= 0 requested for KNN features. Returning zeros.")
-        return np.zeros((query_np.shape[0], 2))
+        return np.zeros((query_np.shape[0], 8))  # Increased number of features
 
     if query_is_index and k >= index_np.shape[0]:
          print(f"Warning: k={k} is >= number of index points ({index_np.shape[0]}) for self-query. Setting k to {index_np.shape[0] - 1}.")
@@ -296,7 +296,7 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
 
     if k <= 0: # Re-check k after potential adjustment
          print("Warning: k became <= 0 after adjustment. Returning zeros.")
-         return np.zeros((query_np.shape[0], 2))
+         return np.zeros((query_np.shape[0], 8))  # Increased number of features
 
     # Normalize for IP -> Cosine Sim (FAISS uses IP, normalization makes it cosine)
     # It's crucial that the input embeddings (sublime_embeddings) are already normalized before calling this function.
@@ -363,10 +363,6 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
     clipped_similarities = np.clip(similarities_np, -1.0, 1.0)
     distances_np = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * clipped_similarities)) # Ensure non-negative argument for sqrt
 
-    # Aggregate features (handle invalid indices potentially returned by FAISS)
-    mean_distances = np.full(query_np.shape[0], np.nan)
-    mean_labels = np.full(query_np.shape[0], np.nan)
-
     # Pre-fetch all required labels to potentially speed up the loop
     valid_indices_flat = indices_np.ravel()
     # Create a mask for valid indices before fetching labels
@@ -378,6 +374,18 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
     else:
         labels_map = {}
 
+    # Initialize arrays to hold all features
+    mean_distances = np.full(query_np.shape[0], np.nan)
+    std_distances = np.full(query_np.shape[0], np.nan)
+    min_distances = np.full(query_np.shape[0], np.nan)
+    max_distances = np.full(query_np.shape[0], np.nan)
+    
+    mean_labels = np.full(query_np.shape[0], np.nan)
+    weighted_mean_labels = np.full(query_np.shape[0], np.nan)
+    label_variance = np.full(query_np.shape[0], np.nan)
+    # For binary classification, entropy is essentially derivable from mean_labels,
+    # but we'll calculate class margin (proportion difference between classes)
+    class_margin = np.full(query_np.shape[0], np.nan)
 
     for i in range(query_np.shape[0]):
         if actual_k_found == 0: continue # Skip if no neighbors were found for any query point initially
@@ -391,28 +399,76 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
             valid_row_distances = row_distances[row_valid_mask]
             # Lookup labels from the pre-fetched map
             valid_row_labels = np.array([labels_map.get(idx, np.nan) for idx in valid_row_indices])
-
-            # Ensure we only use non-NaN labels for mean calculation (in case map lookup failed somehow)
+            
+            # Filter out any NaN labels that might have occurred
             valid_label_mask = ~np.isnan(valid_row_labels)
+            
             if np.any(valid_label_mask):
-                mean_distances[i] = np.mean(valid_row_distances) # Use distances even if label lookup failed
-                mean_labels[i] = np.mean(valid_row_labels[valid_label_mask])
+                # -- Distance statistics --
+                mean_distances[i] = np.mean(valid_row_distances)
+                std_distances[i] = np.std(valid_row_distances) if len(valid_row_distances) > 1 else 0
+                min_distances[i] = np.min(valid_row_distances)
+                max_distances[i] = np.max(valid_row_distances)
+                
+                # -- Label statistics --
+                # Use only valid labels for label stats
+                filtered_labels = valid_row_labels[valid_label_mask]
+                filtered_distances = valid_row_distances[valid_label_mask]
+                
+                if len(filtered_labels) > 0:
+                    mean_labels[i] = np.mean(filtered_labels)
+                    
+                    # Distance-weighted mean (closer neighbors have more influence)
+                    if len(filtered_distances) > 0:
+                        # Convert distances to weights (smaller distance = larger weight)
+                        # Add small epsilon to avoid division by zero
+                        weights = 1.0 / (filtered_distances + 1e-10)
+                        weights = weights / np.sum(weights)  # Normalize weights
+                        weighted_mean_labels[i] = np.sum(filtered_labels * weights)
+                    
+                    # For binary labels (0/1), variance tells us how mixed the neighbors are
+                    label_variance[i] = np.var(filtered_labels)
+                    
+                    # Class margin is the difference between proportion of class 1 and class 0
+                    # For binary 0/1 labels: 2*mean - 1 gives values from -1 to 1
+                    # where -1 = all zeros, 0 = equal mix, 1 = all ones
+                    class_margin[i] = 2.0 * mean_labels[i] - 1.0
+            
             elif len(valid_row_distances) > 0: # If only distances are valid
-                 mean_distances[i] = np.mean(valid_row_distances)
-                 # mean_labels[i] remains NaN
-
-        # else: features remain NaN if no valid neighbors found
+                mean_distances[i] = np.mean(valid_row_distances)
+                std_distances[i] = np.std(valid_row_distances) if len(valid_row_distances) > 1 else 0
+                min_distances[i] = np.min(valid_row_distances)
+                max_distances[i] = np.max(valid_row_distances)
+                # Other metrics remain NaN
 
     # Impute NaNs (e.g., if no valid neighbors found for a point)
-    # Use median of calculated means for imputation.
+    # Use median of calculated values for imputation to be robust to outliers
     median_dist = np.nanmedian(mean_distances) if not np.all(np.isnan(mean_distances)) else 0
-    median_label = np.nanmedian(mean_labels) if not np.all(np.isnan(mean_labels)) else 0.5 # If all fail, assume neutral label prob
+    median_std_dist = np.nanmedian(std_distances) if not np.all(np.isnan(std_distances)) else 0
+    median_min_dist = np.nanmedian(min_distances) if not np.all(np.isnan(min_distances)) else 0
+    median_max_dist = np.nanmedian(max_distances) if not np.all(np.isnan(max_distances)) else 0
+    
+    median_label = np.nanmedian(mean_labels) if not np.all(np.isnan(mean_labels)) else 0.5
+    median_weighted_label = np.nanmedian(weighted_mean_labels) if not np.all(np.isnan(weighted_mean_labels)) else 0.5
+    median_label_var = np.nanmedian(label_variance) if not np.all(np.isnan(label_variance)) else 0.25  # Default to 0.25 (maximum variance for binary)
+    median_margin = np.nanmedian(class_margin) if not np.all(np.isnan(class_margin)) else 0  # Default to 0 (balanced classes)
 
+    # Fill in missing values
     mean_distances = np.nan_to_num(mean_distances, nan=median_dist)
+    std_distances = np.nan_to_num(std_distances, nan=median_std_dist)
+    min_distances = np.nan_to_num(min_distances, nan=median_min_dist)
+    max_distances = np.nan_to_num(max_distances, nan=median_max_dist)
+    
     mean_labels = np.nan_to_num(mean_labels, nan=median_label)
+    weighted_mean_labels = np.nan_to_num(weighted_mean_labels, nan=median_weighted_label)
+    label_variance = np.nan_to_num(label_variance, nan=median_label_var)
+    class_margin = np.nan_to_num(class_margin, nan=median_margin)
 
-    # Combine features
-    knn_features = np.vstack([mean_distances, mean_labels]).T # Shape: (num_query, 2)
+    # Combine all features - stack them as columns
+    knn_features = np.column_stack([
+        mean_distances, std_distances, min_distances, max_distances,
+        mean_labels, weighted_mean_labels, label_variance, class_margin
+    ])
 
     # Cleanup GPU memory if index was created internally on GPU
     if gpu_available and hasattr(index, 'free'):
