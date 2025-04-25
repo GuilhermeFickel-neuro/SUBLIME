@@ -108,11 +108,23 @@ def preprocess_dataset_features(df, target_column=None, fit_transform=False):
     if fit_transform:
         # Fit and transform the data
         preprocessed_data = preprocessor.fit_transform(X)
+        
+        # Ensure preprocessed_data is 2D
+        if len(preprocessed_data.shape) == 1:
+            preprocessed_data = preprocessed_data.reshape(-1, 1)
+            print(f"Reshaped preprocessed_data to 2D array with shape: {preprocessed_data.shape}")
+        
         print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
         return preprocessed_data, preprocessor, y
     else:
         # Only transform the data
         preprocessed_data = preprocessor.transform(X)
+        
+        # Ensure preprocessed_data is 2D
+        if len(preprocessed_data.shape) == 1:
+            preprocessed_data = preprocessed_data.reshape(-1, 1)
+            print(f"Reshaped preprocessed_data to 2D array with shape: {preprocessed_data.shape}")
+            
         print(f"Dataset features shape: {X.shape} -> Processed shape: {preprocessed_data.shape}")
         return preprocessed_data, y
 
@@ -511,6 +523,12 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
               Values contain test metrics, params, models, etc.
     """
     # --- Feature Set Preparation ---
+    # Ensure dataset_features is a 2D array
+    if len(dataset_features.shape) == 1:
+        print(f"Reshaping dataset_features from 1D array {dataset_features.shape} to 2D array")
+        dataset_features = dataset_features.reshape(-1, 1)
+        print(f"New dataset_features shape: {dataset_features.shape}")
+    
     feature_sets = {'dataset': dataset_features} # Start with base features
 
     base_concat_features = np.hstack((dataset_features, sublime_embeddings))
