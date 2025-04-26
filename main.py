@@ -848,6 +848,22 @@ class Experiment:
             # Initialize the model
             model = GCL(**gcl_params)
 
+            # --- Load Pre-trained Weights (if specified) ---
+            if args.load_pretrained_path and os.path.isdir(args.load_pretrained_path):
+                pretrained_model_path = os.path.join(args.load_pretrained_path, 'model.pt')
+                pretrained_learner_path = os.path.join(args.load_pretrained_path, 'graph_learner.pt')
+                if os.path.exists(pretrained_model_path) and os.path.exists(pretrained_learner_path):
+                    try:
+                        print(f"Loading pre-trained model weights from {pretrained_model_path}")
+                        model.load_state_dict(torch.load(pretrained_model_path, map_location=self.device))
+                        print(f"Loading pre-trained graph learner weights from {pretrained_learner_path}")
+                        graph_learner.load_state_dict(torch.load(pretrained_learner_path, map_location=self.device))
+                        print("Successfully loaded pre-trained weights.")
+                    except Exception as e:
+                        print(f"Warning: Failed to load pre-trained weights from {args.load_pretrained_path}: {e}")
+                else:
+                    print(f"Warning: Pre-trained model path specified ({args.load_pretrained_path}), but model.pt or graph_learner.pt not found.")
+
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
             optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
             
@@ -1446,6 +1462,10 @@ def create_parser():
     # New argument for relationship dataset
     parser.add_argument('-relationship_dataset', type=str, default=None,
                         help='Path to the relationship dataset CSV file (e.g., relationships.csv)')
+
+    # New argument to load pre-trained model weights
+    parser.add_argument('-load_pretrained_path', type=str, default=None,
+                        help='Path to directory containing pre-trained model.pt and graph_learner.pt to load weights from.')
 
     # New argument for KNN threshold type
     parser.add_argument('--knn_threshold_type', type=str, default='none', choices=['none', 'median_k', 'std_dev_k'],
