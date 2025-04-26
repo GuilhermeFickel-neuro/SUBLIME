@@ -1425,7 +1425,7 @@ def create_parser():
     parser.add_argument('-c', type=int, default=0)
 
     # New arguments for saving model
-    parser.add_argument('-save_model', type=int, default=0)
+    parser.add_argument('-save_model', type=int, default=1)
     parser.add_argument('-output_dir', type=str, default='saved_models')
     
     # ArcFace arguments
