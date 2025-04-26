@@ -554,7 +554,12 @@ def calculate_knn_features(query_embeddings, index_embeddings, index_labels, k, 
     print(f"KNN features calculated. Shape: {knn_features.shape}. Time: {t_end - t_start:.4f}s")
     return knn_features
 
-def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, preprocessor=None, n_trials=50, classification_probs=None, k_neighbors_list=[5], device=device):
+def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, preprocessor=None, n_trials=50, classification_probs=None, k_neighbors_list=[5], device=device,
+                   X_dataset_train=None, X_dataset_val=None, X_dataset_test=None,
+                   sublime_train=None, sublime_val=None, sublime_test=None,
+                   y_train=None, y_val=None, y_test=None,
+                   cls_probs_train=None, cls_probs_val=None, cls_probs_test=None,
+                   using_external_test=False):
     """
     Train XGBoost, CatBoost and LightGBM classifiers on different feature sets and compare performance
     using a train/validation/test split.
@@ -574,6 +579,21 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
         k_neighbors_list (list[int]): List of neighbor counts (k) for KNN feature calculation.
                                      Values <= 0 will be skipped.
         device: PyTorch device ('cuda' or 'cpu').
+        
+        # New parameters for pre-split data
+        X_dataset_train: Pre-split dataset features for training
+        X_dataset_val: Pre-split dataset features for validation
+        X_dataset_test: Pre-split dataset features for testing
+        sublime_train: Pre-split SUBLIME embeddings for training
+        sublime_val: Pre-split SUBLIME embeddings for validation
+        sublime_test: Pre-split SUBLIME embeddings for testing
+        y_train: Pre-split target labels for training
+        y_val: Pre-split target labels for validation
+        y_test: Pre-split target labels for testing
+        cls_probs_train: Pre-split classification probabilities for training
+        cls_probs_val: Pre-split classification probabilities for validation
+        cls_probs_test: Pre-split classification probabilities for testing
+        using_external_test: Whether an external test set is being used
 
     Returns:
         dict: Nested results dictionary. Outer keys are model types ('xgboost', 'catboost', 'lightgbm').
@@ -655,25 +675,66 @@ def evaluate_features(dataset_features, sublime_embeddings, y, dataset_name, pre
     print(f"Concatenated features shape: {concat_features.shape}")
 
     # --- Data Splitting ---
-    from sklearn.model_selection import train_test_split
-    split_inputs = [dataset_features, sublime_embeddings, concat_features, y]
-    split_outputs = ['X', 'sublime', 'concat', 'y']
-    if classification_probs_reshaped is not None:
-        split_inputs.insert(2, classification_probs_reshaped)
-        split_outputs.insert(2, 'cls_probs')
+    # Check if pre-split data is provided
+    if using_external_test and X_dataset_train is not None and X_dataset_val is not None and X_dataset_test is not None:
+        print("Using pre-split data with external test set")
+        split_data = {
+            'X_train': X_dataset_train,
+            'X_val': X_dataset_val,
+            'X_test': X_dataset_test,
+            'sublime_train': sublime_train,
+            'sublime_val': sublime_val,
+            'sublime_test': sublime_test,
+            'y_train': y_train,
+            'y_val': y_val,
+            'y_test': y_test,
+            'X_train_val': np.vstack((X_dataset_train, X_dataset_val)),
+            'sublime_train_val': np.vstack((sublime_train, sublime_val)),
+            'y_train_val': np.concatenate((y_train, y_val))
+        }
+        
+        # Handle concatenated features for pre-split data
+        concat_train = np.hstack((X_dataset_train, sublime_train))
+        concat_val = np.hstack((X_dataset_val, sublime_val))
+        concat_test = np.hstack((X_dataset_test, sublime_test))
+        
+        # Add classification probs if available
+        if cls_probs_train is not None and cls_probs_val is not None:
+            cls_probs_train_reshaped = cls_probs_train.reshape(-1, 1)
+            cls_probs_val_reshaped = cls_probs_val.reshape(-1, 1)
+            concat_train = np.hstack((concat_train, cls_probs_train_reshaped))
+            concat_val = np.hstack((concat_val, cls_probs_val_reshaped))
+            
+            # Also handle cls_probs_test if available
+            if cls_probs_test is not None:
+                cls_probs_test_reshaped = cls_probs_test.reshape(-1, 1) 
+                concat_test = np.hstack((concat_test, cls_probs_test_reshaped))
+        
+        split_data['concat_train'] = concat_train
+        split_data['concat_val'] = concat_val
+        split_data['concat_test'] = concat_test
+        split_data['concat_train_val'] = np.vstack((concat_train, concat_val))
+    else:
+        # Regular splitting logic when no pre-split data is provided
+        from sklearn.model_selection import train_test_split
+        split_inputs = [dataset_features, sublime_embeddings, concat_features, y]
+        split_outputs = ['X', 'sublime', 'concat', 'y']
+        if classification_probs_reshaped is not None:
+            split_inputs.insert(2, classification_probs_reshaped)
+            split_outputs.insert(2, 'cls_probs')
 
-    split_results_tv_test = train_test_split(*split_inputs, test_size=0.2, random_state=42, stratify=y)
-    train_val_indices = [i * 2 for i in range(len(split_outputs))]
-    split_inputs_train_val = [split_results_tv_test[i] for i in train_val_indices]
-    stratify_y_train_val = split_results_tv_test[split_outputs.index('y') * 2]
-    split_results_train_val = train_test_split(*split_inputs_train_val, test_size=0.25, random_state=42, stratify=stratify_y_train_val)
+        split_results_tv_test = train_test_split(*split_inputs, test_size=0.2, random_state=42, stratify=y)
+        train_val_indices = [i * 2 for i in range(len(split_outputs))]
+        split_inputs_train_val = [split_results_tv_test[i] for i in train_val_indices]
+        stratify_y_train_val = split_results_tv_test[split_outputs.index('y') * 2]
+        split_results_train_val = train_test_split(*split_inputs_train_val, test_size=0.25, random_state=42, stratify=stratify_y_train_val)
 
-    split_data = {}
-    for i, name in enumerate(split_outputs):
-         split_data[f'{name}_train_val'] = split_results_tv_test[i*2]
-         split_data[f'{name}_test'] = split_results_tv_test[i*2+1]
-         split_data[f'{name}_train'] = split_results_train_val[i*2]
-         split_data[f'{name}_val'] = split_results_train_val[i*2+1]
+        split_data = {}
+        for i, name in enumerate(split_outputs):
+             split_data[f'{name}_train_val'] = split_results_tv_test[i*2]
+             split_data[f'{name}_test'] = split_results_tv_test[i*2+1]
+             split_data[f'{name}_train'] = split_results_train_val[i*2]
+             split_data[f'{name}_val'] = split_results_train_val[i*2+1]
 
     y_train, y_val, y_test, y_train_val = split_data['y_train'], split_data['y_val'], split_data['y_test'], split_data['y_train_val']
     print(f"Data split: Train ({len(y_train)}), Validation ({len(y_val)}), Test ({len(y_test)})")
@@ -1169,6 +1230,11 @@ def main(args):
         os.makedirs(args.cache_dir, exist_ok=True)
         print(f"Using cache directory: {args.cache_dir}")
     
+    # Check if using a separate test file
+    using_separate_test = args.test_csv is not None
+    if using_separate_test:
+        print(f"\nUsing separate test file: {args.test_csv}")
+    
     # 1. Load and preprocess neurolake data (for SUBLIME)
     print(f"\nLoading neurolake data from {args.neurolake_csv}")
     neurolake_df = pd.read_csv(args.neurolake_csv, delimiter='\t')
@@ -1183,7 +1249,38 @@ def main(args):
         if len(neurolake_df) != len(dataset_df):
             raise ValueError(f"Neurolake data ({len(neurolake_df)} rows) and dataset features ({len(dataset_df)} rows) must have the same number of rows!")
     
-    # Apply data sampling before any processing
+    # If using a separate test file, load it
+    test_neurolake_df = None
+    test_dataset_df = None
+    
+    if using_separate_test:
+        print(f"Loading test data from {args.test_csv}")
+        test_df = pd.read_csv(args.test_csv, delimiter='\t')
+        
+        # Split the test data into neurolake and dataset features
+        # The test CSV should contain all columns from both original CSVs
+        neurolake_cols = neurolake_df.columns
+        
+        if args.dataset_features_csv and args.target_column:
+            dataset_cols = dataset_df.columns
+            # Make sure the test file contains all required columns
+            missing_neurolake_cols = [col for col in neurolake_cols if col not in test_df.columns]
+            missing_dataset_cols = [col for col in dataset_cols if col not in test_df.columns]
+            
+            if missing_neurolake_cols:
+                raise ValueError(f"Test CSV is missing neurolake columns: {missing_neurolake_cols}")
+            if missing_dataset_cols:
+                raise ValueError(f"Test CSV is missing dataset feature columns: {missing_dataset_cols}")
+            
+            # Extract the columns for each part
+            test_neurolake_df = test_df[neurolake_cols].copy()
+            test_dataset_df = test_df[dataset_cols].copy()
+            
+            print(f"Test data loaded: {len(test_df)} rows")
+            print(f"Neurolake test data shape: {test_neurolake_df.shape}")
+            print(f"Dataset test features shape: {test_dataset_df.shape}")
+    
+    # Apply data sampling before any processing (only to training data, not test data)
     if args.data_fraction < 0 or args.data_fraction > 1:
         raise ValueError(f"data_fraction must be between 0 and 1, got {args.data_fraction}")
     
@@ -1204,11 +1301,17 @@ def main(args):
         if dataset_df is not None:
             dataset_df = dataset_df.iloc[sampled_indices].reset_index(drop=True)
                 
-        print(f"\nUsing {args.data_fraction:.1%} of the data: {n_samples} samples")
+        print(f"\nUsing {args.data_fraction:.1%} of the data: {n_samples} samples for training/validation")
     
     # 2. Process neurolake data with preprocess_mixed_data for SUBLIME
     X_neurolake = preprocess_mixed_data(neurolake_df, model_dir=args.model_dir)
     print(f"Neurolake data processed: {X_neurolake.shape}")
+    
+    # Process test neurolake data if provided
+    X_test_neurolake = None
+    if test_neurolake_df is not None:
+        X_test_neurolake = preprocess_mixed_data(test_neurolake_df, model_dir=args.model_dir)
+        print(f"Test neurolake data processed: {X_test_neurolake.shape}")
     
     # 3. Load the SUBLIME model
     print(f"\nLoading SUBLIME model from {args.model_dir}")
@@ -1233,11 +1336,14 @@ def main(args):
         print(f"Failed to build FAISS index: {str(e)}. Continuing without index optimization.")
         faiss_index = None
     
-    # Dataset name for cache files
+    # Dataset names for cache files
     dataset_name = os.path.basename(args.neurolake_csv).split('.')[0]
+    test_dataset_name = None
+    if using_separate_test:
+        test_dataset_name = os.path.basename(args.test_csv).split('.')[0] + "_ext_test"
     
     # 5. Extract SUBLIME features from neurolake data
-    print("\nExtracting SUBLIME features...")
+    print("\nExtracting SUBLIME features for training/validation data...")
     sublime_embeddings = extract_in_batches(
         X_neurolake, model, graph_learner, features, adj, sparse, experiment, 
         batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir, 
@@ -1247,7 +1353,22 @@ def main(args):
     # Normalize SUBLIME embeddings
     sublime_embeddings = sublime_embeddings / np.linalg.norm(sublime_embeddings, axis=1, keepdims=True)
     
-    print(f"Feature extraction complete. Extracted shape: {sublime_embeddings.shape}")
+    print(f"Feature extraction complete for training/validation. Extracted shape: {sublime_embeddings.shape}")
+    
+    # Extract SUBLIME features for test data if provided
+    sublime_test_embeddings = None
+    if X_test_neurolake is not None:
+        print("\nExtracting SUBLIME features for test data...")
+        sublime_test_embeddings = extract_in_batches(
+            X_test_neurolake, model, graph_learner, features, adj, sparse, experiment, 
+            batch_size=args.batch_size, cache_dir=args.cache_dir, model_dir=args.model_dir, 
+            dataset_name=test_dataset_name,
+            faiss_index=faiss_index
+        )
+        # Normalize SUBLIME test embeddings
+        sublime_test_embeddings = sublime_test_embeddings / np.linalg.norm(sublime_test_embeddings, axis=1, keepdims=True)
+        
+        print(f"Feature extraction complete for test data. Extracted shape: {sublime_test_embeddings.shape}")
     
     # Check if classification results are available in cache
     classification_results = None
@@ -1262,6 +1383,20 @@ def main(args):
             # Extract probabilities to use as features
             classification_probs = classification_results[:, 0]
             print(f"Extracted classification probabilities for use as features")
+    
+    # Also check for test classification results if using separate test
+    test_classification_results = None
+    test_classification_probs = None
+    if has_classification_head and args.cache_dir and test_dataset_name:
+        model_name = os.path.basename(os.path.normpath(args.model_dir))
+        test_classification_cache_file = os.path.join(args.cache_dir, f"sublime_classifications_{model_name}_{test_dataset_name}.npy")
+        if os.path.exists(test_classification_cache_file):
+            test_classification_results = np.load(test_classification_cache_file)
+            print(f"Loaded test classification results from cache: {test_classification_cache_file}")
+            print(f"Test classification results shape: {test_classification_results.shape}")
+            # Extract probabilities to use as features
+            test_classification_probs = test_classification_results[:, 0]
+            print(f"Extracted test classification probabilities for use as features")
     
     # 5. If embeddings_output is provided, save embeddings to CSV
     if args.embeddings_output:
@@ -1284,6 +1419,28 @@ def main(args):
         # Save to CSV
         embeddings_df.to_csv(args.embeddings_output, index=False)
         print(f"\nSUBLIME embeddings saved to {args.embeddings_output}")
+        
+        # If using separate test, save test embeddings too
+        if sublime_test_embeddings is not None:
+            test_embeddings_df = pd.DataFrame(
+                sublime_test_embeddings,
+                columns=[f"sublime_embedding_{i}" for i in range(sublime_test_embeddings.shape[1])]
+            )
+            
+            # Add index from test data if it exists
+            if 'id' in test_neurolake_df.columns:
+                test_embeddings_df['id'] = test_neurolake_df['id'].values
+            
+            # Add classification results if available
+            if test_classification_results is not None:
+                test_embeddings_df['classification_probability'] = test_classification_results[:, 0]
+                test_embeddings_df['classification_prediction'] = test_classification_results[:, 1]
+                print("Added classification results to test embeddings output")
+            
+            # Save to CSV with _test suffix
+            test_embeddings_output = args.embeddings_output.replace('.csv', '_test.csv')
+            test_embeddings_df.to_csv(test_embeddings_output, index=False)
+            print(f"\nTest SUBLIME embeddings saved to {test_embeddings_output}")
         
         # If no evaluation parameters provided, exit now
         if not (args.dataset_features_csv and args.target_column):
@@ -1322,14 +1479,52 @@ def main(args):
     else:
         raise ValueError(f"Target column '{args.target_column}' not found in the dataset features")
     
+    # Filter test data if needed
+    if test_dataset_df is not None and args.target_column in test_dataset_df.columns:
+        # Create a mask for valid target values (0 or 1)
+        test_valid_mask = test_dataset_df[args.target_column].isin([0, 1])
+        
+        # Count filtered rows
+        test_filtered_count = (~test_valid_mask).sum()
+        if test_filtered_count > 0:
+            print(f"\nRemoving {test_filtered_count} rows from test data where {args.target_column} is not 0 or 1")
+            
+            # Apply the same filtering to both test dataframes to keep them aligned
+            test_dataset_df = test_dataset_df[test_valid_mask].reset_index(drop=True)
+            test_neurolake_df = test_neurolake_df[test_valid_mask].reset_index(drop=True)
+            
+            # Also filter the test embeddings and classification results
+            sublime_test_embeddings = sublime_test_embeddings[test_valid_mask]
+            if test_classification_results is not None:
+                test_classification_results = test_classification_results[test_valid_mask]
+                test_classification_probs = test_classification_results[:, 0]
+
+            print(f"After filtering test data: {len(test_dataset_df)} rows remaining")
+    
     # Process dataset features with a new preprocessing pipeline
     X_dataset, preprocessor, y = preprocess_dataset_features(dataset_df, args.target_column, fit_transform=True)
+    
+    # Process test dataset features if available
+    X_test_dataset = None
+    y_test = None
+    if test_dataset_df is not None:
+        # Use the preprocessor fitted on training data to transform test data
+        X_test_dataset, y_test = preprocess_dataset_features(
+            test_dataset_df, args.target_column, fit_transform=False
+        )
+        print(f"Test dataset features processed: {X_test_dataset.shape}")
     
     # Ensure X_dataset is a 2D array
     if len(X_dataset.shape) == 1:
         print(f"Reshaping X_dataset from 1D array {X_dataset.shape} to 2D array")
         X_dataset = X_dataset.reshape(-1, 1)
         print(f"New X_dataset shape: {X_dataset.shape}")
+    
+    # Ensure X_test_dataset is a 2D array if it exists
+    if X_test_dataset is not None and len(X_test_dataset.shape) == 1:
+        print(f"Reshaping X_test_dataset from 1D array {X_test_dataset.shape} to 2D array")
+        X_test_dataset = X_test_dataset.reshape(-1, 1)
+        print(f"New X_test_dataset shape: {X_test_dataset.shape}")
     
     # Compare model's built-in classification with target values if available
     if classification_results is not None:
@@ -1360,8 +1555,36 @@ def main(args):
         model_results_path = os.path.join(args.output_dir, f"{dataset_name}_model_classification_results.csv")
         model_results_df.to_csv(model_results_path, index=False)
         print(f"Model classification results saved to {model_results_path}")
+        
+        # Also evaluate test data if available
+        if test_classification_results is not None and y_test is not None:
+            test_model_predictions = test_classification_results[:, 1].astype(int)
+            test_model_probabilities = test_classification_results[:, 0]
+            
+            # Calculate accuracy and AUC for the test data
+            test_model_accuracy = accuracy_score(y_test, test_model_predictions)
+            test_model_auc = roc_auc_score(y_test, test_model_probabilities)
+            
+            print("\n" + "="*80)
+            print("TEST DATA - BUILT-IN BINARY CLASSIFIER PERFORMANCE")
+            print("="*80)
+            print(f"Accuracy: {test_model_accuracy:.4f}")
+            print(f"AUC-ROC: {test_model_auc:.4f}")
+            print("\nClassification Report:")
+            print(classification_report(y_test, test_model_predictions))
+            print("="*80)
+            
+            # Save test results to CSV
+            test_model_results_df = pd.DataFrame({
+                'target': y_test,
+                'model_prediction': test_model_predictions,
+                'model_probability': test_model_probabilities
+            })
+            test_model_results_path = os.path.join(args.output_dir, f"{test_dataset_name}_model_classification_results.csv")
+            test_model_results_df.to_csv(test_model_results_path, index=False)
+            print(f"Test model classification results saved to {test_model_results_path}")
     
-    # 7. Evaluate using dataset features and SUBLIME embeddings (and classification probabilities if available)
+    # 7. Evaluate using dataset features and SUBLIME embeddings with possible external test set
     print("\nEvaluating features with XGBoost, CatBoost, and LightGBM...")
     dataset_name = os.path.basename(args.dataset_features_csv).split('.')[-1]
     
@@ -1373,6 +1596,14 @@ def main(args):
     print(f"sublime_embeddings shape: {sublime_embeddings.shape if hasattr(sublime_embeddings, 'shape') else 'No shape attribute'}")
     print(f"y type: {type(y)}")
     print(f"y shape: {y.shape if hasattr(y, 'shape') else 'No shape attribute'}")
+    
+    if X_test_dataset is not None:
+        print(f"X_test_dataset type: {type(X_test_dataset)}")
+        print(f"X_test_dataset shape: {X_test_dataset.shape if hasattr(X_test_dataset, 'shape') else 'No shape attribute'}")
+        print(f"sublime_test_embeddings type: {type(sublime_test_embeddings)}")
+        print(f"sublime_test_embeddings shape: {sublime_test_embeddings.shape if hasattr(sublime_test_embeddings, 'shape') else 'No shape attribute'}")
+        print(f"y_test type: {type(y_test)}")
+        print(f"y_test shape: {y_test.shape if hasattr(y_test, 'shape') else 'No shape attribute'}")
     
     # Force conversion to numpy arrays if needed
     if hasattr(X_dataset, 'toarray'):
@@ -1387,6 +1618,20 @@ def main(args):
         print(f"Converting sublime_embeddings from {type(sublime_embeddings)} to numpy array")
         sublime_embeddings = np.array(sublime_embeddings)
     
+    # Also convert test arrays if they exist
+    if X_test_dataset is not None:
+        if hasattr(X_test_dataset, 'toarray'):
+            print("Converting X_test_dataset from sparse matrix to dense array")
+            X_test_dataset = X_test_dataset.toarray()
+        
+        if not isinstance(X_test_dataset, np.ndarray):
+            print(f"Converting X_test_dataset from {type(X_test_dataset)} to numpy array")
+            X_test_dataset = np.array(X_test_dataset)
+        
+        if not isinstance(sublime_test_embeddings, np.ndarray):
+            print(f"Converting sublime_test_embeddings from {type(sublime_test_embeddings)} to numpy array")
+            sublime_test_embeddings = np.array(sublime_test_embeddings)
+    
     # Ensure both are 2D arrays
     if len(X_dataset.shape) == 1:
         print(f"Reshaping X_dataset from 1D ({X_dataset.shape}) to 2D")
@@ -1396,17 +1641,71 @@ def main(args):
         print(f"Reshaping sublime_embeddings from 1D ({sublime_embeddings.shape}) to 2D")
         sublime_embeddings = sublime_embeddings.reshape(-1, 1)
     
+    # Also ensure test arrays are 2D if they exist
+    if X_test_dataset is not None:
+        if len(X_test_dataset.shape) == 1:
+            print(f"Reshaping X_test_dataset from 1D ({X_test_dataset.shape}) to 2D")
+            X_test_dataset = X_test_dataset.reshape(-1, 1)
+        
+        if len(sublime_test_embeddings.shape) == 1:
+            print(f"Reshaping sublime_test_embeddings from 1D ({sublime_test_embeddings.shape}) to 2D")
+            sublime_test_embeddings = sublime_test_embeddings.reshape(-1, 1)
+    
     print("After conversion:")
     print(f"X_dataset shape: {X_dataset.shape}")
     print(f"sublime_embeddings shape: {sublime_embeddings.shape}")
+    if X_test_dataset is not None:
+        print(f"X_test_dataset shape: {X_test_dataset.shape}")
+        print(f"sublime_test_embeddings shape: {sublime_test_embeddings.shape}")
     print("=== END PRE-EVALUATION DIAGNOSTICS ===\n")
     
-    # Pass the list of k values from args
-    all_results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name,
-                               preprocessor=preprocessor, n_trials=args.n_trials,
-                               classification_probs=classification_probs,
-                               k_neighbors_list=args.k_neighbors, # Pass the list using the correct keyword
-                               device=device)
+    # Call evaluate_features based on whether we have a separate test set or not
+    if using_separate_test:
+        # If we have a separate test set, split training data into train/val
+        from sklearn.model_selection import train_test_split
+        
+        # Split train/val for dataset features
+        X_dataset_train, X_dataset_val, sublime_train, sublime_val, y_train, y_val = train_test_split(
+            X_dataset, sublime_embeddings, y, test_size=0.25, random_state=42, stratify=y
+        )
+        
+        # Split classification probabilities if available
+        cls_probs_train = None
+        cls_probs_val = None
+        if classification_probs is not None:
+            _, _, cls_probs_train, cls_probs_val, _, _ = train_test_split(
+                X_dataset, classification_probs, y, test_size=0.25, random_state=42, stratify=y
+            )
+        
+        # Pass the pre-split data to evaluate_features
+        all_results = evaluate_features(
+            X_dataset, sublime_embeddings, y, dataset_name,
+            preprocessor=preprocessor, n_trials=args.n_trials,
+            classification_probs=classification_probs,
+            k_neighbors_list=args.k_neighbors,
+            device=device,
+            # Pass pre-split data
+            X_dataset_train=X_dataset_train,
+            X_dataset_val=X_dataset_val, 
+            X_dataset_test=X_test_dataset,
+            sublime_train=sublime_train,
+            sublime_val=sublime_val,
+            sublime_test=sublime_test_embeddings,
+            y_train=y_train,
+            y_val=y_val,
+            y_test=y_test,
+            cls_probs_train=cls_probs_train,
+            cls_probs_val=cls_probs_val,
+            cls_probs_test=test_classification_probs,
+            using_external_test=True
+        )
+    else:
+        # Use standard evaluation without pre-split data
+        all_results = evaluate_features(X_dataset, sublime_embeddings, y, dataset_name,
+                                   preprocessor=preprocessor, n_trials=args.n_trials,
+                                   classification_probs=classification_probs,
+                                   k_neighbors_list=args.k_neighbors,
+                                   device=device)
     
     # 8. Print summary
     print("\n" + "="*80)
@@ -1564,6 +1863,7 @@ if __name__ == "__main__":
                         help='List of neighbor counts (k) for KNN features. Set to 0 in the list to disable KNN for that value, though typically just omit 0.')
     parser.add_argument('--data-fraction', type=float, default=1.0,
                         help='Fraction of the input datasets to use (between 0 and 1). Defaults to 1.0 (use all data).')
+    parser.add_argument('--test-csv', type=str, help='Path to a pre-combined CSV file to use as test set. This CSV must contain all columns from both neurolake and dataset features CSVs.')
     
     args = parser.parse_args()
     
