@@ -10,7 +10,7 @@ from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -194,22 +194,27 @@ class DataManager:
         categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
         numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
 
-        # --- Data Coercion --- 
-        # Ensure columns intended to be numeric are coerced, turning errors into NaN
-        # This should be applied *before* imputation, both during fit and transform
-        for col in numerical_cols:
-            if col in X.columns:
-                 try: # Add try-except for safety, though to_numeric should handle it
-                     X[col] = pd.to_numeric(X[col], errors='coerce')
-                 except Exception as e:
-                      print(f"Warning: Could not coerce column '{col}' to numeric: {e}")
-        # --- End Data Coercion ---
+        # --- Define Transformers with Coercion Inside Pipeline ---
+        # Function to coerce to numeric, converting errors to NaN
+        def coerce_numeric(df_): 
+            return df_.apply(lambda x: pd.to_numeric(x, errors='coerce'))
 
-        numerical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
-        categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore'))])
+        numerical_transformer = Pipeline(steps=[
+            ('coerce', FunctionTransformer(coerce_numeric)), # Coerce before imputation
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler())
+        ])
+        categorical_transformer = Pipeline(steps=[
+            ('imputer', SimpleImputer(strategy='most_frequent')),
+            ('onehot', OneHotEncoder(handle_unknown='ignore'))
+        ])
 
         if fit_transform:
-             preprocessor = ColumnTransformer(transformers=[('num', numerical_transformer, numerical_cols), ('cat', categorical_transformer, categorical_cols)])
+             # Define preprocessor *after* defining transformers
+             preprocessor = ColumnTransformer(transformers=[
+                 ('num', numerical_transformer, numerical_cols),
+                 ('cat', categorical_transformer, categorical_cols)
+             ])
              print("Fitting dataset feature preprocessor...")
              processed_data = preprocessor.fit_transform(X)
              self.dataset_preprocessor = preprocessor # Store fitted preprocessor
