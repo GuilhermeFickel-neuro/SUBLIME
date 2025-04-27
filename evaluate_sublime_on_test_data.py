@@ -743,10 +743,11 @@ class FeatureEngineer:
                      if 'cls_probs_test' in split_data:
                           concat_test = np.hstack((concat_test, split_data['cls_probs_test'].reshape(-1, 1)))
                      else:
-                          # If test probs missing, add a column of zeros/NaNs or handle in eval? Add NaNs for now.
-                          print("Warning: Test classification probabilities missing for concatenation. Filling with NaNs.")
-                          nan_col = np.full((concat_test.shape[0], 1), np.nan)
-                          concat_test = np.hstack((concat_test, nan_col))
+                          # If test probs missing, impute with 0.5
+                          print("Warning: Test classification probabilities missing for concatenation. Filling with 0.5.")
+                          # nan_col = np.full((concat_test.shape[0], 1), np.nan) # Old line
+                          prob_col = np.full((concat_test.shape[0], 1), 0.5) # New line
+                          concat_test = np.hstack((concat_test, prob_col)) # Use prob_col
 
                 feature_sets['concat'] = {
                      'train': concat_train, 'val': concat_val, 'test': concat_test, 'train_val': concat_train_val
@@ -776,11 +777,11 @@ class FeatureEngineer:
             sublime_test = split_data['sublime_test']
             sublime_train_val = split_data['sublime_train_val']
             
-            # Pre-normalize just in case (should be done in SublimeHandler)
-            sublime_train = sublime_train / np.linalg.norm(sublime_train, axis=1, keepdims=True)
-            sublime_val = sublime_val / np.linalg.norm(sublime_val, axis=1, keepdims=True)
-            sublime_test = sublime_test / np.linalg.norm(sublime_test, axis=1, keepdims=True)
-            sublime_train_val = sublime_train_val / np.linalg.norm(sublime_train_val, axis=1, keepdims=True)
+            # Embeddings are already normalized by SublimeHandler. No need to re-normalize here.
+            # sublime_train = sublime_train / np.linalg.norm(sublime_train, axis=1, keepdims=True)
+            # sublime_val = sublime_val / np.linalg.norm(sublime_val, axis=1, keepdims=True)
+            # sublime_test = sublime_test / np.linalg.norm(sublime_test, axis=1, keepdims=True)
+            # sublime_train_val = sublime_train_val / np.linalg.norm(sublime_train_val, axis=1, keepdims=True)
             
             for k in self.config.active_k_values:
                 print(f"Calculating KNN features for k={k}...")
@@ -1305,7 +1306,9 @@ def main(args):
              if len(embeddings_df) == len(data_manager.neurolake_df):
                   embeddings_df['id'] = data_manager.neurolake_df['id'].values
              else:
-                  print("Warning: Length mismatch, cannot reliably attach IDs to saved embeddings.")
+                  print("Warning: Length mismatch between embeddings and current neurolake dataframe state "
+                        f"({len(embeddings_df)} vs {len(data_manager.neurolake_df)}). "
+                        "This can happen due to sampling or filtering. Cannot reliably attach original IDs.")
 
         if sublime_handler.has_classification_head and train_val_sublime_results.get('classification_probs') is not None:
             embeddings_df['classification_probability'] = train_val_sublime_results['classification_probs']
@@ -1325,7 +1328,9 @@ def main(args):
                  if len(test_embeddings_df) == len(data_manager.test_neurolake_df):
                      test_embeddings_df['id'] = data_manager.test_neurolake_df['id'].values
                  else:
-                     print("Warning: Length mismatch, cannot reliably attach IDs to saved test embeddings.")
+                     print("Warning: Length mismatch between test embeddings and test neurolake dataframe state "
+                           f"({len(test_embeddings_df)} vs {len(data_manager.test_neurolake_df)}). "
+                           "Cannot reliably attach original IDs.")
 
             if sublime_handler.has_classification_head and test_sublime_results.get('classification_probs') is not None:
                 test_embeddings_df['classification_probability'] = test_sublime_results['classification_probs']
