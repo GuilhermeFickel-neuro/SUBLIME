@@ -1369,7 +1369,7 @@ def main(args):
     # Evaluate built-in on the actual test split if *not* using external test
     if not config.using_separate_test:
          # Need to reconstruct test sublime results from the split
-         test_indices = data_manager.neurolake_df.index # Get indices corresponding to the split test set
+         # test_indices = data_manager.neurolake_df.index # Get indices corresponding to the split test set - REMOVED as neurolake_df is deleted after split
          # This requires more complex index tracking during split, let's skip for now
          # or re-extract for the test split? Re-extracting is inefficient.
          print("Skipping built-in classifier evaluation on internal test split (requires more complex index tracking).")
