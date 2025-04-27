@@ -882,9 +882,7 @@ class Evaluator:
         labels = {split: split_data[f'y_{split}'] for split in ['train', 'val', 'test', 'train_val']}
 
         for model_name, config in self.model_configs.items():
-            print(f"{'='*50}
-{model_name.upper()} Models
-{'='*50}")
+            print(f"{'='*50}\n{model_name.upper()} Models\n{'='*50}")
             self.results[model_name] = {}
             self.best_params[model_name] = {}
             model_class = config['class']
@@ -1433,5 +1431,4 @@ if __name__ == "__main__":
          parser.error(f"Model directory not found: {args.model_dir}")
     if args.test_csv and not os.path.exists(args.test_csv):
          parser.error(f"Separate test file not found: {args.test_csv}")
-
     main(args) 
