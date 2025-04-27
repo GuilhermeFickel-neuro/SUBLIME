@@ -853,11 +853,12 @@ class Evaluator:
                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
                               eval_metric=eval_metric, callbacks=[pruning_callback], verbose=-1) # Suppress verbose
                 elif isinstance(model, CatBoostClassifier):
-                    model.fit(train_features, train_labels, eval_set=(val_features, val_labels), early_stopping_rounds=10, verbose=False)
+                    # Removed early_stopping_rounds=10 as per user request
+                    model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False)
                 elif isinstance(model, XGBClassifier):
-                     # XGBoost needs explicit early stopping for pruning
-                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
-                               early_stopping_rounds=10, verbose=False) # Use early stopping
+                     # Removed early_stopping_rounds=10 as per user request
+                     # XGBoost needs explicit early stopping for pruning - Pruning might be less effective now.
+                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False)
                 else:
                     model.fit(train_features, train_labels) # Generic fit
 
