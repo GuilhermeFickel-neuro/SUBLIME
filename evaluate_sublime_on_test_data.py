@@ -516,9 +516,7 @@ class SublimeHandler:
             print("No built-in classifier results to evaluate.")
             return
 
-        print(f"{'='*80}
-BUILT-IN BINARY CLASSIFIER PERFORMANCE ({dataset_tag})
-{'='*80}")
+        print(f"{'='*80}\nBUILT-IN BINARY CLASSIFIER PERFORMANCE ({dataset_tag})\n{'='*80}")
         probabilities = sublime_results['classification_probs']
         # Assuming binary classification, threshold at 0.5 for predictions
         predictions = (probabilities >= 0.5).astype(int)
