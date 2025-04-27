@@ -259,10 +259,17 @@ class DataManager:
             except Exception as e:
                 print(f"Could not get feature names from preprocessor: {e}. Using generic names.")
         
-        # Fallback to generic names if preprocessor doesn't exist or fails
-        if self.X_dataset is not None:
-             n_features = self.X_dataset.shape[1]
-             return [f"DatasetFeature_{i}" for i in range(n_features)]
+        # Fallback to generic names if preprocessor fails or doesn't exist
+        # Try using the split data dictionary which should persist after cleanup
+        if self.split_data_dict and 'X_dataset_train' in self.split_data_dict:
+            try:
+                n_features = self.split_data_dict['X_dataset_train'].shape[1]
+                print(f"Generating generic dataset feature names (count: {n_features}).")
+                return [f"DatasetFeature_{i}" for i in range(n_features)]
+            except Exception as e:
+                print(f"Error getting shape from split_data_dict['X_dataset_train']: {e}")
+        
+        print("Warning: Could not determine dataset feature names.")
         return []
 
     def perform_train_val_test_split(self, sublime_results, test_sublime_results):
