@@ -487,11 +487,27 @@ class SublimeHandler:
                             self.features, self.adj, self.sparse, faiss_index=self.faiss_index
                         )
 
-                        embedding_vector = result_dict['embedding_vector'].cpu().numpy().flatten() # Ensure CPU, flatten
+                        # Check type before calling .cpu() or .numpy()
+                        embedding_raw = result_dict['embedding_vector']
+                        if isinstance(embedding_raw, np.ndarray):
+                            embedding_vector = embedding_raw.flatten()
+                        elif isinstance(embedding_raw, torch.Tensor):
+                            embedding_vector = embedding_raw.detach().cpu().numpy().flatten()
+                        else:
+                            raise TypeError(f"Unexpected type for embedding_vector: {type(embedding_raw)}")
                         all_embeddings.append(embedding_vector)
 
+                        # Check type for classification probability as well
                         if self.has_classification_head and 'classification_probability' in result_dict:
-                            all_class_probs.append(result_dict['classification_probability'].cpu().item())
+                             prob_raw = result_dict['classification_probability']
+                             if isinstance(prob_raw, (int, float, np.number)):
+                                 # Already a scalar CPU value
+                                 all_class_probs.append(float(prob_raw))
+                             elif isinstance(prob_raw, torch.Tensor):
+                                 # Tensor, move to CPU and get item
+                                 all_class_probs.append(prob_raw.detach().cpu().item())
+                             else:
+                                 raise TypeError(f"Unexpected type for classification_probability: {type(prob_raw)}")
 
                     except Exception as e:
                         print(f"Error processing point {start_idx + j}: {str(e)}")
