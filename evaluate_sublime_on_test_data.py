@@ -194,6 +194,17 @@ class DataManager:
         categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
         numerical_cols = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
 
+        # --- Data Coercion --- 
+        # Ensure columns intended to be numeric are coerced, turning errors into NaN
+        # This should be applied *before* imputation, both during fit and transform
+        for col in numerical_cols:
+            if col in X.columns:
+                 try: # Add try-except for safety, though to_numeric should handle it
+                     X[col] = pd.to_numeric(X[col], errors='coerce')
+                 except Exception as e:
+                      print(f"Warning: Could not coerce column '{col}' to numeric: {e}")
+        # --- End Data Coercion ---
+
         numerical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
         categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore'))])
 
