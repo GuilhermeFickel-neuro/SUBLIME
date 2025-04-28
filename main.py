@@ -708,29 +708,52 @@ class Experiment:
             scheduler_learner = None
             if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
                 print("Using One Cycle Policy learning rate scheduler")
-                scheduler_cl = lr_scheduler.OneCycleLR(
-                    optimizer_cl,
-                    max_lr=args.lr,
-                    total_steps=args.epochs, # Main model trains for all epochs
-                    pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3,
-                    div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
-                    final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
-                )
+                
+                # Calculate total steps for each component based on phases
+                phase1_epochs = args.embedding_only_epochs
+                phase2_epochs = args.graph_learner_only_epochs
+                phase3_epochs = args.epochs - phase1_epochs - phase2_epochs
+                
+                if phase3_epochs < 0:
+                    print("Warning: embedding_only_epochs + graph_learner_only_epochs exceeds total epochs. Adjusting phase durations.")
+                    if phase1_epochs >= args.epochs:
+                         phase1_epochs = args.epochs
+                         phase2_epochs = 0
+                         phase3_epochs = 0
+                    elif phase1_epochs + phase2_epochs > args.epochs:
+                         phase2_epochs = args.epochs - phase1_epochs
+                         phase3_epochs = 0
+                
+                model_total_steps = phase1_epochs + phase3_epochs
+                learner_total_steps = phase2_epochs + phase3_epochs
+
+                if model_total_steps > 0:
+                    scheduler_cl = lr_scheduler.OneCycleLR(
+                        optimizer_cl,
+                        max_lr=args.lr,
+                        total_steps=model_total_steps, # Model trains in Phase 1 and 3
+                        pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3,
+                        div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
+                        final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
+                    )
+                else:
+                    if args.verbose:
+                         print("GCL model will not be trained (no steps in Phase 1 or 3).")
                 
                 # Adjust learner scheduler total steps based on embedding_only_epochs
-                learner_total_steps = args.epochs - args.embedding_only_epochs
+                # learner_total_steps = args.epochs - args.embedding_only_epochs
                 if learner_total_steps > 0:
                     scheduler_learner = lr_scheduler.OneCycleLR(
                         optimizer_learner,
                         max_lr=args.lr,
-                        total_steps=learner_total_steps, # Learner trains for fewer epochs
+                        total_steps=learner_total_steps, # Learner trains in Phase 2 and 3
                         pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3, # Consider adjusting pct_start if desired for the shorter schedule
                         div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
                         final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
                     )
                 else:
                     if args.verbose:
-                        print("Graph learner will not be trained (embedding_only_epochs >= epochs).")
+                        print("Graph learner will not be trained (no steps in Phase 2 or 3).")
 
             model = model.to(self.device)
             graph_learner = graph_learner.to(self.device)
@@ -759,21 +782,33 @@ class Experiment:
             # Get tqdm iterator
             epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
             for epoch in epoch_iterator:
-                model.train()
-               
                 # Determine current training phase
-                is_embedding_phase = epoch < args.embedding_only_epochs
+                phase1_end = args.embedding_only_epochs
+                phase2_end = phase1_end + args.graph_learner_only_epochs
+                
+                is_embedding_phase = epoch < phase1_end
+                is_graph_learner_phase = phase1_end <= epoch < phase2_end
+                is_joint_phase = epoch >= phase2_end
 
+                # --- Set Model Modes and Print Phase Info ---
                 if is_embedding_phase:
-                    # In phase 1, graph learner is not trained
+                    # Phase 1: Train GCL model, freeze learner
+                    model.train()
                     graph_learner.eval()
-                    if args.verbose and epoch == 0 and args.embedding_only_epochs > 0:
-                        print(f"--- Starting Phase 1: Training Embeddings Only (Epochs 0-{args.embedding_only_epochs-1}) ---")
-                else:
-                    # In phase 2, train both model and learner
+                    if args.verbose and epoch == 0 and phase1_end > 0:
+                        print(f"\n--- Starting Phase 1: Training Embeddings Only (Epochs 0-{phase1_end-1}) ---")
+                elif is_graph_learner_phase:
+                    # Phase 2: Freeze GCL model, train learner
+                    model.eval() # Freeze GCL model
                     graph_learner.train()
-                    if args.verbose and epoch == args.embedding_only_epochs:
-                        print(f"--- Starting Phase 2: Training Model and Learner Jointly (Epochs {args.embedding_only_epochs}-{args.epochs-1}) ---")
+                    if args.verbose and epoch == phase1_end:
+                        print(f"\n--- Starting Phase 2: Training Graph Learner Only (Epochs {phase1_end}-{phase2_end - 1}) ---")
+                else: # is_joint_phase
+                    # Phase 3: Train both
+                    model.train()
+                    graph_learner.train()
+                    if args.verbose and epoch == phase2_end:
+                        print(f"\n--- Starting Phase 3: Training Model and Learner Jointly (Epochs {phase2_end}-{args.epochs-1}) ---")
 
                 # Simplified training loop with combined loss calculation
                 if grad_accumulation_steps > 1:
@@ -783,13 +818,26 @@ class Experiment:
                     accumulated_arcface_loss = 0.0
                     accumulated_cls_loss = 0.0
                     
-                    optimizer_cl.zero_grad()
-                    if not is_embedding_phase: # Only zero learner grad if training it
+                    # Zero gradients based on phase
+                    if is_embedding_phase or is_joint_phase: # Model trained in Phase 1 & 3
+                        optimizer_cl.zero_grad()
+                    if is_graph_learner_phase or is_joint_phase: # Learner trained in Phase 2 & 3
                         optimizer_learner.zero_grad()
+                    # optimizer_cl.zero_grad()
+                    # if not is_embedding_phase: # Only zero learner grad if training it # Old logic
+                        # optimizer_learner.zero_grad()
 
                     for i in range(grad_accumulation_steps):
                         # --- Forward passes ---
-                        # --- Phase 1: Only Anchor Graph ---
+                        contrastive_loss = torch.tensor(0.0, device=features.device)
+                        arcface_loss = torch.tensor(0.0, device=features.device)
+                        cls_loss = torch.tensor(0.0, device=features.device)
+                        current_cls_accuracy = torch.tensor(0.0, device=features.device)
+                        emb1, cls_output1 = None, None
+                        emb2, cls_output2 = None, None
+                        Adj = None # Learned adj
+
+                        # --- Phase 1: Only Anchor Graph (Train Model) ---
                         if is_embedding_phase:
                             if args.maskfeat_rate_anchor:
                                 mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
@@ -798,20 +846,57 @@ class Experiment:
                                 features_v1 = copy.deepcopy(features)
                             # Only need anchor view outputs
                             _, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
+                            # Contrastive loss is 0
 
-                            # Set learner outputs to None or dummy values as they are not used
-                            z2, emb2, cls_output = None, None, None
-                            contrastive_loss = torch.tensor(0.0, device=features.device) # No contrastive loss
+                        # --- Phase 2: Anchor + Learned Graph (Train Learner, Frozen Model) ---
+                        elif is_graph_learner_phase:
+                            # view 1: anchor graph (Frozen Model)
+                            if args.maskfeat_rate_anchor:
+                                mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+                                features_v1 = features * (1 - mask_v1)
+                            else:
+                                features_v1 = copy.deepcopy(features)
+                            with torch.no_grad(): # Ensure model grads aren't calculated
+                                z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
-                        # --- Phase 2: Anchor and Learned Graph ---
-                        else:
+                            # view 2: learned graph (Train Learner, Frozen Model)
+                            if args.maskfeat_rate_learner:
+                                mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+                                features_v2 = features * (1 - mask_v2)
+                            else:
+                                features_v2 = copy.deepcopy(features)
+                            # Learn graph
+                            learned_adj = graph_learner(features)
+                            if not args.sparse:
+                                learned_adj = symmetrize(learned_adj)
+                                learned_adj = normalize(learned_adj, 'sym', args.sparse)
+                            Adj = learned_adj # Store for potential use later
+                            # Get learner outputs (Frozen Model)
+                            with torch.no_grad(): # Ensure model grads aren't calculated
+                                z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True)
+
+                            # Calculate Contrastive Loss
+                            if args.contrast_batch_size:
+                                node_idxs = list(range(features.shape[0]))
+                                batches = split_batch(node_idxs, args.contrast_batch_size)
+                                contrastive_loss = 0
+                                for batch in batches:
+                                    weight = len(batch) / features.shape[0]
+                                    # Use z1, z2 calculated under no_grad
+                                    contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
+                            else:
+                                contrastive_loss = model.calc_loss(z1, z2)
+                            # ArcFace and Cls loss are 0 (not relevant for learner training)
+
+                        # --- Phase 3: Anchor + Learned Graph (Train Both) ---
+                        else: # is_joint_phase
                             # view 1: anchor graph
                             if args.maskfeat_rate_anchor:
                                 mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
                                 features_v1 = features * (1 - mask_v1)
                             else:
                                 features_v1 = copy.deepcopy(features)
-                            z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True) # Only need z1 for contrastive
+                            z1, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
                             # view 2: learned graph
                             if args.maskfeat_rate_learner:
@@ -819,16 +904,16 @@ class Experiment:
                                 features_v2 = features * (1 - mask_v2)
                             else:
                                 features_v2 = copy.deepcopy(features)
-                            # Learn graph only in Phase 2
+                            # Learn graph
                             learned_adj = graph_learner(features)
                             if not args.sparse:
                                 learned_adj = symmetrize(learned_adj)
                                 learned_adj = normalize(learned_adj, 'sym', args.sparse)
-                            Adj = learned_adj # Store for potential use later (e.g., evaluation)
+                            Adj = learned_adj # Store for potential use later
                             # Get learner outputs
-                            z2, emb2, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
+                            z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True)
 
-                            # Calculate Contrastive Loss only in Phase 2
+                            # Calculate Contrastive Loss
                             if args.contrast_batch_size:
                                 node_idxs = list(range(features.shape[0]))
                                 batches = split_batch(node_idxs, args.contrast_batch_size)
@@ -839,17 +924,21 @@ class Experiment:
                             else:
                                 contrastive_loss = model.calc_loss(z1, z2)
 
+
                         # --- Loss Calculation (Common part, adapted for phases) ---
+                        # 1. Initialize total loss for this mini-step
                         mini_total_loss = torch.tensor(0.0, device=features.device)
-                        if not is_embedding_phase: # Add contrastive loss only in Phase 2
+
+                        # 2. Add Contrastive Loss (only in Phase 2 and 3)
+                        if is_graph_learner_phase or is_joint_phase:
                             mini_total_loss += contrastive_loss
                             accumulated_contrastive_loss += contrastive_loss.item() # Accumulate for reporting
 
-                        # 2. ArcFace Loss (if enabled)
+                        # 3. ArcFace Loss (if enabled, only in Phase 1 and 3)
                         current_arcface_loss = torch.tensor(0.0, device=features.device)
-                        if args.use_arcface:
+                        if args.use_arcface and (is_embedding_phase or is_joint_phase):
                             if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
-                                # Use anchor embedding (emb1) in Phase 1, learner embedding (emb2) in Phase 2
+                                # Use anchor embedding (emb1) in Phase 1, learner embedding (emb2) in Phase 3
                                 embedding_for_arcface = emb1 if is_embedding_phase else emb2
                                 try:
                                     # Ensure the embedding is valid before passing
@@ -859,19 +948,19 @@ class Experiment:
                                         mini_total_loss += args.arcface_weight * current_arcface_loss
                                         accumulated_arcface_loss += current_arcface_loss.item() # Accumulate for reporting
                                     else:
-                                        if args.verbose and i == 0: print(f"Warning: Embedding for ArcFace is None in epoch {epoch}, step {i} (Phase {'1' if is_embedding_phase else '2'}). Skipping ArcFace.")
+                                        if args.verbose and i == 0: print(f"Warning: Embedding for ArcFace is None in epoch {epoch}, step {i} (Phase {'1' if is_embedding_phase else '3'}). Skipping ArcFace.")
                                 except Exception as e:
-                                    print(f"Warning: Error during ArcFace calculation step {i} (Phase {'1' if is_embedding_phase else '2'}): {e}")
+                                    print(f"Warning: Error during ArcFace calculation step {i} (Phase {'1' if is_embedding_phase else '3'}): {e}")
                                     current_arcface_loss = torch.tensor(0.0, device=features.device)
                             else:
                                 if args.verbose and i == 0: print("Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly.")
-                        
-                        # 3. Classification Loss (if enabled)
+
+                        # 4. Classification Loss (if enabled, only in Phase 1 and 3)
                         current_cls_loss = torch.tensor(0.0, device=features.device)
                         current_cls_accuracy = torch.tensor(0.0, device=features.device)
-                        if use_classification_head:
-                            # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output) in Phase 2
-                            cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output
+                        if use_classification_head and (is_embedding_phase or is_joint_phase):
+                            # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output2) in Phase 3
+                            cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output2
                             if cls_output_for_loss is not None and labels is not None:
                                 classification_mask = (labels != -1)
                                 if classification_mask.any():
@@ -881,35 +970,39 @@ class Experiment:
                                     mini_total_loss += args.annotation_loss_weight * current_cls_loss
                                     accumulated_cls_loss += current_cls_loss.item() # Accumulate for reporting
                                 else:
-                                    # No valid labels found this step - possible if labels change?
+                                    # No valid labels found this step
                                     pass
                             else:
                                 # Should not happen if use_classification_head is True
-                                if args.verbose and i == 0: print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {'1' if is_embedding_phase else '2'}).")
-                        
+                                if args.verbose and i == 0: print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {'1' if is_embedding_phase else '3'}).")
+
+
                         # Scale loss for accumulation
                         scaled_mini_loss = mini_total_loss / grad_accumulation_steps
- 
+
                         # Backward pass for this step
                         scaled_mini_loss.backward()
- 
+
                         accumulated_loss += mini_total_loss.item() # Accumulate total unscaled loss for reporting average
- 
+
                         # Store accuracy from first step for reporting
                         if i == 0:
                            first_step_cls_accuracy = current_cls_accuracy
- 
+
                     # --- After Accumulation Steps ---
-                    # Gradient Clipping (apply to accumulated grads)
+                    # Gradient Clipping (apply to accumulated grads based on phase)
                     if args.clip_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
-                        if not is_embedding_phase: # Only clip learner grad if training it
+                        if is_embedding_phase or is_joint_phase: # Clip model grads if model was trained
+                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                        if is_graph_learner_phase or is_joint_phase: # Clip learner grads if learner was trained
                             torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
- 
-                    # Update weights
-                    optimizer_cl.step()
-                    if not is_embedding_phase: # Only update learner if training it
+
+                    # Update weights based on phase
+                    if is_embedding_phase or is_joint_phase: # Update model weights if model was trained
+                        optimizer_cl.step()
+                    if is_graph_learner_phase or is_joint_phase: # Update learner weights if learner was trained
                         optimizer_learner.step()
+
 
                     # Calculate average losses for reporting
                     loss = accumulated_loss / grad_accumulation_steps
@@ -919,54 +1012,66 @@ class Experiment:
                     # Use accuracy from the first mini-batch for reporting consistency
                     if use_classification_head:
                         current_cls_accuracy = first_step_cls_accuracy
- 
+
                 else:
                     # --- Standard Training Path (no gradient accumulation) ---
-                    optimizer_cl.zero_grad()
-                    if not is_embedding_phase: # Only zero learner grad if training it
+                    # Zero gradients based on phase
+                    if is_embedding_phase or is_joint_phase: # Model trained in Phase 1 & 3
+                        optimizer_cl.zero_grad()
+                    if is_graph_learner_phase or is_joint_phase: # Learner trained in Phase 2 & 3
                         optimizer_learner.zero_grad()
+                    # optimizer_cl.zero_grad()
+                    # if not is_embedding_phase: # Only zero learner grad if training it # Old logic
+                        # optimizer_learner.zero_grad()
 
                     # --- Forward passes (Select based on phase) ---
+                    contrastive_loss = torch.tensor(0.0, device=features.device)
+                    arcface_loss = torch.tensor(0.0, device=features.device)
+                    cls_loss = torch.tensor(0.0, device=features.device)
+                    current_cls_accuracy = torch.tensor(0.0, device=features.device)
+                    emb1, cls_output1 = None, None
+                    emb2, cls_output2 = None, None
+                    Adj = None # Learned adj
+
+                    # --- Phase 1: Only Anchor Graph (Train Model) ---
                     if is_embedding_phase:
-                        # --- Phase 1: Only Anchor Graph ---
+                       if args.maskfeat_rate_anchor:
+                           mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+                           features_v1 = features * (1 - mask_v1)
+                       else:
+                           features_v1 = copy.deepcopy(features)
+                       # Only need anchor view outputs
+                       _, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
+                       Adj = None # No learned adj in Phase 1
+
+                    # --- Phase 2: Anchor + Learned Graph (Train Learner, Frozen Model) ---
+                    elif is_graph_learner_phase:
+                        # view 1: anchor graph (Frozen Model)
                         if args.maskfeat_rate_anchor:
                            mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
                            features_v1 = features * (1 - mask_v1)
                         else:
                            features_v1 = copy.deepcopy(features)
-                        # Only need anchor view outputs
-                        _, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
-                        contrastive_loss = torch.tensor(0.0, device=features.device)
-                        emb2, cls_output = None, None # Not used
-                        Adj = anchor_adj # Use anchor_adj for eval if needed in phase 1? Or None? Let's set to None for safety.
-                        Adj = None # Explicitly None as learned adj not computed
+                        with torch.no_grad(): # Model is frozen
+                           z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
-                    else:
-                        # --- Phase 2: Anchor and Learned Graph ---
-                        # view 1: anchor graph
-                        if args.maskfeat_rate_anchor:
-                            mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
-                            features_v1 = features * (1 - mask_v1)
-                        else:
-                            features_v1 = copy.deepcopy(features)
-                        z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True) # Only need z1
-
-                        # view 2: learned graph
+                        # view 2: learned graph (Train Learner, Frozen Model)
                         if args.maskfeat_rate_learner:
-                            mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
-                            features_v2 = features * (1 - mask_v2)
+                           mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+                           features_v2 = features * (1 - mask_v2)
                         else:
-                            features_v2 = copy.deepcopy(features)
-                        # Learn graph only in Phase 2
+                           features_v2 = copy.deepcopy(features)
+                        # Learn graph
                         learned_adj = graph_learner(features)
                         if not args.sparse:
                            learned_adj = symmetrize(learned_adj)
                            learned_adj = normalize(learned_adj, 'sym', args.sparse)
                         Adj = learned_adj # Store for potential use later
-                        # Get learner outputs
-                        z2, emb2, _, cls_output = model(features_v2, learned_adj, 'learner', include_features=True)
+                        # Get learner outputs (Frozen Model)
+                        with torch.no_grad(): # Model is frozen
+                           z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True)
 
-                        # Calculate Contrastive Loss only in Phase 2
+                        # Calculate Contrastive Loss
                         if args.contrast_batch_size:
                            node_idxs = list(range(features.shape[0]))
                            batches = split_batch(node_idxs, args.contrast_batch_size)
@@ -976,24 +1081,64 @@ class Experiment:
                                contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
                         else:
                            contrastive_loss = model.calc_loss(z1, z2)
-                        # Assign anchor outputs for phase 1 compatibility in later loss calculations
-                        emb1, cls_output1 = None, None # Not used directly for loss in Phase 2
+                        # Assign None to outputs not used for loss in this phase
+                        emb1, cls_output1, emb2, cls_output2 = None, None, None, None
+
+
+                    # --- Phase 3: Anchor + Learned Graph (Train Both) ---
+                    else: # is_joint_phase
+                        # view 1: anchor graph
+                        if args.maskfeat_rate_anchor:
+                            mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+                            features_v1 = features * (1 - mask_v1)
+                        else:
+                            features_v1 = copy.deepcopy(features)
+                        z1, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True) # Need z1, emb1, cls_output1
+
+                        # view 2: learned graph
+                        if args.maskfeat_rate_learner:
+                            mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+                            features_v2 = features * (1 - mask_v2)
+                        else:
+                            features_v2 = copy.deepcopy(features)
+                        # Learn graph
+                        learned_adj = graph_learner(features)
+                        if not args.sparse:
+                           learned_adj = symmetrize(learned_adj)
+                           learned_adj = normalize(learned_adj, 'sym', args.sparse)
+                        Adj = learned_adj # Store for potential use later
+                        # Get learner outputs
+                        z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True) # Need z2, emb2, cls_output2
+
+                        # Calculate Contrastive Loss
+                        if args.contrast_batch_size:
+                           node_idxs = list(range(features.shape[0]))
+                           batches = split_batch(node_idxs, args.contrast_batch_size)
+                           contrastive_loss = 0
+                           for batch in batches:
+                               weight = len(batch) / features.shape[0]
+                               contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
+                        else:
+                           contrastive_loss = model.calc_loss(z1, z2)
+
 
                     # --- Loss Calculation ---
-                    # 1. Contrastive Loss
+                    # 1. Initialize total loss
                     total_loss = torch.tensor(0.0, device=features.device)
-                    print_loss_components = {'contrastive': contrastive_loss.item()}
-                    if not is_embedding_phase: # Add contrastive loss only in Phase 2
+                    print_loss_components = {} # Reset components dict
+
+                    # 2. Add Contrastive Loss (Phase 2 & 3)
+                    if is_graph_learner_phase or is_joint_phase:
                         total_loss += contrastive_loss
                         print_loss_components['contrastive'] = contrastive_loss.item()
                     else:
                         print_loss_components['contrastive'] = 0.0 # Show 0 for contrastive in Phase 1 report
 
-                    # 2. ArcFace Loss (if enabled)
+                    # 3. ArcFace Loss (Phase 1 & 3, if enabled)
                     arcface_loss = torch.tensor(0.0, device=features.device)
-                    if args.use_arcface:
+                    if args.use_arcface and (is_embedding_phase or is_joint_phase):
                         if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
-                            # Use anchor embedding (emb1) in Phase 1, learner embedding (emb2) in Phase 2
+                            # Use anchor embedding (emb1) in Phase 1, learner embedding (emb2) in Phase 3
                             embedding_for_arcface = emb1 if is_embedding_phase else emb2
                             try:
                                 if embedding_for_arcface is not None:
@@ -1002,22 +1147,25 @@ class Experiment:
                                     total_loss += args.arcface_weight * arcface_loss
                                     print_loss_components['arcface_sampled'] = arcface_loss.item()
                                 else:
-                                     if args.verbose: print(f"Warning: Embedding for ArcFace is None in epoch {epoch} (Phase {'1' if is_embedding_phase else '2'}). Skipping ArcFace.")
+                                     if args.verbose: print(f"Warning: Embedding for ArcFace is None in epoch {epoch} (Phase {'1' if is_embedding_phase else '3'}). Skipping ArcFace.")
                                      print_loss_components['arcface_sampled'] = 0.0
                             except Exception as e:
-                                print(f"Warning: Error during ArcFace calculation (Phase {'1' if is_embedding_phase else '2'}): {e}")
+                                print(f"Warning: Error during ArcFace calculation (Phase {'1' if is_embedding_phase else '3'}): {e}")
                                 arcface_loss = torch.tensor(0.0, device=features.device)
                                 print_loss_components['arcface_sampled'] = 0.0
                         else:
                             print("Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly.")
                             print_loss_components['arcface_sampled'] = 0.0
-                    
-                    # 3. Classification Loss (if enabled)
+                    else:
+                        print_loss_components['arcface_sampled'] = 0.0 # Ensure key exists
+
+
+                    # 4. Classification Loss (Phase 1 & 3, if enabled)
                     cls_loss = torch.tensor(0.0, device=features.device)
                     current_cls_accuracy = torch.tensor(0.0, device=features.device)
-                    if use_classification_head:
-                        # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output) in Phase 2
-                        cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output
+                    if use_classification_head and (is_embedding_phase or is_joint_phase):
+                        # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output2) in Phase 3
+                        cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output2
                         if cls_output_for_loss is not None and labels is not None:
                             classification_mask = (labels != -1)
                             if classification_mask.any():
@@ -1026,15 +1174,15 @@ class Experiment:
                                 cls_loss, current_cls_accuracy = self.loss_binary_cls(masked_logits, masked_labels)
                                 total_loss += args.annotation_loss_weight * cls_loss
                                 print_loss_components['classification'] = cls_loss.item()
-                                
-                                # Track best classification accuracy during training
+
+                                # Track best classification accuracy during training (only when model is trained)
                                 if current_cls_accuracy > best_cls_accuracy:
                                     best_cls_accuracy = current_cls_accuracy
                             else:
                                 if args.verbose: print("Warning: Classification head active, but no valid labels (0 or 1) found in this epoch.")
                                 print_loss_components['classification'] = 0.0
                         else:
-                            print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {'1' if is_embedding_phase else '2'}).")
+                            print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {'1' if is_embedding_phase else '3'}).")
                             print_loss_components['classification'] = 0.0
                     else:
                          # Ensure keys exist even if classification head is off
@@ -1043,7 +1191,7 @@ class Experiment:
                     # --- Combined Loss Backward Pass ---
                     loss = total_loss # Assign to 'loss' variable for consistency
 
-                    # NaN Loss Check
+                    # NaN Loss Check (remains the same)
                     if torch.isnan(loss):
                         print(f"\nWarning: NaN loss detected at epoch {epoch}. Attempting to reload last checkpoint.")
                         if last_checkpoint_path:
@@ -1055,6 +1203,8 @@ class Experiment:
                                 if loaded_anchor_adj is not None:
                                      anchor_adj = loaded_anchor_adj
                                 print(f"Successfully reloaded checkpoint from {last_checkpoint_path}. Skipping optimizer step for epoch {epoch}.")
+                                # Reset tqdm iterator description if needed after reload? Or assume it continues
+                                epoch_iterator.set_description(f"Training (Resumed from {last_checkpoint_path})")
                                 continue # Skip the rest of the loop for this epoch
                             except Exception as e:
                                 print(f"Error reloading checkpoint {last_checkpoint_path} after NaN loss: {e}")
@@ -1062,50 +1212,61 @@ class Experiment:
                                 break # Exit the epoch loop for this trial
                         else:
                             print("No previous checkpoint found to revert to after NaN loss. Stopping training trial.")
-                            break # Exit the epoch loop for this trial                    
+                            break # Exit the epoch loop for this trial
 
-                    # Backward and optimize
+                    # Backward and optimize based on phase
                     loss.backward()
 
-                    # Gradient Clipping
+                    # Gradient Clipping based on phase
                     if args.clip_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
-                        if not is_embedding_phase: # Only clip learner grad if training it
+                        if is_embedding_phase or is_joint_phase: # Clip model grads if model was trained
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                        if is_graph_learner_phase or is_joint_phase: # Clip learner grads if learner was trained
                             torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
- 
-                    optimizer_cl.step()
-                    if not is_embedding_phase: # Only update learner if training it
+
+                    # Optimizer step based on phase
+                    if is_embedding_phase or is_joint_phase: # Step model optimizer if model was trained
+                        optimizer_cl.step()
+                    if is_graph_learner_phase or is_joint_phase: # Step learner optimizer if learner was trained
                         optimizer_learner.step()
 
-                # Step the schedulers if using OneCycleLR
-                if scheduler_cl:
+
+                # Step the schedulers if using OneCycleLR, based on phase
+                if scheduler_cl and (is_embedding_phase or is_joint_phase): # Step model scheduler if model trained
                     scheduler_cl.step()
-                # Only step learner scheduler in phase 2 AND if it exists
-                if not is_embedding_phase and scheduler_learner:
+                if scheduler_learner and (is_graph_learner_phase or is_joint_phase): # Step learner scheduler if learner trained
                     scheduler_learner.step()
-                    
+
                 # Print current learning rates periodically using tqdm.write
                 # Adapt LR reporting based on phase
-                lr_model_str = f"{optimizer_cl.param_groups[0]['lr']:.6f}"
-                lr_learner_str = f"{optimizer_learner.param_groups[0]['lr']:.6f}" if not is_embedding_phase else "N/A (Phase 1)"
-                if args.verbose and epoch % 10 == 0:
-                    tqdm.write(f"Epoch {epoch} - LR model: {lr_model_str}, LR learner: {lr_learner_str}")
+                lr_model_str = f"{optimizer_cl.param_groups[0]['lr']:.6f}" if scheduler_cl else "N/A"
+                lr_learner_str = f"{optimizer_learner.param_groups[0]['lr']:.6f}" if scheduler_learner else "N/A"
+                # Only show active LRs
+                if is_embedding_phase: lr_learner_str = "N/A (Phase 1)"
+                if is_graph_learner_phase: lr_model_str = "N/A (Phase 2)"
 
-                # Structure Bootstrapping
-                if (1 - args.tau) and (args.c == 0 or epoch % args.c == 0):
+                if args.verbose and epoch % 10 == 0:
+                    tqdm.write(f"Epoch {epoch} [Phase {1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}] - LR model: {lr_model_str}, LR learner: {lr_learner_str}")
+
+
+                # Structure Bootstrapping - Should only happen when learner is active (Phase 2 & 3) and Adj exists
+                if Adj is not None and (1 - args.tau) and (args.c == 0 or epoch % args.c == 0):
+                    # This condition ensures Adj was computed (i.e., not Phase 1)
+                    # Original bootstrapping logic follows:
                     if args.sparse:
                         # Memory-efficient sparse bootstrapping using DGL graph manipulation
                         num_nodes = anchor_adj.num_nodes()
                         dev = anchor_adj.device
-                        
+
                         # 1. Get edges and weights from anchor_adj (DGL graph)
                         u_a, v_a = anchor_adj.edges()
                         w_a = anchor_adj.edata['w'] if 'w' in anchor_adj.edata else torch.ones(anchor_adj.num_edges(), device=dev)
-                        
+
                         # 2. Get edges and weights from learned Adj (DGL graph)
                         # Ensure Adj is on the same device and detach its weights
                         Adj = Adj.to(dev)
                         u_l, v_l = Adj.edges()
+                        # Detach learned weights before combining to prevent gradient flow through bootstrap update
                         w_l = Adj.edata['w'].detach() if 'w' in Adj.edata else torch.ones(Adj.num_edges(), device=dev)
 
                         # 3. Combine edges and calculate new weights
@@ -1119,10 +1280,10 @@ class Experiment:
                             learned_edge_dict[(u_l[i].item(), v_l[i].item())] = i
 
                         new_u, new_v, new_w = [], [], []
-                        
+
                         # Combine keys (edges)
                         all_edges = set(anchor_edge_dict.keys()) | set(learned_edge_dict.keys())
-                        
+
                         tau = args.tau
                         one_minus_tau = 1.0 - tau
 
@@ -1134,7 +1295,7 @@ class Experiment:
                             w_l_val = 0.0
                             if (u, v) in learned_edge_dict:
                                 w_l_val = w_l[learned_edge_dict[(u, v)]]
-                                
+
                             final_w = tau * w_a_val + one_minus_tau * w_l_val
 
                             # Add edge if weight is non-zero (or above a small threshold if desired)
@@ -1142,12 +1303,13 @@ class Experiment:
                                 new_u.append(u)
                                 new_v.append(v)
                                 new_w.append(final_w)
-                        
+
                         # 4. Create the new anchor_adj DGL graph
                         if len(new_u) > 0:
-                            new_anchor_adj = dgl.graph((torch.tensor(new_u, device=dev), torch.tensor(new_v, device=dev)), 
+                            new_anchor_adj = dgl.graph((torch.tensor(new_u, device=dev), torch.tensor(new_v, device=dev)),
                                                        num_nodes=num_nodes)
-                            new_anchor_adj.edata['w'] = torch.tensor(new_w, device=dev)
+                            # Assign weights as tensors
+                            new_anchor_adj.edata['w'] = torch.tensor(new_w, device=dev, dtype=torch.float32) # Ensure float type
                             anchor_adj = new_anchor_adj
                         else:
                             # Handle case where the combined graph might be empty
@@ -1158,86 +1320,110 @@ class Experiment:
                         # Dense bootstrapping remains the same
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
-                # --- Update tqdm postfix --- 
+
+                # --- Update tqdm postfix ---
                 # Use averaged losses if using grad accum, otherwise use direct loss values
-                report_loss = avg_loss if grad_accumulation_steps > 1 else loss.item()
-                postfix_dict = {'Loss': f"{report_loss:.4f}"}
+                report_loss = loss if grad_accumulation_steps > 1 else loss.item() # Use avg loss from accum or current loss
+                phase_str = f"P{1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}"
+                postfix_dict = {'Phase': phase_str, 'Loss': f"{report_loss:.4f}"}
+                
                 if use_classification_head:
-                    postfix_dict['ClsAcc'] = f"{current_cls_accuracy.item():.4f}"
-                    # Keep tracking accuracy for periodic average
-                    cls_accuracies.append(current_cls_accuracy.item())
-                 
-                # Add individual loss components to postfix
+                    # Use accuracy from accum or current
+                    report_cls_acc = first_step_cls_accuracy.item() if grad_accumulation_steps > 1 else current_cls_accuracy.item()
+                    # Only report accuracy if it was calculated (Phase 1 & 3)
+                    if is_embedding_phase or is_joint_phase:
+                        postfix_dict['ClsAcc'] = f"{report_cls_acc:.4f}"
+                        cls_accuracies.append(report_cls_acc) # Track accuracy when it's calculated
+                    else:
+                        postfix_dict['ClsAcc'] = "N/A" # Phase 2
+
+
+                # Add individual loss components to postfix based on phase and reporting source
                 if grad_accumulation_steps > 1:
                      report_contrastive = avg_contrastive_loss
                      report_arcface = avg_arcface_loss
                      report_cls_loss = avg_cls_loss
-                elif 'print_loss_components' in locals(): # Standard path
+                else: # Standard path, use print_loss_components dict
                      report_contrastive = print_loss_components.get('contrastive', 0.0)
                      report_arcface = print_loss_components.get('arcface_sampled', 0.0)
                      report_cls_loss = print_loss_components.get('classification', 0.0)
-                else: # Should not happen, fallback
-                     report_contrastive, report_arcface, report_cls_loss = 0.0, 0.0, 0.0
-                 
-                if not is_embedding_phase: postfix_dict['Contra'] = f"{report_contrastive:.4f}"
-                if args.use_arcface: postfix_dict['ArcF'] = f"{report_arcface:.4f}"
-                if use_classification_head: postfix_dict['ClsLoss'] = f"{report_cls_loss:.4f}"
-                 
+
+                # Only display losses relevant to the current phase
+                if is_graph_learner_phase or is_joint_phase: postfix_dict['Contra'] = f"{report_contrastive:.4f}"
+                if args.use_arcface and (is_embedding_phase or is_joint_phase): postfix_dict['ArcF'] = f"{report_arcface:.4f}"
+                if use_classification_head and (is_embedding_phase or is_joint_phase): postfix_dict['ClsLoss'] = f"{report_cls_loss:.4f}"
+
                 epoch_iterator.set_postfix(postfix_dict)
                 # --- End tqdm postfix update ---
 
-                # Periodic Checkpointing
+                # Periodic Checkpointing (remains the same, saves state at end of epoch)
                 if epoch > 0 and epoch % args.checkpoint_freq == 0:
                     current_checkpoint_path = self.save_checkpoint(
                         epoch, model, graph_learner, optimizer_cl, optimizer_learner, anchor_adj, args
                     )
                     last_checkpoint_path = current_checkpoint_path # Update last known good path
-                    
+
                     # Also report average classification accuracy over period if using classification head
                     if use_classification_head and len(cls_accuracies) > 0:
                         avg_cls_acc = sum(cls_accuracies) / len(cls_accuracies)
                         if args.verbose:
                             # Use tqdm.write for this message
-                            tqdm.write(f"Checkpoint @ Epoch {epoch}: Avg classification accuracy over last {len(cls_accuracies)} epochs: {avg_cls_acc:.4f}") 
+                            tqdm.write(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}")
                         cls_accuracies = []  # Reset for next period
 
-                if epoch % args.eval_freq == 0:
+                # Evaluation (remains the same, happens based on epoch freq)
+                # Note: Evaluation uses the 'Adj' computed in the epoch, which is None in Phase 1.
+                # The evaluate_adj_by_cls function might need handling if Adj is None. Let's check it.
+                # Ok, evaluate_adj_by_cls takes Adj. It will likely fail if Adj is None.
+                # We should only evaluate if Adj is available (i.e., in Phase 2 or 3).
+                if Adj is not None and epoch % args.eval_freq == 0:
                     if args.downstream_task == 'classification':
-                        model.eval()
+                        model.eval() # Set both to eval for consistency during evaluation
                         graph_learner.eval()
-                        f_adj = Adj
+                        f_adj = Adj # Use the learned Adj from this epoch for evaluation
 
                         if args.sparse:
+                            # Ensure weights are detached for evaluation
                             f_adj.edata['w'] = f_adj.edata['w'].detach()
                         else:
                             f_adj = f_adj.detach()
 
+                        # Pass labels (combined) and nclasses (determined earlier)
                         val_accu, test_accu, _ = self.evaluate_adj_by_cls(f_adj, features, nfeats, labels,
                                                                                nclasses, train_mask, val_mask, test_mask, args)
+                        # Note: evaluation uses the combined labels and nclasses=2 if annotation was provided.
+                        # This evaluates the quality of the learned graph (Adj) for the downstream task.
 
                         if val_accu > best_val:
                             best_val = val_accu.item() if isinstance(val_accu, torch.Tensor) else val_accu # Ensure float
                             best_val_test = test_accu
                             best_epoch = epoch
+                            if args.verbose:
+                                # Use tqdm.write for this message
+                                tqdm.write(f"** New Best Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **")
 
                     elif args.downstream_task == 'clustering' and labels is not None:
-                        pass
+                        pass # Clustering evaluation logic can remain here if needed
+            
+            # After all epochs, report best classification accuracy if tracked
+            if use_classification_head:
+                 final_best_cls_acc = best_cls_accuracy.item() if isinstance(best_cls_accuracy, torch.Tensor) else best_cls_accuracy
+                 print(f"Best classification accuracy during training phases 1 & 3: {final_best_cls_acc:.4f}")
 
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val)
                 test_accuracies.append(best_val_test.item())
                 if args.verbose:
-                    print("Trial: ", trial + 1)
-                    print("Best val ACC: ", best_val)
-                    print("Best test ACC: ", best_val_test.item())
-                    
-                    # Report best classification accuracy if used
-                    if use_classification_head:
-                        print("Best classification accuracy during training: ", best_cls_accuracy.item() if isinstance(best_cls_accuracy, torch.Tensor) else best_cls_accuracy) # Ensure it's a float
+                    print("\nTrial: ", trial + 1)
+                    print(f"Best Eval val ACC: {best_val:.4f} (Epoch {best_epoch})") # Report best val accuracy from evaluation
+                    print(f"Corresponding test ACC: {best_val_test.item():.4f}")
+                    # Report best classification accuracy if used (already printed above)
+                    # if use_classification_head:
+                        # print("Best classification accuracy during training: ", best_cls_accuracy.item() if isinstance(best_cls_accuracy, torch.Tensor) else best_cls_accuracy) # Ensure it's a float
 
-            # After training completes
+            # After training completes (remains the same)
             if args.save_model:
-                # Save model, graph learner, features and final adjacency matrix
+                # Save model, graph learner, features and final anchor adjacency matrix
                 self.save_model(model, graph_learner, features, anchor_adj, args.sparse, args,
                                output_dir=args.output_dir)
                 if args.verbose:
@@ -1393,6 +1579,8 @@ def create_parser():
     # Add the new argument here
     parser.add_argument('--embedding_only_epochs', type=int, default=0,
                         help='Number of initial epochs to train only embeddings using anchor graph (ArcFace/Classification loss), disabling learner and contrastive loss.')
+    parser.add_argument('--graph_learner_only_epochs', type=int, default=0,
+                        help='Number of epochs to train only the graph learner, freezing the main GCL model.')
 
     # GCL Module -Augmentation
     parser.add_argument('-maskfeat_rate_learner', type=float, default=0.2)
