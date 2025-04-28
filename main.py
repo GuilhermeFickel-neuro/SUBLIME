@@ -703,57 +703,6 @@ class Experiment:
                 anchor_adj = loaded_anchor_adj
             # --- End Checkpoint Setup --- 
 
-            # Set up OneCycleLR scheduler if enabled
-            scheduler_cl = None
-            scheduler_learner = None
-            if hasattr(args, 'use_one_cycle') and args.use_one_cycle:
-                print("Using One Cycle Policy learning rate scheduler")
-                
-                # Calculate total steps for each component based on phases
-                phase1_epochs = args.embedding_only_epochs
-                phase2_epochs = args.graph_learner_only_epochs
-                phase3_epochs = args.epochs - phase1_epochs - phase2_epochs
-                
-                if phase3_epochs < 0:
-                    print("Warning: embedding_only_epochs + graph_learner_only_epochs exceeds total epochs. Adjusting phase durations.")
-                    if phase1_epochs >= args.epochs:
-                         phase1_epochs = args.epochs
-                         phase2_epochs = 0
-                         phase3_epochs = 0
-                    elif phase1_epochs + phase2_epochs > args.epochs:
-                         phase2_epochs = args.epochs - phase1_epochs
-                         phase3_epochs = 0
-                
-                model_total_steps = phase1_epochs + phase3_epochs
-                learner_total_steps = phase2_epochs + phase3_epochs
-
-                if model_total_steps > 0:
-                    scheduler_cl = lr_scheduler.OneCycleLR(
-                        optimizer_cl,
-                        max_lr=args.lr,
-                        total_steps=model_total_steps, # Model trains in Phase 1 and 3
-                        pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3,
-                        div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
-                        final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
-                    )
-                else:
-                    if args.verbose:
-                         print("GCL model will not be trained (no steps in Phase 1 or 3).")
-                
-                # Adjust learner scheduler total steps based on embedding_only_epochs
-                # learner_total_steps = args.epochs - args.embedding_only_epochs
-                if learner_total_steps > 0:
-                    scheduler_learner = lr_scheduler.OneCycleLR(
-                        optimizer_learner,
-                        max_lr=args.lr,
-                        total_steps=learner_total_steps, # Learner trains in Phase 2 and 3
-                        pct_start=args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3, # Consider adjusting pct_start if desired for the shorter schedule
-                        div_factor=args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
-                        final_div_factor=args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
-                    )
-                else:
-                    if args.verbose:
-                        print("Graph learner will not be trained (no steps in Phase 2 or 3).")
 
             model = model.to(self.device)
             graph_learner = graph_learner.to(self.device)
@@ -779,6 +728,30 @@ class Experiment:
             if grad_accumulation_steps > 1 and args.verbose:
                 print(f"Using gradient accumulation with {grad_accumulation_steps} steps")
                 
+            # --- Initialize Schedulers --- 
+            scheduler_cl = None
+            scheduler_learner = None
+            one_cycle_defaults = {
+                'pct_start': args.one_cycle_pct_start if hasattr(args, 'one_cycle_pct_start') else 0.3,
+                'div_factor': args.one_cycle_div_factor if hasattr(args, 'one_cycle_div_factor') else 25.0,
+                'final_div_factor': args.one_cycle_final_div_factor if hasattr(args, 'one_cycle_final_div_factor') else 10000.0
+            }
+
+            # Calculate phase durations
+            phase1_epochs = args.embedding_only_epochs
+            phase2_epochs = args.graph_learner_only_epochs
+            phase3_epochs = args.epochs - phase1_epochs - phase2_epochs
+
+            if phase3_epochs < 0:
+                print("Warning: embedding_only_epochs + graph_learner_only_epochs exceeds total epochs. Adjusting phase durations.")
+                if phase1_epochs >= args.epochs:
+                    phase1_epochs = args.epochs
+                    phase2_epochs = 0
+                    phase3_epochs = 0
+                elif phase1_epochs + phase2_epochs > args.epochs:
+                    phase2_epochs = args.epochs - phase1_epochs
+                    phase3_epochs = 0
+
             # Get tqdm iterator
             epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
             for epoch in epoch_iterator:
@@ -789,6 +762,28 @@ class Experiment:
                 is_embedding_phase = epoch < phase1_end
                 is_graph_learner_phase = phase1_end <= epoch < phase2_end
                 is_joint_phase = epoch >= phase2_end
+
+                # --- Initialize/Re-initialize Schedulers at Phase Start ---
+                if args.use_one_cycle:
+                    if epoch == 0 and phase1_epochs > 0: # Start of Phase 1
+                        print(f"Initializing OneCycleLR for Model (Phase 1: {phase1_epochs} steps)")
+                        scheduler_cl = lr_scheduler.OneCycleLR(
+                            optimizer_cl, max_lr=args.lr, total_steps=phase1_epochs, **one_cycle_defaults
+                        )
+                    elif epoch == phase1_end and phase2_epochs > 0: # Start of Phase 2
+                         print(f"Initializing OneCycleLR for Learner (Phase 2: {phase2_epochs} steps)")
+                         scheduler_learner = lr_scheduler.OneCycleLR(
+                             optimizer_learner, max_lr=args.lr, total_steps=phase2_epochs, **one_cycle_defaults
+                         )
+                    elif epoch == phase2_end and phase3_epochs > 0: # Start of Phase 3
+                        print(f"Re-initializing OneCycleLR for Model (Phase 3: {phase3_epochs} steps)")
+                        scheduler_cl = lr_scheduler.OneCycleLR(
+                            optimizer_cl, max_lr=args.lr, total_steps=phase3_epochs, **one_cycle_defaults
+                        )
+                        print(f"Re-initializing OneCycleLR for Learner (Phase 3: {phase3_epochs} steps)")
+                        scheduler_learner = lr_scheduler.OneCycleLR(
+                            optimizer_learner, max_lr=args.lr, total_steps=phase3_epochs, **one_cycle_defaults
+                        )
 
                 # --- Set Model Modes and Print Phase Info ---
                 if is_embedding_phase:
