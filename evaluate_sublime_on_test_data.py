@@ -20,6 +20,26 @@ import time
 import matplotlib.pyplot as plt
 import gc
 
+# Define coerce_numeric at the top level
+def coerce_numeric(df_):
+    """Coerces DataFrame columns to numeric, handling errors."""
+    for col in df_.columns:
+        # Skip if already numeric
+        if pd.api.types.is_numeric_dtype(df_[col]):
+            continue
+        try:
+            # Attempt coercion, raising errors for non-numeric
+            df_[col] = pd.to_numeric(df_[col], errors='raise')
+        except (ValueError, TypeError):
+            # If coercion fails, print a message and potentially convert to category
+            print(f"Column {col} could not be coerced to numeric, keeping as object/category.")
+            # Heuristic: Convert to category if low cardinality
+            if df_[col].nunique() < 50 and len(df_) > 0:
+                print(f"  Converting column {col} to category.")
+                df_[col] = df_[col].astype('category')
+            # Consider adding handling for specific non-numeric types like dates if needed
+    return df_
+
 from main import Experiment  # Assuming main.py and Experiment class exist
 
 # Suppress Optuna logging
@@ -196,25 +216,12 @@ class DataManager:
 
         # --- Define Transformers with Coercion Inside Pipeline ---
         # Function to coerce to numeric, converting errors to NaN
-        def coerce_numeric(df_): 
-            for col in df_.columns:
-                try:
-                    df_[col] = pd.to_numeric(df_[col], errors='raise')
-                except (ValueError, TypeError):
-                    print(f"Column {col} could not be coerced to numeric, keeping as object/category.")
-                    # Optionally convert to category if it seems appropriate
-                    if df_[col].nunique() < 50 and len(df_) > 0: # Heuristic
-                        print(f"  Converting column {col} to category.")
-                        df_[col] = df_[col].astype('category')
-                    # Or handle specific non-numeric types like dates if necessary
-            return df_
-        
-        if self.config.preprocess_mode == 'simple':
-            processed_df = coerce_numeric(df.copy()) # <<< Used here
-            # ... rest of the method ...
+        # Removed local definition of coerce_numeric here
+
+        # Removed the problematic if-check for self.config.preprocess_mode
 
         numerical_transformer = Pipeline(steps=[
-            ('coerce', FunctionTransformer(coerce_numeric)), # Coerce before imputation
+            ('coerce', FunctionTransformer(coerce_numeric)), # Coerce before imputation - uses top-level function
             ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler())
         ])
