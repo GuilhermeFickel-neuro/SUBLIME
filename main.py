@@ -1520,6 +1520,10 @@ def create_parser():
     parser.add_argument('-relationship_dataset', type=str, default=None,
                         help='Path to the relationship dataset CSV file (e.g., relationships.csv)')
 
+    # New argument for relationship edge weight
+    parser.add_argument('--relationship_weight', type=float, default=1.0,
+                        help='Weight assigned to edges created from the relationship dataset (default: 1.0)')
+
     # New argument to load pre-trained model weights
     parser.add_argument('-load_pretrained_path', type=str, default=None,
                         help='Path to directory containing pre-trained model.pt and graph_learner.pt to load weights from.')

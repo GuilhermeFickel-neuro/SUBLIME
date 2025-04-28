@@ -444,7 +444,9 @@ def load_person_data(args):
                 if idx1 != idx2:
                     rows.extend([idx1, idx2]) # Add edge in both directions for symmetry
                     cols.extend([idx2, idx1])
-                    data.extend([1.0, 1.0])   # Use weight 1.0 for explicit relationships
+                    # Use the weight from args, default 1.0
+                    rel_weight = args.relationship_weight if hasattr(args, 'relationship_weight') else 1.0
+                    data.extend([rel_weight, rel_weight])
                     valid_edges += 1
                 else:
                     skipped_self_loops += 1
