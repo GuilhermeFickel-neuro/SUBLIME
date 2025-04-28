@@ -402,184 +402,6 @@ class Experiment:
         if isinstance(graph_learner, FGP_learner) and hasattr(graph_learner, 'i'):
             f.write(f'fgp_elu_alpha: {graph_learner.i}\n')
 
-    def load_model(self, input_dir='saved_models'):
-        """
-        Load a saved model, graph learner, features and adjacency matrix
-        
-        Args:
-            input_dir: Directory where models are saved
-            
-        Returns:
-            tuple: (model, graph_learner, features, adj, sparse)
-        """
-        # Load config
-        config = {}
-        with open(os.path.join(input_dir, 'config.txt'), 'r') as f:
-            for line in f:
-                key, value = line.strip().split(': ')
-                if key in ['sparse', 'use_layer_norm', 'use_residual', 'use_arcface', 'use_sampled_arcface', 'use_classification_head']:
-                    config[key] = value.lower() in ['true', '1', 't', 'y', 'yes']
-                elif key in ['feature_dim', 'num_nodes', 'nlayers', 'hidden_dim', 'emb_dim', 'proj_dim', 'k', 'num_classes', 'arcface_num_samples', 'classification_head_layers']:
-                    config[key] = int(value)
-                elif key in ['dropout', 'dropout_adj', 'arcface_scale', 'arcface_margin', 'classification_dropout']:
-                    config[key] = float(value)
-                else:
-                    config[key] = value
-        
-        sparse = config['sparse']
-        
-        # Load features
-        features = torch.load(os.path.join(input_dir, 'features.pt')).to(self.device)
-        
-        # If model_params is not provided, use parameters from config
-        model_params = {
-            'nlayers': config.get('nlayers', 2),
-            'hidden_dim': config.get('hidden_dim', 128),
-            'emb_dim': config.get('emb_dim', 32),
-            'proj_dim': config.get('proj_dim', 32),
-            'dropout': config.get('dropout', 0.3),
-            'dropout_adj': config.get('dropout_adj', 0.3),
-            'k': config.get('k', 10),
-            'sim_function': config.get('sim_function', 'cosine'),
-            'activation_learner': config.get('activation_learner', 'relu')
-        }
-        
-        # Check for arcface parameters in config
-        use_arcface = config.get('use_arcface', False)
-        arcface_params = {}
-        if use_arcface:
-            arcface_params['use_arcface'] = True
-            arcface_params['num_classes'] = config.get('num_classes', 0)
-            arcface_params['arcface_scale'] = config.get('arcface_scale', 30.0)
-            arcface_params['arcface_margin'] = config.get('arcface_margin', 0.5)
-            
-            # Add sampled arcface config loading
-            use_sampled_arcface = config.get('use_sampled_arcface', False)
-            if use_sampled_arcface:
-                arcface_params['use_sampled_arcface'] = True
-                arcface_params['arcface_num_samples'] = config.get('arcface_num_samples', 5000)
-
-        # Check for classification head parameters in config
-        use_classification_head = config.get('use_classification_head', False)
-        classification_params = {}
-        if use_classification_head:
-            classification_params['use_classification_head'] = True
-            classification_params['classification_dropout'] = config.get('classification_dropout', 0.3)
-            classification_params['classification_head_layers'] = config.get('classification_head_layers', 2)
-
-        # Add flags to model loading defaults if needed (assuming they weren't saved)
-        use_layer_norm_load = config.get('use_layer_norm', False)
-        use_residual_load = config.get('use_residual', False)
-        
-        # Initialize models with arcface and classification parameters if needed
-        init_params = {
-            'nlayers': model_params['nlayers'],
-            'in_dim': features.shape[1],
-            'hidden_dim': model_params['hidden_dim'],
-            'emb_dim': model_params['emb_dim'],
-            'proj_dim': model_params['proj_dim'],
-            'dropout': model_params['dropout'],
-            'dropout_adj': model_params['dropout_adj'],
-            'sparse': sparse,
-            'use_layer_norm': use_layer_norm_load,
-            'use_residual': use_residual_load
-        }
-        
-        # Add ArcFace parameters if needed
-        if use_arcface:
-            init_params.update(arcface_params)
-            
-        # Add classification head parameters if needed
-        if use_classification_head:
-            init_params.update(classification_params)
-            
-        # Initialize model with all collected parameters
-        model = GCL(**init_params)
-        
-        # Determine type of graph learner from config or saved file
-        learner_type = config.get('type_learner', None)
-        
-        if learner_type is None and os.path.exists(os.path.join(input_dir, 'graph_learner.pt')):
-            # Try to determine from saved state dict
-            learner_state = torch.load(os.path.join(input_dir, 'graph_learner.pt'))
-            
-            # Check which type of learner it is
-            if 'Adj' in learner_state:
-                learner_type = 'fgp'
-            elif any('layers.0.weight' in key for key in learner_state.keys()):
-                # Determine if it's MLP, ATT, or GNN
-                if any('w' in key for key in learner_state.keys()):
-                    learner_type = 'att'
-                else:
-                    # Check if it's a GNN (need to load adjacency first)
-                    # For now, assume MLP as default
-                    learner_type = 'mlp'
-        
-        # Load adjacency matrix *before* initializing graph learner if needed (e.g., FGP)
-        adj = self._load_adjacency(input_dir, sparse)
-        initial_graph_data_loaded = adj # Assume loaded adj is the initial graph
-
-        # Create the appropriate graph learner
-        if learner_type == 'fgp':
-            # Pass the loaded initial graph data
-            fgp_elu_alpha = config.get('fgp_elu_alpha', 6) # Load alpha, default to 6
-            graph_learner = FGP_learner(k=model_params['k'], knn_metric=model_params['sim_function'], i=fgp_elu_alpha,
-                                      sparse=sparse, initial_graph_data=initial_graph_data_loaded)
-        elif learner_type == 'mlp':
-            graph_learner = MLP_learner(2, features.shape[1], model_params['k'], 
-                                     model_params['sim_function'], 6, sparse,
-                                     model_params['activation_learner'])
-        elif learner_type == 'att':
-            graph_learner = ATT_learner(2, features.shape[1], model_params['k'], 
-                                     model_params['sim_function'], 6, sparse,
-                                     model_params['activation_learner'])
-        elif learner_type == 'gnn':
-            # Need to load adjacency first
-            # Adjacency (initial_graph_data_loaded) is already loaded
-            graph_learner = GNN_learner(2, features.shape[1], model_params['k'], 
-                                     model_params['sim_function'], 6, sparse,
-                                     model_params['activation_learner'], initial_graph_data_loaded)
-        else:
-            # Default to FGP learner if no specific type is found
-            fgp_elu_alpha = config.get('fgp_elu_alpha', 6)
-            graph_learner = FGP_learner(k=model_params['k'], knn_metric=model_params['sim_function'], i=fgp_elu_alpha,
-                                      sparse=sparse, initial_graph_data=initial_graph_data_loaded)
-        
-        # Load model weights
-        model.load_state_dict(torch.load(os.path.join(input_dir, 'model.pt')))
-        graph_learner.load_state_dict(torch.load(os.path.join(input_dir, 'graph_learner.pt')))
-        
-        # Move models to device
-        model = model.to(self.device)
-        graph_learner = graph_learner.to(self.device)
-        
-        # Return the loaded components, including the initial graph data used by the learner
-        return model, graph_learner, features, initial_graph_data_loaded, sparse
-
-    def _load_adjacency(self, input_dir, sparse):
-        """Helper method to load adjacency matrix"""
-        adj_path = os.path.join(input_dir, 'adjacency.pt')
-        
-        if sparse:
-            # Load the saved data (could be dict for DGL or sparse tensor)
-            saved_data = torch.load(adj_path)
-            if isinstance(saved_data, dict):
-                # This is a saved DGL graph
-                edges = saved_data['edges']
-                weights = saved_data['weights']
-                num_nodes = saved_data['num_nodes']
-                
-                # Recreate DGL graph
-                adj = dgl.graph(edges, num_nodes=num_nodes, device=self.device)
-                adj.edata['w'] = weights.to(self.device)
-            else:
-                # This is a torch sparse tensor
-                adj = saved_data.to(self.device)
-        else:
-            adj = torch.load(adj_path).to(self.device)
-            
-        return adj
-
     def process_new_point(self, new_point, model, graph_learner, features, adj, sparse, replace_idx=None, faiss_index=None):
         """
         Process a new data point by replacing an existing point and extract its embedding features
@@ -1050,7 +872,7 @@ class Experiment:
                         if use_classification_head:
                             # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output) in Phase 2
                             cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output
-                            if cls_output is not None and labels is not None:
+                            if cls_output_for_loss is not None and labels is not None:
                                 classification_mask = (labels != -1)
                                 if classification_mask.any():
                                     masked_logits = cls_output_for_loss[classification_mask]
@@ -1196,7 +1018,7 @@ class Experiment:
                     if use_classification_head:
                         # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output) in Phase 2
                         cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output
-                        if cls_output is not None and labels is not None:
+                        if cls_output_for_loss is not None and labels is not None:
                             classification_mask = (labels != -1)
                             if classification_mask.any():
                                 masked_logits = cls_output_for_loss[classification_mask]
