@@ -1164,11 +1164,68 @@ class Experiment:
                 # Structure Bootstrapping
                 if (1 - args.tau) and (args.c == 0 or epoch % args.c == 0):
                     if args.sparse:
-                        learned_adj_torch_sparse = dgl_graph_to_torch_sparse(Adj)
-                        anchor_adj_torch_sparse = anchor_adj_torch_sparse * args.tau \
-                                                  + learned_adj_torch_sparse * (1 - args.tau)
-                        anchor_adj = torch_sparse_to_dgl_graph(anchor_adj_torch_sparse)
+                        # Memory-efficient sparse bootstrapping using DGL graph manipulation
+                        num_nodes = anchor_adj.num_nodes()
+                        dev = anchor_adj.device
+                        
+                        # 1. Get edges and weights from anchor_adj (DGL graph)
+                        u_a, v_a = anchor_adj.edges()
+                        w_a = anchor_adj.edata['w'] if 'w' in anchor_adj.edata else torch.ones(anchor_adj.num_edges(), device=dev)
+                        
+                        # 2. Get edges and weights from learned Adj (DGL graph)
+                        # Ensure Adj is on the same device and detach its weights
+                        Adj = Adj.to(dev)
+                        u_l, v_l = Adj.edges()
+                        w_l = Adj.edata['w'].detach() if 'w' in Adj.edata else torch.ones(Adj.num_edges(), device=dev)
+
+                        # 3. Combine edges and calculate new weights
+                        # Use a dictionary for efficient lookup: map (u, v) tuple to index
+                        anchor_edge_dict = {}
+                        for i in range(anchor_adj.num_edges()):
+                            anchor_edge_dict[(u_a[i].item(), v_a[i].item())] = i
+
+                        learned_edge_dict = {}
+                        for i in range(Adj.num_edges()):
+                            learned_edge_dict[(u_l[i].item(), v_l[i].item())] = i
+
+                        new_u, new_v, new_w = [], [], []
+                        
+                        # Combine keys (edges)
+                        all_edges = set(anchor_edge_dict.keys()) | set(learned_edge_dict.keys())
+                        
+                        tau = args.tau
+                        one_minus_tau = 1.0 - tau
+
+                        for u, v in all_edges:
+                            w_a_val = 0.0
+                            if (u, v) in anchor_edge_dict:
+                                w_a_val = w_a[anchor_edge_dict[(u, v)]]
+
+                            w_l_val = 0.0
+                            if (u, v) in learned_edge_dict:
+                                w_l_val = w_l[learned_edge_dict[(u, v)]]
+                                
+                            final_w = tau * w_a_val + one_minus_tau * w_l_val
+
+                            # Add edge if weight is non-zero (or above a small threshold if desired)
+                            if final_w > EOS: # Using EOS threshold from utils
+                                new_u.append(u)
+                                new_v.append(v)
+                                new_w.append(final_w)
+                        
+                        # 4. Create the new anchor_adj DGL graph
+                        if len(new_u) > 0:
+                            new_anchor_adj = dgl.graph((torch.tensor(new_u, device=dev), torch.tensor(new_v, device=dev)), 
+                                                       num_nodes=num_nodes)
+                            new_anchor_adj.edata['w'] = torch.tensor(new_w, device=dev)
+                            anchor_adj = new_anchor_adj
+                        else:
+                            # Handle case where the combined graph might be empty
+                            print(f"Warning: Bootstrapped graph at epoch {epoch} became empty.")
+                            anchor_adj = dgl.graph(([], []), num_nodes=num_nodes, device=dev) # Keep same num_nodes
+
                     else:
+                        # Dense bootstrapping remains the same
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
                 # --- Update tqdm postfix --- 
