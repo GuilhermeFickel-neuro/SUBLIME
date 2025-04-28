@@ -66,7 +66,7 @@ def _check_processed_data(data, dataset_name=""):
 
     return True, data # Return True indicating success
 
-def preprocess_mixed_data(df_main, df_annotated=None, model_dir='sublime_models', target_column=None):
+def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_column=None):
     """
     Preprocess main and optional annotated dataframes using a single transformer.
     Transformer is fitted ONLY on df_main if not loaded.
@@ -74,7 +74,7 @@ def preprocess_mixed_data(df_main, df_annotated=None, model_dir='sublime_models'
     Args:
         df_main: Main Pandas DataFrame.
         df_annotated: Optional annotated Pandas DataFrame.
-        model_dir: Directory to save/load transformation models.
+        output_dir: Directory to save/load the transformation model (data_transformer.joblib).
         target_column: Name of the target column in df_annotated (if provided).
 
     Returns:
@@ -85,9 +85,11 @@ def preprocess_mixed_data(df_main, df_annotated=None, model_dir='sublime_models'
         )
         Raises ValueError if preprocessing fails critical checks.
     """
+    if not output_dir:
+        raise ValueError("output_dir must be provided to preprocess_mixed_data.")
     # Create model directory if it doesn't exist
-    os.makedirs(model_dir, exist_ok=True)
-    transformer_path = os.path.join(model_dir, 'data_transformer.joblib')
+    os.makedirs(output_dir, exist_ok=True)
+    transformer_path = os.path.join(output_dir, 'data_transformer.joblib')
     preprocessor = None
 
     # Separate numerical and categorical columns from the *main* dataframe
@@ -273,7 +275,7 @@ def load_person_data(args):
     # === 3. Preprocess Data ===
     # Pass both dataframes, preprocessor handles fitting/loading and transforming
     processed_main, processed_annotated, preprocessor = preprocess_mixed_data(
-        df_main, df_annotated, model_dir='sublime_models', target_column=target_column
+        df_main, df_annotated, output_dir=args.output_dir, target_column=target_column
     )
 
     # === 4. Combine Features ===
