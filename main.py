@@ -1568,6 +1568,9 @@ def create_parser():
                        help='Use Layer Normalization (0=disabled, 1=enabled)')
     parser.add_argument('-use_residual', type=int, default=0,
                        help='Use Residual Connections (0=disabled, 1=enabled)')
+    # Add the new argument here
+    parser.add_argument('--embedding_only_epochs', type=int, default=0,
+                        help='Number of initial epochs to train only embeddings using anchor graph (ArcFace/Classification loss), disabling learner and contrastive loss.')
 
     # GCL Module -Augmentation
     parser.add_argument('-maskfeat_rate_learner', type=float, default=0.2)
