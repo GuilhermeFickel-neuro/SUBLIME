@@ -197,7 +197,21 @@ class DataManager:
         # --- Define Transformers with Coercion Inside Pipeline ---
         # Function to coerce to numeric, converting errors to NaN
         def coerce_numeric(df_): 
-            return df_.apply(lambda x: pd.to_numeric(x, errors='coerce'))
+            for col in df_.columns:
+                try:
+                    df_[col] = pd.to_numeric(df_[col], errors='raise')
+                except (ValueError, TypeError):
+                    print(f"Column {col} could not be coerced to numeric, keeping as object/category.")
+                    # Optionally convert to category if it seems appropriate
+                    if df_[col].nunique() < 50 and len(df_) > 0: # Heuristic
+                        print(f"  Converting column {col} to category.")
+                        df_[col] = df_[col].astype('category')
+                    # Or handle specific non-numeric types like dates if necessary
+            return df_
+        
+        if self.config.preprocess_mode == 'simple':
+            processed_df = coerce_numeric(df.copy()) # <<< Used here
+            # ... rest of the method ...
 
         numerical_transformer = Pipeline(steps=[
             ('coerce', FunctionTransformer(coerce_numeric)), # Coerce before imputation
