@@ -19,6 +19,7 @@ import faiss
 import time
 import matplotlib.pyplot as plt
 import gc
+import sys # Import sys for sys.exit
 
 # Define coerce_numeric at the top level
 def coerce_numeric(df_):
@@ -31,13 +32,13 @@ def coerce_numeric(df_):
             # Attempt coercion, raising errors for non-numeric
             df_[col] = pd.to_numeric(df_[col], errors='raise')
         except (ValueError, TypeError):
-            # If coercion fails, print a message and potentially convert to category
-            print(f"Column {col} could not be coerced to numeric, keeping as object/category.")
-            # Heuristic: Convert to category if low cardinality
-            if df_[col].nunique() < 50 and len(df_) > 0:
-                print(f"  Converting column {col} to category.")
-                df_[col] = df_[col].astype('category')
-            # Consider adding handling for specific non-numeric types like dates if needed
+            # If coercion fails, print a message and force to NaN
+            print(f"Column {col} could not be coerced to numeric. Forcing errors to NaN.")
+            df_[col] = pd.to_numeric(df_[col], errors='coerce')
+            # Optional: Add category conversion here if desired, but NaN is needed for imputation
+            # if df_[col].nunique() < 50 and len(df_) > 0:
+            #     print(f"  Converting column {col} to category.") # This line might not be needed now
+            #     df_[col] = df_[col].astype('category')
     return df_
 
 from main import Experiment  # Assuming main.py and Experiment class exist
@@ -1325,6 +1326,17 @@ def main(args):
     data_manager = DataManager(config)
     data_manager.load_and_sample_data()
     data_manager.filter_target_variable() # Apply target filtering early
+
+    # Check if dataframes are empty after loading/filtering
+    if data_manager.neurolake_df is None or data_manager.neurolake_df.empty:
+        print(f"WARNING: Neurolake DataFrame for dataset {config.dataset_name} is empty after loading/filtering. Skipping evaluation for this dataset.")
+        # Exit cleanly for this dataset iteration. The calling shell script will continue.
+        sys.exit(0)
+    # Also check the primary dataset df if it exists (it should mirror neurolake_df's row count after filtering)
+    if config.dataset_features_csv and (data_manager.dataset_df is None or data_manager.dataset_df.empty):
+        print(f"WARNING: Dataset Features DataFrame for dataset {config.dataset_name} is empty after loading/filtering. Skipping evaluation for this dataset.")
+        sys.exit(0)
+
     data_manager.preprocess_neurolake()
     # Only preprocess dataset features if needed for evaluation
     if config.dataset_features_csv and config.target_column:
