@@ -868,8 +868,7 @@ class Experiment:
                             Adj = learned_adj # Store for potential use later
                             # Get learner outputs (Frozen Model, allow graph connection)
                             # REMOVED torch.no_grad() here
-                            # z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval() # Original
-                            z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True) # Capture emb2 and cls_output2
+                            z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval()
 
                             # Calculate Contrastive Loss
                             if args.contrast_batch_size:
@@ -882,7 +881,7 @@ class Experiment:
                                     contrastive_loss += model.calc_loss(z1[batch], z2[batch]) * weight
                             else:
                                 contrastive_loss = model.calc_loss(z1, z2)
-                            # ArcFace and Cls loss are 0 (not relevant for learner training) # OLD COMMENT - REMOVED
+                            # ArcFace and Cls loss are 0 (not relevant for learner training)
 
                         # --- Phase 3: Anchor + Learned Graph (Train Both) ---
                         else: # is_joint_phase
@@ -931,21 +930,11 @@ class Experiment:
                             accumulated_contrastive_loss += contrastive_loss.item() # Accumulate for reporting
 
                         # 3. ArcFace Loss (if enabled, only in Phase 1 and 3)
-                        # MODIFIED: Include Phase 2
                         current_arcface_loss = torch.tensor(0.0, device=features.device)
-                        # if args.use_arcface and (is_embedding_phase or is_joint_phase): # Original condition
-                        if args.use_arcface and (is_embedding_phase or is_graph_learner_phase or is_joint_phase): # Include Phase 2
+                        if args.use_arcface and (is_embedding_phase or is_joint_phase):
                             if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
                                 # Use anchor embedding (emb1) in Phase 1, learner embedding (emb2) in Phase 3
-                                # ADDED: Use learner embedding (emb2) in Phase 2 as well
-                                # embedding_for_arcface = emb1 if is_embedding_phase else emb2 # Original logic
-                                if is_embedding_phase:
-                                    embedding_for_arcface = emb1
-                                elif is_graph_learner_phase or is_joint_phase:
-                                    embedding_for_arcface = emb2
-                                else: # Should not happen
-                                    embedding_for_arcface = None
-
+                                embedding_for_arcface = emb1 if is_embedding_phase else emb2
                                 try:
                                     # Ensure the embedding is valid before passing
                                     if embedding_for_arcface is not None:
@@ -954,35 +943,19 @@ class Experiment:
                                         mini_total_loss += args.arcface_weight * current_arcface_loss
                                         accumulated_arcface_loss += current_arcface_loss.item() # Accumulate for reporting
                                     else:
-                                        # Adjusted warning message phase reporting
-                                        phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                                        if args.verbose and i == 0: print(f"Warning: Embedding for ArcFace is None in epoch {epoch}, step {i} (Phase {phase_str}). Skipping ArcFace.")
+                                        if args.verbose and i == 0: print(f"Warning: Embedding for ArcFace is None in epoch {epoch}, step {i} (Phase {'1' if is_embedding_phase else '3'}). Skipping ArcFace.")
                                 except Exception as e:
-                                    # Adjusted warning message phase reporting
-                                    phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                                    print(f"Warning: Error during ArcFace calculation step {i} (Phase {phase_str}): {e}")
+                                    print(f"Warning: Error during ArcFace calculation step {i} (Phase {'1' if is_embedding_phase else '3'}): {e}")
                                     current_arcface_loss = torch.tensor(0.0, device=features.device)
                             else:
-                                phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                                if args.verbose and i == 0: print(f"Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly (Phase {phase_str}).")
-
+                                if args.verbose and i == 0: print("Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly.")
 
                         # 4. Classification Loss (if enabled, only in Phase 1 and 3)
-                        # MODIFIED: Include Phase 2
                         current_cls_loss = torch.tensor(0.0, device=features.device)
-                        current_cls_accuracy = torch.tensor(0.0, device=features.device) # Initialize accuracy for this step
-                        # if use_classification_head and (is_embedding_phase or is_joint_phase): # Original condition
-                        if use_classification_head and (is_embedding_phase or is_graph_learner_phase or is_joint_phase): # Include Phase 2
+                        current_cls_accuracy = torch.tensor(0.0, device=features.device)
+                        if use_classification_head and (is_embedding_phase or is_joint_phase):
                             # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output2) in Phase 3
-                            # ADDED: Use learner cls output (cls_output2) in Phase 2 as well
-                            # cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output2 # Original logic
-                            if is_embedding_phase:
-                                cls_output_for_loss = cls_output1
-                            elif is_graph_learner_phase or is_joint_phase:
-                                cls_output_for_loss = cls_output2
-                            else: # Should not happen
-                                cls_output_for_loss = None
-
+                            cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output2
                             if cls_output_for_loss is not None and labels is not None:
                                 classification_mask = (labels != -1)
                                 if classification_mask.any():
@@ -996,9 +969,7 @@ class Experiment:
                                     pass
                             else:
                                 # Should not happen if use_classification_head is True
-                                # Adjusted warning message phase reporting
-                                phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                                if args.verbose and i == 0: print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {phase_str}).")
+                                if args.verbose and i == 0: print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {'1' if is_embedding_phase else '3'}).")
 
 
                         # Scale loss for accumulation
@@ -1010,13 +981,8 @@ class Experiment:
                         accumulated_loss += mini_total_loss.item() # Accumulate total unscaled loss for reporting average
 
                         # Store accuracy from first step for reporting
-                        # MODIFIED: Capture accuracy correctly inside i == 0 block
                         if i == 0:
-                           # Check if classification was actually run in this step (Phase 1, 2, or 3)
-                           if use_classification_head and (is_embedding_phase or is_graph_learner_phase or is_joint_phase):
-                               first_step_cls_accuracy = current_cls_accuracy # Capture accuracy if calculated
-                           else:
-                               first_step_cls_accuracy = torch.tensor(0.0, device=features.device) # Default if not calculated
+                           first_step_cls_accuracy = current_cls_accuracy
 
                     # --- After Accumulation Steps ---
                     # Gradient Clipping (apply to accumulated grads based on phase)
@@ -1098,8 +1064,7 @@ class Experiment:
                         Adj = learned_adj # Store for potential use later
                         # Get learner outputs (Frozen Model, allow graph connection)
                         # REMOVED torch.no_grad() here
-                        # z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval() # Original
-                        z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True) # Capture emb2 and cls_output2
+                        z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval()
 
                         # Calculate Contrastive Loss
                         if args.contrast_batch_size:
@@ -1166,18 +1131,10 @@ class Experiment:
 
                     # 3. ArcFace Loss (Phase 1 & 3, if enabled)
                     arcface_loss = torch.tensor(0.0, device=features.device)
-                    if args.use_arcface and (is_embedding_phase or is_graph_learner_phase or is_joint_phase):
+                    if args.use_arcface and (is_embedding_phase or is_joint_phase):
                         if hasattr(model, 'arcface') and isinstance(model.arcface, SampledArcFaceLayer):
                             # Use anchor embedding (emb1) in Phase 1, learner embedding (emb2) in Phase 3
-                            # ADDED: Use learner embedding (emb2) in Phase 2 as well
-                            # embedding_for_arcface = emb1 if is_embedding_phase else emb2 # Original logic
-                            if is_embedding_phase:
-                                embedding_for_arcface = emb1
-                            elif is_graph_learner_phase or is_joint_phase:
-                                embedding_for_arcface = emb2
-                            else: # Should not happen
-                                embedding_for_arcface = None
-
+                            embedding_for_arcface = emb1 if is_embedding_phase else emb2
                             try:
                                 if embedding_for_arcface is not None:
                                     arcface_output, sampled_labels = model.arcface(embedding_for_arcface, arcface_labels)
@@ -1185,39 +1142,25 @@ class Experiment:
                                     total_loss += args.arcface_weight * arcface_loss
                                     print_loss_components['arcface_sampled'] = arcface_loss.item()
                                 else:
-                                     # Adjusted warning message phase reporting
-                                     phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                                     if args.verbose: print(f"Warning: Embedding for ArcFace is None in epoch {epoch} (Phase {phase_str}). Skipping ArcFace.")
+                                     if args.verbose: print(f"Warning: Embedding for ArcFace is None in epoch {epoch} (Phase {'1' if is_embedding_phase else '3'}). Skipping ArcFace.")
                                      print_loss_components['arcface_sampled'] = 0.0
                             except Exception as e:
-                                # Adjusted warning message phase reporting
-                                phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                                print(f"Warning: Error during ArcFace calculation (Phase {phase_str}): {e}")
+                                print(f"Warning: Error during ArcFace calculation (Phase {'1' if is_embedding_phase else '3'}): {e}")
                                 arcface_loss = torch.tensor(0.0, device=features.device)
                                 print_loss_components['arcface_sampled'] = 0.0
                         else:
-                            phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                            print(f"Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly (Phase {phase_str}).")
+                            print("Warning: use_arcface=True but SampledArcFaceLayer not found/configured correctly.")
                             print_loss_components['arcface_sampled'] = 0.0
                     else:
-                         # Ensure key exists if ArcFace is off
-                         if 'arcface_sampled' not in print_loss_components: print_loss_components['arcface_sampled'] = 0.0
+                        print_loss_components['arcface_sampled'] = 0.0 # Ensure key exists
 
 
                     # 4. Classification Loss (Phase 1 & 3, if enabled)
                     cls_loss = torch.tensor(0.0, device=features.device)
                     current_cls_accuracy = torch.tensor(0.0, device=features.device)
-                    if use_classification_head and (is_embedding_phase or is_graph_learner_phase or is_joint_phase):
+                    if use_classification_head and (is_embedding_phase or is_joint_phase):
                         # Use anchor cls output (cls_output1) in Phase 1, learner cls output (cls_output2) in Phase 3
-                        # ADDED: Use learner cls output (cls_output2) in Phase 2 as well
-                        # cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output2 # Original logic
-                        if is_embedding_phase:
-                            cls_output_for_loss = cls_output1
-                        elif is_graph_learner_phase or is_joint_phase:
-                            cls_output_for_loss = cls_output2
-                        else: # Should not happen
-                            cls_output_for_loss = None
-
+                        cls_output_for_loss = cls_output1 if is_embedding_phase else cls_output2
                         if cls_output_for_loss is not None and labels is not None:
                             classification_mask = (labels != -1)
                             if classification_mask.any():
@@ -1228,23 +1171,17 @@ class Experiment:
                                 print_loss_components['classification'] = cls_loss.item()
 
                                 # Track best classification accuracy during training (only when model is trained)
-                                # MODIFIED: Only track if model is being trained (Phase 1 or 3)
-                                if is_embedding_phase or is_joint_phase:
-                                    if current_cls_accuracy > best_cls_accuracy:
-                                        best_cls_accuracy = current_cls_accuracy
+                                if current_cls_accuracy > best_cls_accuracy:
+                                    best_cls_accuracy = current_cls_accuracy
                             else:
                                 if args.verbose: print("Warning: Classification head active, but no valid labels (0 or 1) found in this epoch.")
-                                # Ensure key exists if no valid labels
-                                if 'classification' not in print_loss_components: print_loss_components['classification'] = 0.0
+                                print_loss_components['classification'] = 0.0
                         else:
-                            # Adjusted warning message phase reporting
-                            phase_str = '1' if is_embedding_phase else ('2' if is_graph_learner_phase else '3')
-                            print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {phase_str}).")
-                            # Ensure key exists if outputs are None
-                            if 'classification' not in print_loss_components: print_loss_components['classification'] = 0.0
+                            print(f"Warning: use_classification_head=True but cls_output or labels are None (Phase {'1' if is_embedding_phase else '3'}).")
+                            print_loss_components['classification'] = 0.0
                     else:
                          # Ensure keys exist even if classification head is off
-                         if 'classification' not in print_loss_components: print_loss_components['classification'] = 0.0
+                         print_loss_components['classification'] = 0.0
 
                     # --- Combined Loss Backward Pass ---
                     loss = total_loss # Assign to 'loss' variable for consistency
@@ -1391,11 +1328,9 @@ class Experiment:
                     # Only report accuracy if it was calculated (Phase 1 & 3)
                     if is_embedding_phase or is_joint_phase:
                         postfix_dict['ClsAcc'] = f"{report_cls_acc:.4f}"
-                        # Track accuracy only when model is actually trained (Phase 1 or 3)
-                        if is_embedding_phase or is_joint_phase:
-                            cls_accuracies.append(report_cls_acc)
+                        cls_accuracies.append(report_cls_acc) # Track accuracy when it's calculated
                     else:
-                        postfix_dict['ClsAcc'] = "N/A" # Should not happen if logic above is correct, but keep for safety
+                        postfix_dict['ClsAcc'] = "N/A" # Phase 2
 
 
                 # Add individual loss components to postfix based on phase and reporting source
@@ -1410,8 +1345,8 @@ class Experiment:
 
                 # Only display losses relevant to the current phase
                 if is_graph_learner_phase or is_joint_phase: postfix_dict['Contra'] = f"{report_contrastive:.4f}"
-                if args.use_arcface and (is_embedding_phase or is_graph_learner_phase or is_joint_phase): postfix_dict['ArcF'] = f"{report_arcface:.4f}"
-                if use_classification_head and (is_embedding_phase or is_graph_learner_phase or is_joint_phase): postfix_dict['ClsLoss'] = f"{report_cls_loss:.4f}"
+                if args.use_arcface and (is_embedding_phase or is_joint_phase): postfix_dict['ArcF'] = f"{report_arcface:.4f}"
+                if use_classification_head and (is_embedding_phase or is_joint_phase): postfix_dict['ClsLoss'] = f"{report_cls_loss:.4f}"
 
                 epoch_iterator.set_postfix(postfix_dict)
                 # --- End tqdm postfix update ---
