@@ -616,7 +616,8 @@ class Experiment:
                 )
             elif args.type_learner == 'mlp':
                 graph_learner = MLP_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
-                                     args.activation_learner)
+                                     args.activation_learner, args.knn_threshold_type, args.knn_std_dev_factor,
+                                     args.graph_learner_chunk_size, bool(args.offload_to_cpu), args.cleanup_every_n_chunks)
             elif args.type_learner == 'att':
                 graph_learner = ATT_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                           args.activation_learner)
@@ -1717,6 +1718,14 @@ def create_parser():
 
     # Model Hyperparameters
     parser.add_argument('--model_type', type=str, default='sublime', help='Model type (sublime)')
+
+    # Memory optimization parameters
+    parser.add_argument('-graph_learner_chunk_size', type=int, default=100,
+                     help='Chunk size for memory-efficient processing in graph learner (smaller = less memory but slower)')
+    parser.add_argument('-offload_to_cpu', type=int, default=1,
+                     help='Whether to offload tensors to CPU during graph learning (1=enabled, 0=disabled)')
+    parser.add_argument('-cleanup_every_n_chunks', type=int, default=5,
+                     help='Call torch.cuda.empty_cache() every N chunks to free up memory (0 to disable)')
 
     return parser
 
