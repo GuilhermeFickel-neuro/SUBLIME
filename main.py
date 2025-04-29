@@ -3,7 +3,7 @@ import copy
 from datetime import datetime
 import math
 
-from tqdm import tqdm
+import tqdm # Changed import
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -778,7 +778,7 @@ class Experiment:
                     phase3_epochs = 0
 
             # Get tqdm iterator
-            epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
+            epoch_iterator = tqdm.tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs) # Changed to tqdm.tqdm
             for epoch in epoch_iterator:
                 self._log_vram(f"Epoch {epoch} Start") # Log start of epoch
                 # Determine current training phase
