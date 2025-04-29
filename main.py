@@ -3,7 +3,7 @@ import copy
 from datetime import datetime
 import math
 
-from tqdm import tqdm # Reverted import
+from tqdm import tqdm # Keep import for now, might be used elsewhere
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -51,8 +51,8 @@ class Experiment:
             max_allocated_mem = torch.cuda.max_memory_allocated(self.device) # Peak since last reset
             reserved_mem = torch.cuda.memory_reserved(self.device)
             max_reserved_mem = torch.cuda.max_memory_reserved(self.device) # Peak since last reset
-            # Use tqdm.write to avoid messing with the progress bar
-            tqdm.write(
+            # Use standard print instead of tqdm.write
+            print(
                 f"[VRAM Log @ {label}] Allocated: {allocated_mem / (1024**2):.2f} MB "
                 f"(Peak Allocated: {max_allocated_mem / (1024**2):.2f} MB) | "
                 f"Reserved: {reserved_mem / (1024**2):.2f} MB "
@@ -777,9 +777,9 @@ class Experiment:
                     phase2_epochs = args.epochs - phase1_epochs
                     phase3_epochs = 0
 
-            # Get tqdm iterator
-            epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs) # Use tqdm directly
-            for epoch in epoch_iterator:
+            # Get tqdm iterator --- REMOVED TQDM WRAPPER
+            # epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
+            for epoch in range(start_epoch, args.epochs): # Iterate directly over range
                 self._log_vram(f"Epoch {epoch} Start") # Log start of epoch
                 # Determine current training phase
                 phase1_end = args.embedding_only_epochs
@@ -1422,39 +1422,39 @@ class Experiment:
                         anchor_adj = anchor_adj * args.tau + Adj.detach() * (1 - args.tau)
 
 
-                # --- Update tqdm postfix ---
+                # --- Update tqdm postfix --- REMOVED TQDM POSTFIX UPDATE
                 # Use averaged losses if using grad accum, otherwise use direct loss values
-                report_loss = loss if grad_accumulation_steps > 1 else loss.item() # Use avg loss from accum or current loss
-                phase_str = f"P{1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}"
-                postfix_dict = {'Phase': phase_str, 'Loss': f"{report_loss:.4f}"}
-                
-                if use_classification_head:
-                    # Use accuracy from accum or current
-                    report_cls_acc = first_step_cls_accuracy.item() if grad_accumulation_steps > 1 else current_cls_accuracy.item()
-                    # Only report accuracy if it was calculated (Phase 1 & 3)
-                    if is_embedding_phase or is_joint_phase:
-                        postfix_dict['ClsAcc'] = f"{report_cls_acc:.4f}"
-                        cls_accuracies.append(report_cls_acc) # Track accuracy when it's calculated
-                    else:
-                        postfix_dict['ClsAcc'] = "N/A" # Phase 2
-
-
-                # Add individual loss components to postfix based on phase and reporting source
-                if grad_accumulation_steps > 1:
-                     report_contrastive = avg_contrastive_loss
-                     report_arcface = avg_arcface_loss
-                     report_cls_loss = avg_cls_loss
-                else: # Standard path, use print_loss_components dict
-                     report_contrastive = print_loss_components.get('contrastive', 0.0)
-                     report_arcface = print_loss_components.get('arcface_sampled', 0.0)
-                     report_cls_loss = print_loss_components.get('classification', 0.0)
-
-                # Only display losses relevant to the current phase
-                if is_graph_learner_phase or is_joint_phase: postfix_dict['Contra'] = f"{report_contrastive:.4f}"
-                if args.use_arcface and (is_embedding_phase or is_joint_phase): postfix_dict['ArcF'] = f"{report_arcface:.4f}"
-                if use_classification_head and (is_embedding_phase or is_joint_phase): postfix_dict['ClsLoss'] = f"{report_cls_loss:.4f}"
-
-                epoch_iterator.set_postfix(postfix_dict)
+                # report_loss = loss if grad_accumulation_steps > 1 else loss.item() # Use avg loss from accum or current loss
+                # phase_str = f"P{1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}"
+                # postfix_dict = {'Phase': phase_str, 'Loss': f"{report_loss:.4f}"}
+                # 
+                # if use_classification_head:
+                #     # Use accuracy from accum or current
+                #     report_cls_acc = first_step_cls_accuracy.item() if grad_accumulation_steps > 1 else current_cls_accuracy.item()
+                #     # Only report accuracy if it was calculated (Phase 1 & 3)
+                #     if is_embedding_phase or is_joint_phase:
+                #         postfix_dict['ClsAcc'] = f"{report_cls_acc:.4f}"
+                #         cls_accuracies.append(report_cls_acc) # Track accuracy when it's calculated
+                #     else:
+                #         postfix_dict['ClsAcc'] = "N/A" # Phase 2
+                # 
+                # 
+                # # Add individual loss components to postfix based on phase and reporting source
+                # if grad_accumulation_steps > 1:
+                #      report_contrastive = avg_contrastive_loss
+                #      report_arcface = avg_arcface_loss
+                #      report_cls_loss = avg_cls_loss
+                # else: # Standard path, use print_loss_components dict
+                #      report_contrastive = print_loss_components.get('contrastive', 0.0)
+                #      report_arcface = print_loss_components.get('arcface_sampled', 0.0)
+                #      report_cls_loss = print_loss_components.get('classification', 0.0)
+                # 
+                # # Only display losses relevant to the current phase
+                # if is_graph_learner_phase or is_joint_phase: postfix_dict['Contra'] = f"{report_contrastive:.4f}"
+                # if args.use_arcface and (is_embedding_phase or is_joint_phase): postfix_dict['ArcF'] = f"{report_arcface:.4f}"
+                # if use_classification_head and (is_embedding_phase or is_joint_phase): postfix_dict['ClsLoss'] = f"{report_cls_loss:.4f}"
+                # 
+                # epoch_iterator.set_postfix(postfix_dict)
                 # --- End tqdm postfix update ---
 
                 # Periodic Checkpointing (remains the same, saves state at end of epoch)
@@ -1468,8 +1468,8 @@ class Experiment:
                     if use_classification_head and len(cls_accuracies) > 0:
                         avg_cls_acc = sum(cls_accuracies) / len(cls_accuracies)
                         if args.verbose:
-                            # Use tqdm.write for this message
-                            tqdm.write(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}") # Changed to tqdm.write
+                            # Use standard print for this message
+                            print(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}")
                         cls_accuracies = []  # Reset for next period
 
                 # Evaluation (remains the same, happens based on epoch freq)
@@ -1502,8 +1502,8 @@ class Experiment:
                             best_val_test = test_accu
                             best_epoch = epoch
                             if args.verbose:
-                                # Use tqdm.write for this message
-                                tqdm.write(f"** New Best Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **") # Changed to tqdm.write
+                                # Use standard print for this message
+                                print(f"** New Best Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **")
 
                     elif args.downstream_task == 'clustering' and labels is not None:
                         pass # Clustering evaluation logic can remain here if needed
