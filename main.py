@@ -31,6 +31,7 @@ class Experiment:
     def __init__(self, device=None):
         super(Experiment, self).__init__()
         self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_cuda_memory_tracking = torch.cuda.is_available() and self.device.type == 'cuda'
 
     def setup_seed(self, seed):
         torch.manual_seed(seed)
@@ -40,6 +41,25 @@ class Experiment:
         random.seed(seed)
         dgl.seed(seed)
         dgl.random.seed(seed)
+
+    def _log_vram(self, label=""):
+        """Helper function to log VRAM usage using tqdm.write if CUDA is active."""
+        if self.use_cuda_memory_tracking:
+            # Reset peak stats before logging to get current usage accurately for the label
+            # torch.cuda.reset_peak_memory_stats(self.device) # Resetting might obscure peak usage between calls
+            allocated_mem = torch.cuda.memory_allocated(self.device)
+            max_allocated_mem = torch.cuda.max_memory_allocated(self.device) # Peak since last reset
+            reserved_mem = torch.cuda.memory_reserved(self.device)
+            max_reserved_mem = torch.cuda.max_memory_reserved(self.device) # Peak since last reset
+            # Use tqdm.write to avoid messing with the progress bar
+            tqdm.write(
+                f"[VRAM Log @ {label}] Allocated: {allocated_mem / (1024**2):.2f} MB "
+                f"(Peak Allocated: {max_allocated_mem / (1024**2):.2f} MB) | "
+                f"Reserved: {reserved_mem / (1024**2):.2f} MB "
+                f"(Peak Reserved: {max_reserved_mem / (1024**2):.2f} MB)"
+            )
+            # Optionally reset peak stats *after* logging if you want peaks *between* logs
+            # torch.cuda.reset_peak_memory_stats(self.device)
 
     def loss_cls(self, model, mask, features, labels):
         logits = model(features)
@@ -501,6 +521,8 @@ class Experiment:
             load_data_fn: Function to load the dataset. Should return:
                 (features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, initial_graph)
         """
+        self._log_vram("Train Start") # Log at the very beginning
+
         if load_data_fn is None:
             raise ValueError("Must provide a data loading function")
             
@@ -560,6 +582,7 @@ class Experiment:
 
         for trial in range(args.ntrials):
             self.setup_seed(trial)
+            self._log_vram(f"Trial {trial+1} Start") # Log at start of trial
 
             # --- Initialize Anchor Adjacency --- 
             # The initial_graph_data IS the raw anchor adjacency before normalization.
@@ -707,6 +730,7 @@ class Experiment:
             model = model.to(self.device)
             graph_learner = graph_learner.to(self.device)
             features = features.to(self.device) # Combined features
+            self._log_vram(f"Trial {trial+1}: Data Moved to Device") # Log after moving data
             # Move combined labels and arcface_labels (if used) to device
             if labels is not None:
                 labels = labels.to(self.device) # Combined labels (-1, 0, 1)
@@ -755,6 +779,7 @@ class Experiment:
             # Get tqdm iterator
             epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
             for epoch in epoch_iterator:
+                self._log_vram(f"Epoch {epoch} Start") # Log start of epoch
                 # Determine current training phase
                 phase1_end = args.embedding_only_epochs
                 phase2_end = phase1_end + args.graph_learner_only_epochs
@@ -821,6 +846,7 @@ class Experiment:
                     # optimizer_cl.zero_grad()
                     # if not is_embedding_phase: # Only zero learner grad if training it # Old logic
                         # optimizer_learner.zero_grad()
+                    self._log_vram(f"Epoch {epoch} GradAccum: Grads Zeroed (Step {i+1}/{grad_accumulation_steps})")
 
                     for i in range(grad_accumulation_steps):
                         # --- Forward passes ---
@@ -842,6 +868,7 @@ class Experiment:
                             # Only need anchor view outputs
                             _, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
                             # Contrastive loss is 0
+                            self._log_vram(f"Epoch {epoch} GradAccum: Phase 1 Forward Done (Step {i+1})")
 
                         # --- Phase 2: Anchor + Learned Graph (Train Learner, Frozen Model) ---
                         elif is_graph_learner_phase:
@@ -890,6 +917,7 @@ class Experiment:
                             # Get learner outputs (Frozen Model, allow graph connection)
                             # Pass the DGL graph Adj
                             z2, _, _, _ = model(features_v2, Adj, 'learner', include_features=True) # Model params frozen via eval()
+                            self._log_vram(f"Epoch {epoch} GradAccum: Phase 2 Forward Done (Step {i+1})")
 
                             # Calculate Contrastive Loss
                             if args.contrast_batch_size:
@@ -928,6 +956,7 @@ class Experiment:
                             Adj = learned_adj # Store for potential use later
                             # Get learner outputs
                             z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True)
+                            self._log_vram(f"Epoch {epoch} GradAccum: Phase 3 Forward Done (Step {i+1})")
 
                             # Calculate Contrastive Loss
                             if args.contrast_batch_size:
@@ -944,6 +973,7 @@ class Experiment:
                         # --- Loss Calculation (Common part, adapted for phases) ---
                         # 1. Initialize total loss for this mini-step
                         mini_total_loss = torch.tensor(0.0, device=features.device)
+                        self._log_vram(f"Epoch {epoch} GradAccum: Before Loss Calc (Step {i+1})")
 
                         # 2. Add Contrastive Loss (only in Phase 2 and 3)
                         if is_graph_learner_phase or is_joint_phase:
@@ -995,9 +1025,12 @@ class Experiment:
 
                         # Scale loss for accumulation
                         scaled_mini_loss = mini_total_loss / grad_accumulation_steps
+                        self._log_vram(f"Epoch {epoch} GradAccum: After Loss Calc (Step {i+1})")
 
                         # Backward pass for this step
+                        self._log_vram(f"Epoch {epoch} GradAccum: Before Backward (Step {i+1})")
                         scaled_mini_loss.backward()
+                        self._log_vram(f"Epoch {epoch} GradAccum: After Backward (Step {i+1})")
 
                         accumulated_loss += mini_total_loss.item() # Accumulate total unscaled loss for reporting average
 
@@ -1018,6 +1051,7 @@ class Experiment:
                         optimizer_cl.step()
                     if is_graph_learner_phase or is_joint_phase: # Update learner weights if learner was trained
                         optimizer_learner.step()
+                    self._log_vram(f"Epoch {epoch} GradAccum: After Optimizer Step")
 
 
                     # Calculate average losses for reporting
@@ -1039,6 +1073,7 @@ class Experiment:
                     # optimizer_cl.zero_grad()
                     # if not is_embedding_phase: # Only zero learner grad if training it # Old logic
                         # optimizer_learner.zero_grad()
+                    self._log_vram(f"Epoch {epoch} Standard: Grads Zeroed")
 
                     # --- Forward passes (Select based on phase) ---
                     contrastive_loss = torch.tensor(0.0, device=features.device)
@@ -1059,6 +1094,7 @@ class Experiment:
                        # Only need anchor view outputs
                        _, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
                        Adj = None # No learned adj in Phase 1
+                       self._log_vram(f"Epoch {epoch} Standard: Phase 1 Forward Done")
 
                     # --- Phase 2: Anchor + Learned Graph (Train Learner, Frozen Model) ---
                     elif is_graph_learner_phase:
@@ -1107,6 +1143,7 @@ class Experiment:
                         # Get learner outputs (Frozen Model, allow graph connection)
                         # Pass the DGL graph Adj
                         z2, _, _, _ = model(features_v2, Adj, 'learner', include_features=True) # Model params frozen via eval()
+                        self._log_vram(f"Epoch {epoch} Standard: Phase 2 Forward Done")
 
                         # Calculate Contrastive Loss
                         if args.contrast_batch_size:
@@ -1146,6 +1183,7 @@ class Experiment:
                         Adj = learned_adj # Store for potential use later
                         # Get learner outputs
                         z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True)
+                        self._log_vram(f"Epoch {epoch} Standard: Phase 3 Forward Done")
 
                         # Calculate Contrastive Loss
                         if args.contrast_batch_size:
@@ -1163,6 +1201,7 @@ class Experiment:
                     # 1. Initialize total loss
                     total_loss = torch.tensor(0.0, device=features.device)
                     print_loss_components = {} # Reset components dict
+                    self._log_vram(f"Epoch {epoch} Standard: Before Loss Calc")
 
                     # 2. Add Contrastive Loss (Phase 2 & 3)
                     if is_graph_learner_phase or is_joint_phase:
@@ -1227,6 +1266,7 @@ class Experiment:
 
                     # --- Combined Loss Backward Pass ---
                     loss = total_loss # Assign to 'loss' variable for consistency
+                    self._log_vram(f"Epoch {epoch} Standard: After Loss Calc")
 
                     # NaN Loss Check (remains the same)
                     if torch.isnan(loss):
@@ -1252,7 +1292,9 @@ class Experiment:
                             break # Exit the epoch loop for this trial
 
                     # Backward and optimize based on phase
+                    self._log_vram(f"Epoch {epoch} Standard: Before Backward")
                     loss.backward()
+                    self._log_vram(f"Epoch {epoch} Standard: After Backward")
 
                     # --- Check Learner Gradients (Diagnostic) ---
                     if is_graph_learner_phase: # Only check during Phase 2
@@ -1279,10 +1321,12 @@ class Experiment:
                             torch.nn.utils.clip_grad_norm_(graph_learner.parameters(), args.clip_norm)
 
                     # Optimizer step based on phase
+                    self._log_vram(f"Epoch {epoch} Standard: Before Optimizer Step")
                     if is_embedding_phase or is_joint_phase: # Step model optimizer if model was trained
                         optimizer_cl.step()
                     if is_graph_learner_phase or is_joint_phase: # Step learner optimizer if learner was trained
                         optimizer_learner.step()
+                    self._log_vram(f"Epoch {epoch} Standard: After Optimizer Step")
 
 
                 # Step the schedulers if using OneCycleLR, based on phase
@@ -1311,6 +1355,7 @@ class Experiment:
                         # Memory-efficient sparse bootstrapping using DGL graph manipulation
                         num_nodes = anchor_adj.num_nodes()
                         dev = anchor_adj.device
+                        self._log_vram(f"Epoch {epoch}: Before Bootstrapping")
 
                         # 1. Get edges and weights from anchor_adj (DGL graph)
                         u_a, v_a = anchor_adj.edges()
@@ -1369,6 +1414,7 @@ class Experiment:
                             # Handle case where the combined graph might be empty
                             print(f"Warning: Bootstrapped graph at epoch {epoch} became empty.")
                             anchor_adj = dgl.graph(([], []), num_nodes=num_nodes, device=dev) # Keep same num_nodes
+                        self._log_vram(f"Epoch {epoch}: After Bootstrapping")
 
                     else:
                         # Dense bootstrapping remains the same
@@ -1434,6 +1480,7 @@ class Experiment:
                     if args.downstream_task == 'classification':
                         model.eval() # Set both to eval for consistency during evaluation
                         graph_learner.eval()
+                        self._log_vram(f"Epoch {epoch}: Before Evaluation")
                         f_adj = Adj # Use the learned Adj from this epoch for evaluation
 
                         if args.sparse:
@@ -1447,6 +1494,7 @@ class Experiment:
                                                                                nclasses, train_mask, val_mask, test_mask, args)
                         # Note: evaluation uses the combined labels and nclasses=2 if annotation was provided.
                         # This evaluates the quality of the learned graph (Adj) for the downstream task.
+                        self._log_vram(f"Epoch {epoch}: After Evaluation")
 
                         if val_accu > best_val:
                             best_val = val_accu.item() if isinstance(val_accu, torch.Tensor) else val_accu # Ensure float
@@ -1463,6 +1511,7 @@ class Experiment:
             if use_classification_head:
                  final_best_cls_acc = best_cls_accuracy.item() if isinstance(best_cls_accuracy, torch.Tensor) else best_cls_accuracy
                  print(f"Best classification accuracy during training phases 1 & 3: {final_best_cls_acc:.4f}")
+            self._log_vram(f"Trial {trial+1} End") # Log at end of trial
 
             if args.downstream_task == 'classification':
                 validation_accuracies.append(best_val)
@@ -1482,9 +1531,11 @@ class Experiment:
                                output_dir=args.output_dir)
                 if args.verbose:
                     print(f"Model saved to {args.output_dir}")
+                self._log_vram(f"Trial {trial+1}: Model Saved") # Log after saving
 
         if args.downstream_task == 'classification' and trial != 0:
             self.print_results(validation_accuracies, test_accuracies)
+        self._log_vram("Train End") # Log at the very end
 
     def print_results(self, validation_accu, test_accu):
         s_val = "Val accuracy: {:.4f} +/- {:.4f}".format(np.mean(validation_accu), np.std(validation_accu))
