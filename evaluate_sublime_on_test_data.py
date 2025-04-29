@@ -659,44 +659,82 @@ class SublimeHandler:
             for i in tqdm(range(num_batches), desc=f"Extracting {dataset_tag}", unit="batch"):
                 start_idx = i * self.config.batch_size
                 end_idx = min((i + 1) * self.config.batch_size, len(X))
-                batch_X = X[start_idx:end_idx]
+                batch_X = X[start_idx:end_idx] # These are the preprocessed neurolake features for the current dataset
 
-                for j in range(len(batch_X)):
+                # Convert batch_X to tensor on the correct device once per batch
+                batch_X_tensor = torch.FloatTensor(batch_X).to(self.device)
+
+                for j in range(len(batch_X_tensor)):
+                    point_tensor = batch_X_tensor[j].unsqueeze(0) # Process one point at a time
+
                     try:
-                        point_tensor = torch.FloatTensor(batch_X[j]).unsqueeze(0).to(self.device) # Add batch dim
+                        # --- Replicate Experiment.process_new_point logic --- 
+                        # 1. Find most similar point in loaded features (self.features)
+                        normalized_features = F.normalize(self.features, p=2, dim=1)
+                        normalized_point = F.normalize(point_tensor, p=2, dim=1)
+                        similarities = torch.mm(normalized_point, normalized_features.t())
+                        replace_idx = torch.argmax(similarities).item()
 
-                        result_dict = self.experiment.process_new_point(
-                            point_tensor, self.model, self.graph_learner,
-                            self.features, self.adj, self.sparse, faiss_index=self.faiss_index
-                        )
+                        # 2. Create modified features (temporarily replace the point)
+                        # Note: This modifies a *copy* in memory for each point, can be slow.
+                        modified_features = self.features.clone()
+                        modified_features[replace_idx] = point_tensor
+
+                        # 3. Generate new adjacency using the graph learner
+                        # Ensure graph learner is in eval mode (should be set after loading)
+                        new_adj = self.graph_learner(modified_features, faiss_index=self.faiss_index)
+                        if not self.sparse:
+                            # Handle potential non-tensor output from learner if dense
+                            if not isinstance(new_adj, torch.Tensor):
+                                # This case might need specific handling based on learner output type
+                                print(f"Warning: Dense graph learner output type is {type(new_adj)}, expected Tensor. Normalization might fail.")
+                            else:
+                                new_adj = symmetrize(new_adj)
+                                new_adj = normalize(new_adj, 'sym', self.sparse)
+                        # else: Sparse DGL graph usually handled by GCL forward
+
+                        # 4. Run the model forward pass
+                        # Ensure model is in eval mode (should be set after loading)
+                        if self.has_classification_head:
+                            _, embedding, _, classification_output = self.model(
+                                modified_features, new_adj, 'learner', include_features=True
+                            )
+                            if classification_output is not None:
+                                classification_prob_tensor = torch.sigmoid(classification_output[replace_idx])
+                                classification_prob = classification_prob_tensor.item()
+                            else:
+                                classification_prob = None
+                        else:
+                            _, embedding = self.model(modified_features, new_adj, 'learner')
+                            classification_prob = None
+                        # --- End Replicated Logic ---
+
+                        # Extract the embedding for the *replaced* index
+                        embedding_tensor = embedding[replace_idx].detach()
 
                         # Check type before calling .cpu() or .numpy()
-                        embedding_raw = result_dict['embedding_vector']
-                        if isinstance(embedding_raw, np.ndarray):
-                            embedding_vector = embedding_raw.flatten()
-                        elif isinstance(embedding_raw, torch.Tensor):
-                            embedding_vector = embedding_raw.detach().cpu().numpy().flatten()
+                        # embedding_raw = result_dict['embedding_vector'] # Old way
+                        # Use the extracted embedding_tensor
+                        if isinstance(embedding_tensor, torch.Tensor):
+                            embedding_vector = embedding_tensor.cpu().numpy().flatten()
                         else:
-                            raise TypeError(f"Unexpected type for embedding_vector: {type(embedding_raw)}")
+                            # This case should ideally not happen if model returns tensor
+                            raise TypeError(f"Unexpected type for extracted embedding: {type(embedding_tensor)}")
                         all_embeddings.append(embedding_vector)
 
                         # Check type for classification probability as well
-                        if self.has_classification_head and 'classification_probability' in result_dict:
-                             prob_raw = result_dict['classification_probability']
-                             if isinstance(prob_raw, (int, float, np.number)):
-                                 # Already a scalar CPU value
-                                 all_class_probs.append(float(prob_raw))
-                             elif isinstance(prob_raw, torch.Tensor):
-                                 # Tensor, move to CPU and get item
-                                 all_class_probs.append(prob_raw.detach().cpu().item())
+                        # if self.has_classification_head and 'classification_probability' in result_dict: # Old way
+                        if self.has_classification_head and classification_prob is not None:
+                             # prob_raw = result_dict['classification_probability'] # Old way
+                             # classification_prob is already a float scalar from .item() above
+                             if isinstance(classification_prob, (int, float, np.number)):
+                                 all_class_probs.append(float(classification_prob))
                              else:
-                                 raise TypeError(f"Unexpected type for classification_probability: {type(prob_raw)}")
+                                 # Should not happen if .item() was used correctly
+                                 raise TypeError(f"Unexpected type for classification_probability: {type(classification_prob)}")
 
                     except Exception as e:
                         print(f"Error processing point {start_idx + j}: {str(e)}")
-                        # Decide whether to raise or continue (e.g., append NaNs?)
-                        # For now, re-raising to make errors obvious
-                        raise e
 
         embeddings_array = np.array(all_embeddings, dtype=np.float32)
         classification_probs_array = np.array(all_class_probs, dtype=np.float32) if self.has_classification_head else None
