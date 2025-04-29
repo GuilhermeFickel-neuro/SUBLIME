@@ -639,7 +639,8 @@ class Experiment:
                 )
             elif args.type_learner == 'mlp':
                 graph_learner = MLP_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
-                                     args.activation_learner, args.knn_threshold_type, args.knn_std_dev_factor)
+                                     args.activation_learner, args.knn_threshold_type, args.knn_std_dev_factor,
+                                     chunk_size=args.graph_learner_chunk_size) # Pass chunk size
             elif args.type_learner == 'att':
                 graph_learner = ATT_learner(2, features.shape[1], args.k, args.sim_function, 6, args.sparse,
                                           args.activation_learner)
