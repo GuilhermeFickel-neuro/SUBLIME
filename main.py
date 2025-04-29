@@ -711,7 +711,7 @@ class Experiment:
                     print(f"Warning: Pre-trained model path specified ({args.load_pretrained_path}), but model.pt or graph_learner.pt not found.")
 
             optimizer_cl = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.w_decay)
-            optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr, weight_decay=args.w_decay)
+            optimizer_learner = torch.optim.Adam(graph_learner.parameters(), lr=args.lr_learner, weight_decay=args.w_decay)
             
             # --- Checkpoint Setup --- 
             os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -800,7 +800,8 @@ class Experiment:
                     elif epoch == phase1_end and phase2_epochs > 0: # Start of Phase 2
                          print(f"Initializing OneCycleLR for Learner (Phase 2: {phase2_epochs} steps)")
                          scheduler_learner = lr_scheduler.OneCycleLR(
-                             optimizer_learner, max_lr=args.lr, total_steps=phase2_epochs, **one_cycle_defaults
+                             # Use the new lr_learner argument for the graph learner scheduler
+                             optimizer_learner, max_lr=args.lr_learner, total_steps=phase2_epochs, **one_cycle_defaults
                          )
                     elif epoch == phase2_end and phase3_epochs > 0: # Start of Phase 3
                         print(f"Re-initializing OneCycleLR for Model (Phase 3: {phase3_epochs} steps)")
@@ -809,7 +810,8 @@ class Experiment:
                         )
                         print(f"Re-initializing OneCycleLR for Learner (Phase 3: {phase3_epochs} steps)")
                         scheduler_learner = lr_scheduler.OneCycleLR(
-                            optimizer_learner, max_lr=args.lr, total_steps=phase3_epochs, **one_cycle_defaults
+                            # Use the new lr_learner argument for the graph learner scheduler
+                            optimizer_learner, max_lr=args.lr_learner, total_steps=phase3_epochs, **one_cycle_defaults
                         )
 
                 # --- Set Model Modes and Print Phase Info ---
@@ -1672,6 +1674,9 @@ def create_parser():
     # GCL Module - Framework
     parser.add_argument('-epochs', type=int, default=1000)
     parser.add_argument('-lr', type=float, default=0.01)
+    # Add new argument for graph learner LR
+    parser.add_argument('-lr_learner', type=float, default=0.01,
+                        help='Learning rate specifically for the graph learner optimizer')
     parser.add_argument('-w_decay', type=float, default=0.0)
     parser.add_argument('-hidden_dim', type=int, default=512)
     parser.add_argument('-rep_dim', type=int, default=64)
