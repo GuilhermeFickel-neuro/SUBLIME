@@ -506,13 +506,13 @@ class SublimeHandler:
         elif learner_type == 'mlp':
             self.graph_learner = MLP_learner(
                 nlayers=2, # Assume 2 layers? Config doesn't save this explicitly
-                in_dim=model_config['feature_dim'], k=k, knn_metric=sim_func, i=6, # Use default 'i'?
-                sparse=self.sparse, mlp_act=act_learner,
+                isize=model_config['feature_dim'], # Changed 'in_dim' to 'isize'
+                k=k, knn_metric=sim_func, i=6, # Use default 'i'?
+                sparse=self.sparse, act=act_learner, # Changed 'mlp_act' to 'act'
                 knn_threshold_type=model_config.get('knn_threshold_type', 'none'),
                 knn_std_dev_factor=model_config.get('knn_std_dev_factor', 1.0),
-                chunk_size=model_config.get('graph_learner_chunk_size', 100), # Use saved or default chunk size
-                offload_to_cpu=bool(model_config.get('offload_to_cpu', 1)),
-                cleanup_every_n_chunks=model_config.get('cleanup_every_n_chunks', 5)
+                chunk_size=model_config.get('graph_learner_chunk_size', 100) # Use saved or default chunk size
+                # Removed offload_to_cpu and cleanup_every_n_chunks as they are not in the MLP_learner constructor
             )
         elif learner_type == 'att':
              self.graph_learner = ATT_learner(
