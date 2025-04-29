@@ -778,6 +778,7 @@ class Experiment:
                     phase3_epochs = 0
 
             # Get tqdm iterator --- REMOVED TQDM WRAPPER
+            from tqdm import tqdm # Explicit import before use
             epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
             for epoch in epoch_iterator: # Iterate over tqdm iterator
                 self._log_vram(f"Epoch {epoch} Start") # Log start of epoch
