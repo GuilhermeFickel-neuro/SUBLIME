@@ -866,9 +866,12 @@ class Experiment:
                                learned_adj = symmetrize(learned_adj)
                                learned_adj = normalize(learned_adj, 'sym', args.sparse)
                             Adj = learned_adj # Store for potential use later
+                            # --- Force gradient requirement on learned_adj ---
+                            Adj.requires_grad_(True) 
+                            # --- End change ---
                             # Get learner outputs (Frozen Model, allow graph connection)
                             # REMOVED torch.no_grad() here
-                            z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval()
+                            z2, _, _, _ = model(features_v2, Adj, 'learner', include_features=True) # Model params frozen via eval()
 
                             # Calculate Contrastive Loss
                             if args.contrast_batch_size:
@@ -1062,9 +1065,11 @@ class Experiment:
                            learned_adj = symmetrize(learned_adj)
                            learned_adj = normalize(learned_adj, 'sym', args.sparse)
                         Adj = learned_adj # Store for potential use later
+                        # --- Force gradient requirement on learned_adj ---
+                        Adj.requires_grad_(True) 
+                        # --- End change ---
                         # Get learner outputs (Frozen Model, allow graph connection)
-                        # REMOVED torch.no_grad() here
-                        z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval()
+                        z2, _, _, _ = model(features_v2, Adj, 'learner', include_features=True) # Model params frozen via eval()
 
                         # Calculate Contrastive Loss
                         if args.contrast_batch_size:
