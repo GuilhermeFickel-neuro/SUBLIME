@@ -1,6 +1,5 @@
 import argparse
 import torch
-import torch.nn.functional as F # Add this import
 import pandas as pd
 import numpy as np
 import os
@@ -1101,7 +1100,7 @@ class Evaluator:
             model = model_class(**params)
             try:
                 if isinstance(model, LGBMClassifier):
-                    eval_metric = 'auc' # Keep using AUC for LightGBM's internal eval/pruning if desired, KS calculated below
+                    eval_metric = 'auc'
                     # Use optuna callback for pruning
                     pruning_callback = optuna.integration.LightGBMPruningCallback(trial, eval_metric)
                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
@@ -1121,10 +1120,7 @@ class Evaluator:
                      raise optuna.TrialPruned()
 
                 preds_proba = model.predict_proba(val_features)[:, 1]
-                # Calculate KS instead of AUC
-                fpr, tpr, _ = roc_curve(val_labels, preds_proba)
-                ks_stat = np.max(tpr - fpr) if len(tpr) > 0 and len(fpr) > 0 else 0.0
-                return ks_stat # Return KS statistic
+                return roc_auc_score(val_labels, preds_proba)
             except optuna.TrialPruned:
                  raise # Re-raise prune exceptions
             except Exception as e:
@@ -1157,13 +1153,12 @@ class Evaluator:
                 print(f"Optimizing {model_name.upper()} for {feature_set_name} features...")
                 try:
                     objective_func = self._create_objective(model_class, X_train, y_train, X_val, y_val, base_params, trial_params)
-                    # KS is maximized, so direction remains 'maximize'
                     study = optuna.create_study(direction='maximize', pruner=optuna.pruners.MedianPruner())
                     study.optimize(objective_func, n_trials=self.config.n_trials, n_jobs=1, show_progress_bar=True) # Use n_jobs=1 for safer debugging/logging
                     best_trial_params = study.best_params
                     self.best_params[model_name][feature_set_name] = best_trial_params
-                    best_val_ks = study.best_value # Store best KS value
-                    print(f"Optimization complete. Best Validation KS: {best_val_ks:.4f}") # Changed AUC to KS
+                    best_val_auc = study.best_value
+                    print(f"Optimization complete. Best Validation AUC: {best_val_auc:.4f}")
 
                 except Exception as e:
                     print(f"ERROR during Optuna optimization for {model_name} - {feature_set_name}: {e}")
