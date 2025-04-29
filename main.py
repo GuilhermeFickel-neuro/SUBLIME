@@ -861,16 +861,34 @@ class Experiment:
                             else:
                                features_v2 = copy.deepcopy(features)
                             # Learn graph
-                            learned_adj = graph_learner(features)
+                            learned_adj = graph_learner(features) # Should return DGLGraph if sparse
                             if not args.sparse:
+                               # Dense case (remains the same)
                                learned_adj = symmetrize(learned_adj)
                                learned_adj = normalize(learned_adj, 'sym', args.sparse)
-                            Adj = learned_adj # Store for potential use later
-                            # --- Force gradient requirement on learned_adj ---
-                            Adj.requires_grad_(True) 
-                            # --- End change ---
+                               Adj = learned_adj # Adj is a Tensor
+                            else:
+                               # Sparse case (DGL Graph)
+                               Adj = learned_adj # Adj is a DGLGraph
+                               # --- Check if edge weights require grad ---
+                               if 'w' in Adj.edata:
+                                   # Ensure the weights tensor requires gradients. It should already if
+                                   # the learner calculated them using its parameters.
+                                   if not Adj.edata['w'].requires_grad:
+                                       # This case is unexpected if learner is trainable & creates weights.
+                                       # Maybe try setting it? Or log a warning.
+                                       # Let's log a warning first, as forcing requires_grad might mask issues.
+                                       if args.verbose:
+                                            tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.")
+                                       # Optionally, try forcing it:
+                                       # Adj.edata['w'].requires_grad_(True) # Use with caution
+                               else:
+                                   # If no 'w', gradient must flow via structure changes implicitly handled by DGL/learner.
+                                   pass
+                               # --- End check ---
+
                             # Get learner outputs (Frozen Model, allow graph connection)
-                            # REMOVED torch.no_grad() here
+                            # Pass the DGL graph Adj
                             z2, _, _, _ = model(features_v2, Adj, 'learner', include_features=True) # Model params frozen via eval()
 
                             # Calculate Contrastive Loss
@@ -1060,15 +1078,34 @@ class Experiment:
                         else:
                            features_v2 = copy.deepcopy(features)
                         # Learn graph
-                        learned_adj = graph_learner(features)
+                        learned_adj = graph_learner(features) # Should return DGLGraph if sparse
                         if not args.sparse:
+                           # Dense case (remains the same)
                            learned_adj = symmetrize(learned_adj)
                            learned_adj = normalize(learned_adj, 'sym', args.sparse)
-                        Adj = learned_adj # Store for potential use later
-                        # --- Force gradient requirement on learned_adj ---
-                        Adj.requires_grad_(True) 
-                        # --- End change ---
+                           Adj = learned_adj # Adj is a Tensor
+                        else:
+                           # Sparse case (DGL Graph)
+                           Adj = learned_adj # Adj is a DGLGraph
+                           # --- Check if edge weights require grad ---
+                           if 'w' in Adj.edata:
+                               # Ensure the weights tensor requires gradients. It should already if
+                               # the learner calculated them using its parameters.
+                               if not Adj.edata['w'].requires_grad:
+                                   # This case is unexpected if learner is trainable & creates weights.
+                                   # Maybe try setting it? Or log a warning.
+                                   # Let's log a warning first, as forcing requires_grad might mask issues.
+                                   if args.verbose:
+                                        tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.")
+                                   # Optionally, try forcing it:
+                                   # Adj.edata['w'].requires_grad_(True) # Use with caution
+                           else:
+                               # If no 'w', gradient must flow via structure changes implicitly handled by DGL/learner.
+                               pass
+                           # --- End check ---
+
                         # Get learner outputs (Frozen Model, allow graph connection)
+                        # Pass the DGL graph Adj
                         z2, _, _, _ = model(features_v2, Adj, 'learner', include_features=True) # Model params frozen via eval()
 
                         # Calculate Contrastive Loss
