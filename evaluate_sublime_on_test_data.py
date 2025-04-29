@@ -21,6 +21,10 @@ import matplotlib.pyplot as plt
 import gc
 import sys # Import sys for sys.exit
 
+# Add necessary imports from main and model/graph_learner
+from main import Experiment, GCL, FGP_learner, MLP_learner, ATT_learner, GNN_learner, normalize, symmetrize, sparse_mx_to_torch_sparse_tensor, torch_sparse_to_dgl_graph, dgl_graph_to_torch_sparse
+import dgl # Make sure dgl is imported
+
 # Define coerce_numeric at the top level
 def coerce_numeric(df_):
     """Coerces DataFrame columns to numeric, handling errors."""
@@ -413,25 +417,175 @@ class SublimeHandler:
         self.features = None
         self.adj = None
         self.sparse = None
-        self.experiment = None
+        # self.experiment = None # Remove experiment instance variable, not needed for loading here
         self.faiss_index = None
         self.has_classification_head = False
 
     def load_model(self):
-        """Loads SUBLIME model components."""
+        """Loads SUBLIME model components by reading config and files."""
         print(f"Loading SUBLIME model from {self.config.model_dir}")
-        self.experiment = Experiment(self.device)
-        try:
-            self.model, self.graph_learner, self.features, self.adj, self.sparse = self.experiment.load_model(input_dir=self.config.model_dir)
-            print("SUBLIME model loaded successfully!")
-            self.has_classification_head = hasattr(self.model, 'use_classification_head') and self.model.use_classification_head
-            if self.has_classification_head: print("Model includes a binary classification head.")
-        except FileNotFoundError as e:
-             print(f"Error loading model: {e}. Ensure model files exist in {self.config.model_dir}")
-             raise
-        except Exception as e:
-             print(f"An unexpected error occurred loading the model: {e}")
-             raise
+        config_path = os.path.join(self.config.model_dir, 'config.txt')
+        model_path = os.path.join(self.config.model_dir, 'model.pt')
+        learner_path = os.path.join(self.config.model_dir, 'graph_learner.pt')
+        features_path = os.path.join(self.config.model_dir, 'features.pt')
+        adj_path = os.path.join(self.config.model_dir, 'adjacency.pt')
+
+        if not all(os.path.exists(p) for p in [config_path, model_path, learner_path, features_path, adj_path]):
+            raise FileNotFoundError(f"One or more model files not found in {self.config.model_dir}. Expected config.txt, model.pt, graph_learner.pt, features.pt, adjacency.pt")
+
+        # 1. Read config.txt
+        model_config = {}
+        with open(config_path, 'r') as f:
+            for line in f:
+                try:
+                    key, value = line.strip().split(': ', 1)
+                    # Attempt to infer type (basic types only)
+                    if value == 'True': model_config[key] = True
+                    elif value == 'False': model_config[key] = False
+                    elif value == 'None': model_config[key] = None
+                    elif '.' in value:
+                        try: model_config[key] = float(value)
+                        except ValueError: model_config[key] = value # Keep as string if float fails
+                    else:
+                        try: model_config[key] = int(value)
+                        except ValueError: model_config[key] = value # Keep as string if int fails
+                except ValueError:
+                    print(f"Warning: Could not parse line in config.txt: {line.strip()}")
+                    continue # Skip malformed lines
+
+        # Store essential config items
+        self.sparse = model_config.get('sparse', False) # Default to False if missing
+
+        # 2. Load Features and Adjacency Matrix first (needed for some learners)
+        self.features = torch.load(features_path, map_location=self.device)
+
+        adj_data = torch.load(adj_path, map_location=self.device)
+        if self.sparse:
+            if isinstance(adj_data, dict) and 'edges' in adj_data: # Saved DGL graph dictionary
+                 num_nodes = adj_data['num_nodes']
+                 edges = adj_data['edges']
+                 weights = adj_data.get('weights') # May not have weights
+                 self.adj = dgl.graph(edges, num_nodes=num_nodes).to(self.device)
+                 if weights is not None:
+                      self.adj.edata['w'] = weights.to(self.device)
+                 # Normalize the loaded DGL graph (as done in original training)
+                 self.adj = normalize(self.adj, 'sym', self.sparse)
+            elif isinstance(adj_data, torch.Tensor) and adj_data.is_sparse: # Saved torch sparse tensor
+                 # This was the format before DGL saving was explicit
+                 # Normalize directly
+                 self.adj = normalize(adj_data, 'sym', self.sparse)
+                 # Convert to DGL graph for model forward pass
+                 self.adj = torch_sparse_to_dgl_graph(self.adj)
+            else:
+                 raise TypeError(f"Unexpected sparse adjacency format loaded from {adj_path}: {type(adj_data)}")
+        else: # Dense
+            if isinstance(adj_data, torch.Tensor) and not adj_data.is_sparse:
+                 self.adj = normalize(adj_data, 'sym', self.sparse) # Normalize dense tensor
+            else:
+                 raise TypeError(f"Expected dense tensor for adjacency, got {type(adj_data)} from {adj_path}")
+        self.adj = self.adj.to(self.device) # Ensure final adj is on device
+
+        # 3. Instantiate Graph Learner
+        learner_type = model_config.get('type_learner', 'unknown')
+        k = model_config.get('k', 30)
+        sim_func = model_config.get('sim_function', 'cosine')
+        act_learner = model_config.get('activation_learner', 'relu')
+
+        if learner_type == 'fgp':
+            # FGP needs the *initial* graph data, which isn't saved separately by default.
+            # Using the loaded 'adj' (which is the final bootstrapped one) might be incorrect.
+            # Let's assume for evaluation, we use the final saved 'adj' as the input if needed.
+            # Or better: FGP doesn't need initial_graph_data *after* being trained.
+            # It learns weights based on the structure it started with.
+            # For evaluation/inference, it just needs the feature dimension.
+            fgp_i = model_config.get('fgp_elu_alpha', 6) # Get 'i' param if saved
+            self.graph_learner = FGP_learner(
+                k=k, knn_metric=sim_func, i=fgp_i, sparse=self.sparse,
+                initial_graph_data=None # Don't pass initial graph for loading trained state
+            )
+        elif learner_type == 'mlp':
+            self.graph_learner = MLP_learner(
+                nlayers=2, # Assume 2 layers? Config doesn't save this explicitly
+                in_dim=model_config['feature_dim'], k=k, knn_metric=sim_func, i=6, # Use default 'i'?
+                sparse=self.sparse, mlp_act=act_learner,
+                knn_threshold_type=model_config.get('knn_threshold_type', 'none'),
+                knn_std_dev_factor=model_config.get('knn_std_dev_factor', 1.0),
+                chunk_size=model_config.get('graph_learner_chunk_size', 100), # Use saved or default chunk size
+                offload_to_cpu=bool(model_config.get('offload_to_cpu', 1)),
+                cleanup_every_n_chunks=model_config.get('cleanup_every_n_chunks', 5)
+            )
+        elif learner_type == 'att':
+             self.graph_learner = ATT_learner(
+                 nlayers=2, # Assume 2?
+                 in_dim=model_config['feature_dim'], k=k, knn_metric=sim_func, i=6, # Default 'i'?
+                 sparse=self.sparse, mlp_act=act_learner
+             )
+        elif learner_type == 'gnn':
+             # GNN Learner needs the anchor_adj during *training*.
+             # For loading, it just needs to be instantiated correctly.
+             self.graph_learner = GNN_learner(
+                 nlayers=2, # Assume 2?
+                 in_dim=model_config['feature_dim'], k=k, knn_metric=sim_func, i=6, # Default 'i'?
+                 sparse=self.sparse, mlp_act=act_learner,
+                 anchor_adj=None # Don't pass anchor adj for loading trained state
+             )
+        else:
+            raise ValueError(f"Unsupported learner type found in config: {learner_type}")
+
+        self.graph_learner.load_state_dict(torch.load(learner_path, map_location=self.device))
+        self.graph_learner = self.graph_learner.to(self.device)
+        self.graph_learner.eval() # Set to eval mode
+
+        # 4. Instantiate GCL Model
+        gcl_params = {
+            'nlayers': model_config.get('nlayers', 2),
+            'in_dim': model_config['feature_dim'],
+            'hidden_dim': model_config['hidden_dim'],
+            'emb_dim': model_config['emb_dim'],
+            'proj_dim': model_config['proj_dim'],
+            'dropout': model_config.get('dropout', 0.5),
+            'dropout_adj': model_config.get('dropout_adj', 0.5), # Note: config saves dropout_adj, GCL takes dropout_adj
+            'sparse': self.sparse,
+            'use_layer_norm': model_config.get('use_layer_norm', False),
+            'use_residual': model_config.get('use_residual', False),
+            'use_arcface': model_config.get('use_arcface', False),
+            'use_classification_head': model_config.get('use_classification_head', False)
+        }
+        # Add ArcFace specific params if used
+        if gcl_params['use_arcface']:
+             gcl_params.update({
+                 'num_classes': model_config['num_classes'],
+                 'arcface_scale': model_config.get('arcface_scale', 30.0),
+                 'arcface_margin': model_config.get('arcface_margin', 0.5),
+                 'use_sampled_arcface': model_config.get('use_sampled_arcface', False),
+                 'arcface_num_samples': model_config.get('arcface_num_samples', None)
+             })
+        # Add Classification head specific params if used
+        if gcl_params['use_classification_head']:
+             gcl_params.update({
+                 'classification_dropout': model_config.get('classification_dropout', 0.3),
+                 'classification_head_layers': model_config.get('classification_head_layers', 2)
+             })
+             self.has_classification_head = True # Set flag
+
+        self.model = GCL(**gcl_params)
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model = self.model.to(self.device)
+        self.model.eval() # Set to eval mode
+
+        print("SUBLIME model loaded successfully!")
+        if self.has_classification_head: print("Model includes a binary classification head.")
+
+        # self.model, self.graph_learner, self.features, self.adj, self.sparse = self.experiment.load_model(input_dir=self.config.model_dir) # REMOVE THIS LINE
+        # print("SUBLIME model loaded successfully!")
+        # self.has_classification_head = hasattr(self.model, 'use_classification_head') and self.model.use_classification_head
+        # if self.has_classification_head: print("Model includes a binary classification head.")
+        # except FileNotFoundError as e:
+             # print(f"Error loading model: {e}. Ensure model files exist in {self.config.model_dir}")
+             # raise
+        # except Exception as e:
+             # print(f"An unexpected error occurred loading the model: {e}")
+             # raise # Keep raising other unexpected errors
 
     def build_faiss_index_if_needed(self):
         """Builds FAISS index from loaded features for optimization."""
