@@ -409,7 +409,7 @@ class MLP_learner(nn.Module):
             final_values_list = []
 
             num_chunks = math.ceil(num_total_edges / self.chunk_size)
-            tqdm.write(f"  [MLP Sparse] Processing {num_total_edges} edges in {num_chunks} chunks of size {self.chunk_size}")
+            print(f"  [MLP Sparse] Processing {num_total_edges} edges in {num_chunks} chunks of size {self.chunk_size}")
 
             for i in range(0, num_total_edges, self.chunk_size):
                 start_idx = i
