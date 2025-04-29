@@ -331,124 +331,145 @@ class MLP_learner(nn.Module):
         embeddings = self.internal_forward(features)
 
         if self.sparse:
-            # Get neighbor indices without similarity values
-            rows, cols = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
-                                 knn_threshold_type=self.knn_threshold_type,
-                                 knn_std_dev_factor=self.knn_std_dev_factor)
-            
-            # Super memory-efficient approach
             device = features.device
             num_nodes = features.shape[0]
+
+            # --- 1. Get Initial KNN Edges ---
+            knn_rows, knn_cols = knn_fast(
+                embeddings, self.k,
+                faiss_index=faiss_index,
+                knn_threshold_type=self.knn_threshold_type,
+                knn_std_dev_factor=self.knn_std_dev_factor
+            )
+
+            # --- 2. Explicitly Symmetrize Edges ---
+            # Combine original and reversed edges for processing
+            all_src_nodes = torch.cat([knn_rows, knn_cols])
+            all_dst_nodes = torch.cat([knn_cols, knn_rows])
+            del knn_rows, knn_cols # Free memory early
             
+            num_total_edges = all_src_nodes.size(0)
+            if num_total_edges == 0:
+                 # Handle case with no edges found
+                 print("Warning: No edges found by knn_fast. Returning empty graph.")
+                 return dgl.graph(([], []), num_nodes=num_nodes, device=device)
+
+
+            # --- 3. Process Edges in Chunks for Memory Efficiency ---
+            processed_rows = []
+            processed_cols = []
+            processed_values = []
+
             # Use memory optimization parameters from instance variables
-            base_chunk_size = self.chunk_size
+            chunk_size = self.chunk_size
             offload_to_cpu = self.offload_to_cpu
             cleanup_every_n_chunks = self.cleanup_every_n_chunks
+
+            for chunk_idx, i in enumerate(range(0, num_total_edges, chunk_size)):
+                # --- a. Get Chunk ---
+                end_idx = min(i + chunk_size, num_total_edges)
+                src_chunk = all_src_nodes[i:end_idx]
+                dst_chunk = all_dst_nodes[i:end_idx]
+
+                # Optionally offload indices to CPU to save GPU memory during index creation
+                src_chunk_mem = src_chunk.to('cpu') if offload_to_cpu else src_chunk
+                dst_chunk_mem = dst_chunk.to('cpu') if offload_to_cpu else dst_chunk
+
+                # --- b. Get Embeddings for Nodes in Chunk ---
+                # Find unique nodes involved in this chunk
+                needed_indices = torch.unique(torch.cat([src_chunk_mem, dst_chunk_mem]))
+                # Ensure needed_indices are on the correct device (GPU) for embedding lookup
+                needed_indices = needed_indices.to(device)
+
+                # Extract only necessary embeddings and normalize them
+                mini_embeddings = embeddings[needed_indices]
+                mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
+
+                # --- c. Map Chunk Indices to Mini-Embedding Indices ---
+                if offload_to_cpu:
+                    # Create mapping structures on CPU
+                    needed_indices_cpu = needed_indices.cpu()
+                    position_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
+                    position_map.scatter_(0, needed_indices_cpu, torch.arange(len(needed_indices_cpu), device='cpu'))
+                    
+                    # Perform mapping lookup on CPU using CPU indices
+                    mapped_src = position_map[src_chunk_mem] # src_chunk_mem is already on CPU
+                    mapped_dst = position_map[dst_chunk_mem] # dst_chunk_mem is already on CPU
+                    
+                    # Move mapped indices back to GPU for similarity calculation
+                    mapped_src = mapped_src.to(device)
+                    mapped_dst = mapped_dst.to(device)
+                    
+                    # Clean up CPU tensors explicitly
+                    del needed_indices_cpu, position_map
+                else:
+                    # Create mapping structures directly on GPU
+                    position_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
+                    position_map.scatter_(0, needed_indices, torch.arange(len(needed_indices), device=device))
+                    
+                    # Perform mapping lookup on GPU using GPU indices
+                    mapped_src = position_map[src_chunk] # src_chunk is already on GPU
+                    mapped_dst = position_map[dst_chunk] # dst_chunk is already on GPU
+
+                    # Clean up GPU tensor explicitly
+                    del position_map
                 
-            # Calculate the total number of edges without storing the full symmetrized tensors
-            base_num_edges = rows.size(0)
-            
-            # Track in-memory edges (each direction separately)
-            all_rows = []
-            all_cols = []
-            all_values = []
-            
-            # Process both original and reverse edges in a single loop
-            for direction in range(2):  # 0 = original, 1 = reverse
-                for chunk_idx, i in enumerate(range(0, base_num_edges, base_chunk_size)):
-                    # Get indices for this chunk
-                    end_idx = min(i + base_chunk_size, base_num_edges)
-                    
-                    if direction == 0:  # Original direction
-                        rows_chunk = rows[i:end_idx]
-                        cols_chunk = cols[i:end_idx]
-                    else:  # Reverse direction (for symmetrizing)
-                        rows_chunk = cols[i:end_idx]  # Note the swap
-                        cols_chunk = rows[i:end_idx]  # Note the swap
-                    
-                    # Optionally offload to CPU to save GPU memory
-                    if offload_to_cpu:
-                        rows_chunk = rows_chunk.to('cpu')
-                        cols_chunk = cols_chunk.to('cpu')
-                    
-                    # Get only the embeddings we need and normalize only those
-                    needed_indices = torch.unique(torch.cat([rows_chunk, cols_chunk]))
-                    needed_indices = needed_indices.to(device)
-                    
-                    # Create a mini-embedding matrix for only needed nodes
-                    mini_embeddings = embeddings[needed_indices]
-                    mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
-                    
-                    # Fast vectorized index mapping using scatter
-                    if offload_to_cpu:
-                        # Move needed_indices to CPU for CPU mapping
-                        needed_indices_cpu = needed_indices.cpu()
-                        # Create position mapping with scatter (MUCH faster than loop)
-                        position_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
-                        position_map.scatter_(0, needed_indices_cpu, torch.arange(len(needed_indices_cpu), device='cpu'))
-                        # Map indices to positions
-                        mapped_rows = position_map[rows_chunk]
-                        mapped_cols = position_map[cols_chunk]
-                        
-                        # Move back to device for similarity calculation
-                        mapped_rows = mapped_rows.to(device)
-                        mapped_cols = mapped_cols.to(device)
-                        rows_chunk = rows_chunk.to(device)
-                        cols_chunk = cols_chunk.to(device)
-                    else:
-                        # GPU version (keep everything on GPU)
-                        position_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
-                        position_map.scatter_(0, needed_indices, torch.arange(len(needed_indices), device=device))
-                        mapped_rows = position_map[rows_chunk]
-                        mapped_cols = position_map[cols_chunk]
-                    
-                    # Calculate similarity using the mini-embeddings
-                    emb_rows = mini_embeddings[mapped_rows]
-                    emb_cols = mini_embeddings[mapped_cols]
-                    values_chunk = torch.sum(emb_rows * emb_cols, dim=1)
-                    
-                    # Store the original rows, cols and values
-                    all_rows.append(rows_chunk)
-                    all_cols.append(cols_chunk)
-                    all_values.append(values_chunk)
-                    
-                    # Clear memory
-                    del mini_embeddings, needed_indices, position_map
-                    del mapped_rows, mapped_cols, emb_rows, emb_cols
-                    
-                    # Periodically run garbage collection 
-                    if cleanup_every_n_chunks > 0 and chunk_idx % cleanup_every_n_chunks == 0:
-                        import gc
-                        gc.collect()
-                        torch.cuda.empty_cache()
-            
-            # Combine all processed chunks
-            rows_sym = torch.cat(all_rows)
-            cols_sym = torch.cat(all_cols)
-            values_sym = torch.cat(all_values)
-            
-            # Apply non-linearity to the differentiable similarity values
-            values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
-            
-            # Create DGL graph and assign differentiable edge weights
-            adj = dgl.graph((rows_sym, cols_sym), num_nodes=num_nodes, device=device)
-            adj.edata['w'] = values_processed
-            
-            # Clear any remaining tensors
-            del all_rows, all_cols, all_values, rows, cols, values_sym
-            
-            # Final memory cleanup
+                # Cleanup mapping-related tensors regardless of path
+                del needed_indices 
+
+                # --- d. Calculate Similarities for Chunk ---
+                emb_src = mini_embeddings[mapped_src]
+                emb_dst = mini_embeddings[mapped_dst]
+                # Cosine similarity for normalized embeddings is the dot product
+                values_chunk = torch.sum(emb_src * emb_dst, dim=1)
+
+                # --- e. Store Original Indices and Calculated Values ---
+                # Store the *original* source/destination indices (on GPU) and computed values
+                processed_rows.append(src_chunk)
+                processed_cols.append(dst_chunk)
+                processed_values.append(values_chunk)
+
+                # --- f. Memory Cleanup for Chunk ---
+                del src_chunk, dst_chunk, src_chunk_mem, dst_chunk_mem
+                if cleanup_every_n_chunks > 0 and (chunk_idx + 1) % cleanup_every_n_chunks == 0:
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+
+            # --- 4. Combine Processed Chunks ---
+            final_rows = torch.cat(processed_rows)
+            final_cols = torch.cat(processed_cols)
+            final_values = torch.cat(processed_values)
+
+            del processed_rows, processed_cols, processed_values # Free list memory
+            del all_src_nodes, all_dst_nodes # Free combined indices
+
+            # --- 5. Apply Non-linearity ---
+            final_values_processed = apply_non_linearity(final_values, self.non_linearity, self.i)
+
+            # --- 6. Create DGL Graph ---
+            adj = dgl.graph((final_rows, final_cols), num_nodes=num_nodes, device=device)
+            adj.edata['w'] = final_values_processed
+
+            # --- 7. Final Memory Cleanup ---
+            del final_rows, final_cols, final_values, final_values_processed, embeddings
             if cleanup_every_n_chunks > 0:
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
-            
+
             return adj
         else:
+            # --- Dense Mode ---
             print("Warning: Dense mode in MLP_learner still uses top_k similarity, not knn_fast thresholding.")
-            embeddings = F.normalize(embeddings, dim=1, p=2)
-            similarities = cal_similarity_graph(embeddings)
-            similarities = top_k(similarities, self.k + 1)
+            # Normalize embeddings for cosine similarity calculation
+            embeddings_norm = F.normalize(embeddings, dim=1, p=2)
+            # Calculate dense similarity matrix
+            similarities = torch.mm(embeddings_norm, embeddings_norm.t())
+            # Keep only top K neighbors for each node
+            similarities = top_k(similarities, self.k + 1) # +1 to potentially include self
+            # Apply non-linearity
             similarities = apply_non_linearity(similarities, self.non_linearity, self.i)
             return similarities
 
