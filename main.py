@@ -1212,6 +1212,23 @@ class Experiment:
                     # Backward and optimize based on phase
                     loss.backward()
 
+                    # --- Check Learner Gradients (Diagnostic) ---
+                    if is_graph_learner_phase: # Only check during Phase 2
+                        learner_grad_norm = 0.0
+                        params_with_grad = 0
+                        for p in graph_learner.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.detach().data.norm(2)
+                                learner_grad_norm += param_norm.item() ** 2
+                                params_with_grad += 1
+                        learner_grad_norm = learner_grad_norm ** 0.5
+                        # Only print if verbose and gradient is calculated
+                        if args.verbose and params_with_grad > 0 and epoch % 5 == 0: # Print every 5 epochs in phase 2
+                            tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: {learner_grad_norm:.6f}")
+                        elif args.verbose and params_with_grad == 0 and epoch % 5 == 0:
+                             tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: N/A (No Grads Found)")
+
+
                     # Gradient Clipping based on phase
                     if args.clip_norm > 0:
                         if is_embedding_phase or is_joint_phase: # Clip model grads if model was trained
