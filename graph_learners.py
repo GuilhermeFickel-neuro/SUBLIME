@@ -370,7 +370,7 @@ class MLP_learner(nn.Module):
                 knn_threshold_type=self.knn_threshold_type,
                 knn_std_dev_factor=self.knn_std_dev_factor
             )
-            del knn_rows, knn_cols # Free memory early
+            # del knn_rows, knn_cols # Free memory early <-- REMOVE THIS LINE
             # self._log_vram("MLP Sparse: After Symmetrization") # REMOVED
             
             num_total_edges = knn_rows.size(0)
@@ -381,7 +381,7 @@ class MLP_learner(nn.Module):
             # --- 2. Explicitly Symmetrize Edges ---
             all_src_nodes = torch.cat([knn_rows, knn_cols])
             all_dst_nodes = torch.cat([knn_cols, knn_rows])
-            del knn_rows, knn_cols # Free memory early
+            del knn_rows, knn_cols # Free memory early <-- ADD THIS LINE HERE
             # self._log_vram("MLP Sparse: After Symmetrization") # REMOVED
             
             # --- 3. Calculate Similarities for ALL Edges ---
