@@ -1,6 +1,7 @@
 import dgl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from layers import Attentive, GCNConv_dense, GCNConv_dgl
 from utils import *
@@ -281,8 +282,7 @@ class ATT_learner(nn.Module):
 
 
 class MLP_learner(nn.Module):
-    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, act, knn_threshold_type='none', knn_std_dev_factor=1.0, 
-                 chunk_size=100, offload_to_cpu=True, cleanup_every_n_chunks=5):
+    def __init__(self, nlayers, isize, k, knn_metric, i, sparse, act, knn_threshold_type='none', knn_std_dev_factor=1.0):
         super(MLP_learner, self).__init__()
 
         self.layers = nn.ModuleList()
@@ -306,10 +306,7 @@ class MLP_learner(nn.Module):
         self.knn_threshold_type = knn_threshold_type
         self.knn_std_dev_factor = knn_std_dev_factor
         
-        # Memory optimization parameters removed
-        # self.chunk_size = chunk_size
-        # self.offload_to_cpu = offload_to_cpu
-        # self.cleanup_every_n_chunks = cleanup_every_n_chunks
+
 
     def internal_forward(self, h):
         for i, layer in enumerate(self.layers):
@@ -328,10 +325,37 @@ class MLP_learner(nn.Module):
                  layer.bias.data.fill_(0)
 
     def forward(self, features, faiss_index=None):
+        # --- VRAM Measurement Setup ---
+        device = features.device
+        use_cuda_memory_tracking = torch.cuda.is_available() and device.type == 'cuda'
+        initial_allocated_mem = 0
+        start_mem_embeddings = 0
+        start_mem_block = 0
+
+        if use_cuda_memory_tracking:
+            # Record initial memory
+            initial_allocated_mem = torch.cuda.memory_allocated(device)
+            print(f"[MLP Forward Start] Initial VRAM allocated: {initial_allocated_mem / (1024**2):.2f} MB")
+            # Reset peak stats for embedding calculation
+            torch.cuda.reset_peak_memory_stats(device)
+            start_mem_embeddings = torch.cuda.memory_allocated(device)
+        # --- End VRAM Measurement Setup ---
+
         embeddings = self.internal_forward(features)
 
+        # --- Measure Embeddings VRAM ---
+        if use_cuda_memory_tracking:
+            peak_mem_embeddings = torch.cuda.max_memory_allocated(device)
+            print(f"  [Embeddings Calc] Peak VRAM increase: {(peak_mem_embeddings - start_mem_embeddings) / (1024**2):.2f} MB")
+            # Reset peak stats for the main sparse/dense block
+            torch.cuda.reset_peak_memory_stats(device)
+            start_mem_block = torch.cuda.memory_allocated(device)
+        # --- End Embeddings VRAM ---
+
+
         if self.sparse:
-            device = features.device
+            # --- Start Sparse Block ---
+            device = features.device # Already defined, but good practice
             num_nodes = features.shape[0]
 
             # --- 1. Get Initial KNN Edges ---
@@ -388,10 +412,14 @@ class MLP_learner(nn.Module):
 
             # --- 7. Final Memory Cleanup (Optional, less critical without chunks) ---
             del all_src_nodes, all_dst_nodes, final_values, final_values_processed
-            # Optional: Force cleanup if still needed for some reason
-            # import gc
-            # gc.collect()
-            # torch.cuda.empty_cache()
+
+            # --- Measure Sparse Block VRAM ---
+            if use_cuda_memory_tracking:
+                peak_mem_block = torch.cuda.max_memory_allocated(device)
+                print(f"  [Sparse Block Total] Peak VRAM increase: {(peak_mem_block - start_mem_block) / (1024**2):.2f} MB")
+                final_allocated_mem = torch.cuda.memory_allocated(device)
+                print(f"[MLP Forward End (Sparse)] Final VRAM allocated: {final_allocated_mem / (1024**2):.2f} MB (Delta: {(final_allocated_mem - initial_allocated_mem) / (1024**2):.2f} MB)")
+            # --- End Sparse Block VRAM ---
 
             return adj
         else:
@@ -401,6 +429,15 @@ class MLP_learner(nn.Module):
             similarities = torch.mm(embeddings_norm, embeddings_norm.t())
             similarities = top_k(similarities, self.k + 1)
             similarities = apply_non_linearity(similarities, self.non_linearity, self.i)
+
+            # --- Measure Dense Block VRAM ---
+            if use_cuda_memory_tracking:
+                peak_mem_block = torch.cuda.max_memory_allocated(device)
+                print(f"  [Dense Block Total] Peak VRAM increase: {(peak_mem_block - start_mem_block) / (1024**2):.2f} MB")
+                final_allocated_mem = torch.cuda.memory_allocated(device)
+                print(f"[MLP Forward End (Dense)] Final VRAM allocated: {final_allocated_mem / (1024**2):.2f} MB (Delta: {(final_allocated_mem - initial_allocated_mem) / (1024**2):.2f} MB)")
+            # --- End Dense Block VRAM ---
+
             return similarities
 
 
