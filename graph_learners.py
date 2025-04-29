@@ -168,16 +168,45 @@ class ATT_learner(nn.Module):
         embeddings = self.internal_forward(features)
 
         if self.sparse:
-            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
-                                          knn_threshold_type=self.knn_threshold_type,
-                                          knn_std_dev_factor=self.knn_std_dev_factor)
+            # Normalize embeddings for cosine similarity calculation (maintains gradients)
+            embeddings_normalized = F.normalize(embeddings, dim=1, p=2)
 
+            # Get neighbor indices using the non-differentiable knn_fast
+            rows, cols = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
+                                  knn_threshold_type=self.knn_threshold_type,
+                                  knn_std_dev_factor=self.knn_std_dev_factor)
+
+            # Symmetrize indices
             rows_sym = torch.cat((rows, cols))
             cols_sym = torch.cat((cols, rows))
-            values_sym = torch.cat((values, values))
+            
+            # Process edges in chunks to avoid OOM
+            chunk_size = 10000  # Adjust based on available memory
+            num_edges = rows_sym.size(0)
+            values_list = []
+            
+            for i in range(0, num_edges, chunk_size):
+                # Get indices for this chunk
+                end_idx = min(i + chunk_size, num_edges)
+                rows_chunk = rows_sym[i:end_idx]
+                cols_chunk = cols_sym[i:end_idx]
+                
+                # Get embeddings and calculate similarity for this chunk
+                emb_rows_chunk = embeddings_normalized[rows_chunk]
+                emb_cols_chunk = embeddings_normalized[cols_chunk]
+                values_chunk = torch.sum(emb_rows_chunk * emb_cols_chunk, dim=1)
+                
+                # Save the values and free memory
+                values_list.append(values_chunk)
+                del emb_rows_chunk, emb_cols_chunk
+            
+            # Combine all chunks
+            values_sym = torch.cat(values_list)
 
+            # Apply non-linearity to the differentiable similarity values
             values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
 
+            # Create DGL graph and assign differentiable edge weights
             adj = dgl.graph((rows_sym, cols_sym), num_nodes=features.shape[0], device=features.device)
             adj.edata['w'] = values_processed
             return adj
@@ -247,12 +276,28 @@ class MLP_learner(nn.Module):
             rows_sym = torch.cat((rows, cols))
             cols_sym = torch.cat((cols, rows))
             
-            # Select embeddings for the edges using the indices
-            emb_rows = embeddings_normalized[rows_sym]
-            emb_cols = embeddings_normalized[cols_sym]
-
-            # Calculate similarity values differentiably (dot product of normalized embeddings)
-            values_sym = torch.sum(emb_rows * emb_cols, dim=1)
+            # Process edges in chunks to avoid OOM
+            chunk_size = 10000  # Adjust based on available memory
+            num_edges = rows_sym.size(0)
+            values_list = []
+            
+            for i in range(0, num_edges, chunk_size):
+                # Get indices for this chunk
+                end_idx = min(i + chunk_size, num_edges)
+                rows_chunk = rows_sym[i:end_idx]
+                cols_chunk = cols_sym[i:end_idx]
+                
+                # Get embeddings and calculate similarity for this chunk
+                emb_rows_chunk = embeddings_normalized[rows_chunk]
+                emb_cols_chunk = embeddings_normalized[cols_chunk]
+                values_chunk = torch.sum(emb_rows_chunk * emb_cols_chunk, dim=1)
+                
+                # Save the values and free memory
+                values_list.append(values_chunk)
+                del emb_rows_chunk, emb_cols_chunk
+            
+            # Combine all chunks
+            values_sym = torch.cat(values_list)
 
             # Apply non-linearity to the differentiable similarity values
             values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
@@ -316,16 +361,45 @@ class GNN_learner(nn.Module):
         embeddings = self.internal_forward(features)
 
         if self.sparse:
-            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
-                                          knn_threshold_type=self.knn_threshold_type,
-                                          knn_std_dev_factor=self.knn_std_dev_factor)
+            # Normalize embeddings for cosine similarity calculation (maintains gradients)
+            embeddings_normalized = F.normalize(embeddings, dim=1, p=2)
 
+            # Get neighbor indices using the non-differentiable knn_fast
+            rows, cols = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
+                                  knn_threshold_type=self.knn_threshold_type,
+                                  knn_std_dev_factor=self.knn_std_dev_factor)
+
+            # Symmetrize indices
             rows_sym = torch.cat((rows, cols))
             cols_sym = torch.cat((cols, rows))
-            values_sym = torch.cat((values, values))
+            
+            # Process edges in chunks to avoid OOM
+            chunk_size = 10000  # Adjust based on available memory
+            num_edges = rows_sym.size(0)
+            values_list = []
+            
+            for i in range(0, num_edges, chunk_size):
+                # Get indices for this chunk
+                end_idx = min(i + chunk_size, num_edges)
+                rows_chunk = rows_sym[i:end_idx]
+                cols_chunk = cols_sym[i:end_idx]
+                
+                # Get embeddings and calculate similarity for this chunk
+                emb_rows_chunk = embeddings_normalized[rows_chunk]
+                emb_cols_chunk = embeddings_normalized[cols_chunk]
+                values_chunk = torch.sum(emb_rows_chunk * emb_cols_chunk, dim=1)
+                
+                # Save the values and free memory
+                values_list.append(values_chunk)
+                del emb_rows_chunk, emb_cols_chunk
+            
+            # Combine all chunks
+            values_sym = torch.cat(values_list)
 
+            # Apply non-linearity to the differentiable similarity values
             values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
 
+            # Create DGL graph and assign differentiable edge weights
             adj = dgl.graph((rows_sym, cols_sym), num_nodes=features.shape[0], device=features.device)
             adj.edata['w'] = values_processed
             return adj
