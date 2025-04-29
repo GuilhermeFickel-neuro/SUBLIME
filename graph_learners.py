@@ -360,10 +360,10 @@ class MLP_learner(nn.Module):
             # --- Start Sparse Block ---
             device = features.device # Already defined, but good practice
             num_nodes = features.shape[0]
-            self._log_vram("MLP Sparse Start") # Log start of sparse block
+            # self._log_vram("MLP Sparse Start") # REMOVED: Method not in this class
 
             # --- 1. Get Initial KNN Edges ---
-            self._log_vram("MLP Sparse: Before KNN")
+            # self._log_vram("MLP Sparse: Before KNN") # REMOVED
             knn_rows, knn_cols = knn_fast(
                 embeddings, self.k,
                 faiss_index=faiss_index,
@@ -371,7 +371,7 @@ class MLP_learner(nn.Module):
                 knn_std_dev_factor=self.knn_std_dev_factor
             )
             del knn_rows, knn_cols # Free memory early
-            self._log_vram("MLP Sparse: After Symmetrization")
+            # self._log_vram("MLP Sparse: After Symmetrization") # REMOVED
             
             num_total_edges = knn_rows.size(0)
             if num_total_edges == 0:
@@ -382,6 +382,7 @@ class MLP_learner(nn.Module):
             all_src_nodes = torch.cat([knn_rows, knn_cols])
             all_dst_nodes = torch.cat([knn_cols, knn_rows])
             del knn_rows, knn_cols # Free memory early
+            # self._log_vram("MLP Sparse: After Symmetrization") # REMOVED
             
             # --- 3. Calculate Similarities for ALL Edges ---
             # Find unique nodes involved across all edges
@@ -392,12 +393,12 @@ class MLP_learner(nn.Module):
             # Note: If embeddings themselves are huge, this might still be an issue
             all_needed_embeddings = embeddings[needed_indices]
             all_needed_embeddings_norm = F.normalize(all_needed_embeddings, dim=1, p=2)
-            self._log_vram("MLP Sparse: After Mini-Embeddings Extraction")
+            # self._log_vram("MLP Sparse: After Mini-Embeddings Extraction") # REMOVED
             
             # Create mapping from global node index to local index within all_needed_embeddings_norm (on GPU)
             position_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
             position_map.scatter_(0, needed_indices, torch.arange(len(needed_indices), device=device))
-            self._log_vram("MLP Sparse: After Position Map Creation")
+            # self._log_vram("MLP Sparse: After Position Map Creation") # REMOVED
 
             # Clear original embeddings if no longer needed elsewhere
             del embeddings, all_needed_embeddings
@@ -415,22 +416,22 @@ class MLP_learner(nn.Module):
                 end_idx = min(i + self.chunk_size, num_total_edges)
                 chunk_src = all_src_nodes[start_idx:end_idx]
                 chunk_dst = all_dst_nodes[start_idx:end_idx]
-                self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}/{num_chunks}: Start")
+                # self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}/{num_chunks}: Start") # REMOVED
 
                 # Map chunk source and destination nodes using the precomputed position_map
                 mapped_src_chunk = position_map[chunk_src]
                 mapped_dst_chunk = position_map[chunk_dst]
-                self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: Mapped Indices")
+                # self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: Mapped Indices") # REMOVED
 
                 # Calculate similarities for the chunk using the normalized mini-embeddings
                 emb_src_chunk = all_needed_embeddings_norm[mapped_src_chunk]
                 emb_dst_chunk = all_needed_embeddings_norm[mapped_dst_chunk]
                 chunk_values = torch.sum(emb_src_chunk * emb_dst_chunk, dim=1)
-                self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: Calculated Similarities")
+                # self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: Calculated Similarities") # REMOVED
 
                 # Apply Non-linearity to chunk values
                 chunk_values_processed = apply_non_linearity(chunk_values, self.non_linearity, self.i)
-                self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: Applied Non-linearity")
+                # self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: Applied Non-linearity") # REMOVED
 
                 # Store the original chunk src/dst and the processed values
                 final_src_list.append(chunk_src)
@@ -443,25 +444,25 @@ class MLP_learner(nn.Module):
                 # Optionally clear cache periodically within the loop if memory pressure is still high
                 # if (i // self.chunk_size + 1) % 5 == 0: # Example: every 5 chunks
                 #     torch.cuda.empty_cache()
-                self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: End & Cleanup")
+                # self._log_vram(f"MLP Sparse Chunk {i//self.chunk_size + 1}: End & Cleanup") # REMOVED
 
             # --- 4. Combine Chunks and Create DGL Graph --- 
-            self._log_vram("MLP Sparse: Before Combining Chunks")
+            # self._log_vram("MLP Sparse: Before Combining Chunks") # REMOVED
             final_src_nodes = torch.cat(final_src_list)
             final_dst_nodes = torch.cat(final_dst_list)
             final_values_processed = torch.cat(final_values_list)
-            self._log_vram("MLP Sparse: After Combining Chunks")
+            # self._log_vram("MLP Sparse: After Combining Chunks") # REMOVED
 
             # --- 5. Clean up intermediate tensors --- (Original position map, etc.)
             del all_src_nodes, all_dst_nodes, needed_indices, all_needed_embeddings_norm, position_map
             del final_src_list, final_dst_list, final_values_list # Delete lists
-            self._log_vram("MLP Sparse: After Final Cleanup Pre-Graph")
+            # self._log_vram("MLP Sparse: After Final Cleanup Pre-Graph") # REMOVED
 
             # --- 6. Create DGL Graph --- 
             # Use the combined source/destination nodes and processed values
             adj = dgl.graph((final_src_nodes, final_dst_nodes), num_nodes=num_nodes, device=device)
             adj.edata['w'] = final_values_processed
-            self._log_vram("MLP Sparse: After DGL Graph Creation")
+            # self._log_vram("MLP Sparse: After DGL Graph Creation") # REMOVED
 
             # --- 7. Final Memory Cleanup (Less critical now, but keep) ---
             # del final_src_nodes, final_dst_nodes, final_values_processed # Keep these for the return 'adj'
