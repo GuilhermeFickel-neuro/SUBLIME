@@ -469,7 +469,7 @@ class SublimeHandler:
                  if weights is not None:
                       self.adj.edata['w'] = weights.to(self.device)
                  # Normalize the loaded DGL graph (as done in original training)
-                 self.adj = normalize(self.adj, 'sym', self.sparse)
+                 # self.adj = normalize(self.adj, 'sym', self.sparse) - REMOVED, assumed already normalized
             elif isinstance(adj_data, torch.Tensor) and adj_data.is_sparse: # Saved torch sparse tensor
                  # This was the format before DGL saving was explicit
                  # Normalize directly
