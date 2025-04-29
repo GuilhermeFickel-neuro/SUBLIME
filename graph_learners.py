@@ -199,23 +199,35 @@ class ATT_learner(nn.Module):
                 needed_indices = torch.unique(torch.cat([rows_chunk, cols_chunk]))
                 needed_indices = needed_indices.to(device)
                 
-                # Create a mini-embedding matrix for only needed nodes
-                with torch.no_grad():  # Use no_grad for the index mapping
-                    mini_embeddings = embeddings[needed_indices]
-                    mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
-                    
-                    # Create a mapping from original indices to positions in mini_embeddings
-                    index_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
-                    for mini_idx, orig_idx in enumerate(needed_indices.cpu()):
-                        index_map[orig_idx] = mini_idx
-                    
-                    # Map the original row and col indices to positions in mini_embeddings
-                    mapped_rows = index_map[rows_chunk]
-                    mapped_cols = index_map[cols_chunk]
+                # Create a mini-embedding matrix for only needed nodes - VECTORIZED VERSION
+                mini_embeddings = embeddings[needed_indices]
+                mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
                 
-                # Move back to device for calculation
-                mapped_rows = mapped_rows.to(device)
-                mapped_cols = mapped_cols.to(device)
+                # Fast vectorized index mapping using scatter (much faster than the loop)
+                if offload_to_cpu:
+                    # Create a CPU mapping tensor
+                    needed_indices_cpu = needed_indices.cpu()
+                    position_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
+                    # Use scatter to build the mapping efficiently
+                    position_map.scatter_(0, needed_indices_cpu, torch.arange(len(needed_indices_cpu), device='cpu'))
+                    # Map the original row and col indices to positions in mini_embeddings
+                    mapped_rows = position_map[rows_chunk]
+                    mapped_cols = position_map[cols_chunk]
+                else:
+                    # Create a GPU mapping tensor (faster on GPU)
+                    position_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
+                    # Use scatter to build the mapping efficiently
+                    position_map.scatter_(0, needed_indices, torch.arange(len(needed_indices), device=device))
+                    # Map the original row and col indices to positions in mini_embeddings
+                    mapped_rows = position_map[rows_chunk]
+                    mapped_cols = position_map[cols_chunk]
+                
+                # Move back to device for calculation if needed
+                if offload_to_cpu:
+                    mapped_rows = mapped_rows.to(device)
+                    mapped_cols = mapped_cols.to(device)
+                    rows_chunk = rows_chunk.to(device)
+                    cols_chunk = cols_chunk.to(device)
                 
                 # Calculate similarity using the mini-embeddings
                 emb_rows = mini_embeddings[mapped_rows]
@@ -223,57 +235,19 @@ class ATT_learner(nn.Module):
                 values_chunk = torch.sum(emb_rows * emb_cols, dim=1)
                 
                 # Store the original rows, cols and values (not the mapped indices)
-                all_rows.append(rows_chunk.to(device))
-                all_cols.append(cols_chunk.to(device))
+                all_rows.append(rows_chunk)
+                all_cols.append(cols_chunk)
                 all_values.append(values_chunk)
                 
                 # Clear memory
-                del mini_embeddings, needed_indices, index_map
+                del mini_embeddings, needed_indices, position_map
                 del mapped_rows, mapped_cols, emb_rows, emb_cols
                 
-            # Now process the reverse direction (symmetrize)
-            for i in range(0, base_num_edges, base_chunk_size):
-                # Get indices for this chunk
-                end_idx = min(i + base_chunk_size, base_num_edges)
-                # Reverse rows and cols for symmetrizing
-                rows_chunk = cols[i:end_idx].to('cpu')  # Note the swap: using cols as rows
-                cols_chunk = rows[i:end_idx].to('cpu')  # Note the swap: using rows as cols
-                
-                # Get only the embeddings we need and normalize only those
-                needed_indices = torch.unique(torch.cat([rows_chunk, cols_chunk]))
-                needed_indices = needed_indices.to(device)
-                
-                # Create a mini-embedding matrix for only needed nodes
-                with torch.no_grad():  # Use no_grad for the index mapping
-                    mini_embeddings = embeddings[needed_indices]
-                    mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
-                    
-                    # Create a mapping from original indices to positions in mini_embeddings
-                    index_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
-                    for mini_idx, orig_idx in enumerate(needed_indices.cpu()):
-                        index_map[orig_idx] = mini_idx
-                    
-                    # Map the original row and col indices to positions in mini_embeddings
-                    mapped_rows = index_map[rows_chunk]
-                    mapped_cols = index_map[cols_chunk]
-                
-                # Move back to device for calculation
-                mapped_rows = mapped_rows.to(device)
-                mapped_cols = mapped_cols.to(device)
-                
-                # Calculate similarity using the mini-embeddings
-                emb_rows = mini_embeddings[mapped_rows]
-                emb_cols = mini_embeddings[mapped_cols]
-                values_chunk = torch.sum(emb_rows * emb_cols, dim=1)
-                
-                # Store the original rows, cols and values (not the mapped indices)
-                all_rows.append(rows_chunk.to(device))
-                all_cols.append(cols_chunk.to(device))
-                all_values.append(values_chunk)
-                
-                # Clear memory
-                del mini_embeddings, needed_indices, index_map
-                del mapped_rows, mapped_cols, emb_rows, emb_cols
+                # Periodically run garbage collection and empty cache
+                if cleanup_every_n_chunks > 0 and chunk_idx % cleanup_every_n_chunks == 0:
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
             
             # Combine all processed chunks
             rows_sym = torch.cat(all_rows)
@@ -288,7 +262,13 @@ class ATT_learner(nn.Module):
             adj.edata['w'] = values_processed
             
             # Clear any remaining tensors
-            del all_rows, all_cols, all_values, rows, cols
+            del all_rows, all_cols, all_values, rows, cols, values_sym
+            
+            # Final memory cleanup
+            if cleanup_every_n_chunks > 0:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
             
             return adj
         else:
@@ -396,51 +376,47 @@ class MLP_learner(nn.Module):
                     needed_indices = needed_indices.to(device)
                     
                     # Create a mini-embedding matrix for only needed nodes
-                    with torch.no_grad():  # Use no_grad for the index mapping
-                        mini_embeddings = embeddings[needed_indices]
-                        mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
-                        
-                        # Create a mapping from original indices to positions in mini_embeddings
-                        if offload_to_cpu:
-                            index_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
-                            for mini_idx, orig_idx in enumerate(needed_indices.cpu()):
-                                index_map[orig_idx] = mini_idx
-                            
-                            # Map the original row and col indices to positions in mini_embeddings
-                            mapped_rows = index_map[rows_chunk]
-                            mapped_cols = index_map[cols_chunk]
-                        else:
-                            # Keep everything on GPU if not offloading
-                            index_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
-                            for mini_idx, orig_idx in enumerate(needed_indices):
-                                index_map[orig_idx] = mini_idx
-                            
-                            # Map the original row and col indices to positions in mini_embeddings
-                            mapped_rows = index_map[rows_chunk]
-                            mapped_cols = index_map[cols_chunk]
+                    mini_embeddings = embeddings[needed_indices]
+                    mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
                     
-                    # Move back to device for calculation if needed
+                    # Fast vectorized index mapping using scatter
                     if offload_to_cpu:
+                        # Move needed_indices to CPU for CPU mapping
+                        needed_indices_cpu = needed_indices.cpu()
+                        # Create position mapping with scatter (MUCH faster than loop)
+                        position_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
+                        position_map.scatter_(0, needed_indices_cpu, torch.arange(len(needed_indices_cpu), device='cpu'))
+                        # Map indices to positions
+                        mapped_rows = position_map[rows_chunk]
+                        mapped_cols = position_map[cols_chunk]
+                        
+                        # Move back to device for similarity calculation
                         mapped_rows = mapped_rows.to(device)
                         mapped_cols = mapped_cols.to(device)
                         rows_chunk = rows_chunk.to(device)
                         cols_chunk = cols_chunk.to(device)
+                    else:
+                        # GPU version (keep everything on GPU)
+                        position_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
+                        position_map.scatter_(0, needed_indices, torch.arange(len(needed_indices), device=device))
+                        mapped_rows = position_map[rows_chunk]
+                        mapped_cols = position_map[cols_chunk]
                     
                     # Calculate similarity using the mini-embeddings
                     emb_rows = mini_embeddings[mapped_rows]
                     emb_cols = mini_embeddings[mapped_cols]
                     values_chunk = torch.sum(emb_rows * emb_cols, dim=1)
                     
-                    # Store the original rows, cols and values (not the mapped indices)
+                    # Store the original rows, cols and values
                     all_rows.append(rows_chunk)
                     all_cols.append(cols_chunk)
                     all_values.append(values_chunk)
                     
                     # Clear memory
-                    del mini_embeddings, needed_indices, index_map
+                    del mini_embeddings, needed_indices, position_map
                     del mapped_rows, mapped_cols, emb_rows, emb_cols
                     
-                    # Periodically run garbage collection and empty cache
+                    # Periodically run garbage collection 
                     if cleanup_every_n_chunks > 0 and chunk_idx % cleanup_every_n_chunks == 0:
                         import gc
                         gc.collect()
@@ -554,23 +530,35 @@ class GNN_learner(nn.Module):
                 needed_indices = torch.unique(torch.cat([rows_chunk, cols_chunk]))
                 needed_indices = needed_indices.to(device)
                 
-                # Create a mini-embedding matrix for only needed nodes
-                with torch.no_grad():  # Use no_grad for the index mapping
-                    mini_embeddings = embeddings[needed_indices]
-                    mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
-                    
-                    # Create a mapping from original indices to positions in mini_embeddings
-                    index_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
-                    for mini_idx, orig_idx in enumerate(needed_indices.cpu()):
-                        index_map[orig_idx] = mini_idx
-                    
-                    # Map the original row and col indices to positions in mini_embeddings
-                    mapped_rows = index_map[rows_chunk]
-                    mapped_cols = index_map[cols_chunk]
+                # Create a mini-embedding matrix for only needed nodes - VECTORIZED VERSION
+                mini_embeddings = embeddings[needed_indices]
+                mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
                 
-                # Move back to device for calculation
-                mapped_rows = mapped_rows.to(device)
-                mapped_cols = mapped_cols.to(device)
+                # Fast vectorized index mapping using scatter (much faster than the loop)
+                if offload_to_cpu:
+                    # Create a CPU mapping tensor
+                    needed_indices_cpu = needed_indices.cpu()
+                    position_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
+                    # Use scatter to build the mapping efficiently
+                    position_map.scatter_(0, needed_indices_cpu, torch.arange(len(needed_indices_cpu), device='cpu'))
+                    # Map the original row and col indices to positions in mini_embeddings
+                    mapped_rows = position_map[rows_chunk]
+                    mapped_cols = position_map[cols_chunk]
+                else:
+                    # Create a GPU mapping tensor (faster on GPU)
+                    position_map = torch.zeros(num_nodes, dtype=torch.long, device=device)
+                    # Use scatter to build the mapping efficiently
+                    position_map.scatter_(0, needed_indices, torch.arange(len(needed_indices), device=device))
+                    # Map the original row and col indices to positions in mini_embeddings
+                    mapped_rows = position_map[rows_chunk]
+                    mapped_cols = position_map[cols_chunk]
+                
+                # Move back to device for calculation if needed
+                if offload_to_cpu:
+                    mapped_rows = mapped_rows.to(device)
+                    mapped_cols = mapped_cols.to(device)
+                    rows_chunk = rows_chunk.to(device)
+                    cols_chunk = cols_chunk.to(device)
                 
                 # Calculate similarity using the mini-embeddings
                 emb_rows = mini_embeddings[mapped_rows]
@@ -578,57 +566,19 @@ class GNN_learner(nn.Module):
                 values_chunk = torch.sum(emb_rows * emb_cols, dim=1)
                 
                 # Store the original rows, cols and values (not the mapped indices)
-                all_rows.append(rows_chunk.to(device))
-                all_cols.append(cols_chunk.to(device))
+                all_rows.append(rows_chunk)
+                all_cols.append(cols_chunk)
                 all_values.append(values_chunk)
                 
                 # Clear memory
-                del mini_embeddings, needed_indices, index_map
+                del mini_embeddings, needed_indices, position_map
                 del mapped_rows, mapped_cols, emb_rows, emb_cols
                 
-            # Now process the reverse direction (symmetrize)
-            for i in range(0, base_num_edges, base_chunk_size):
-                # Get indices for this chunk
-                end_idx = min(i + base_chunk_size, base_num_edges)
-                # Reverse rows and cols for symmetrizing
-                rows_chunk = cols[i:end_idx].to('cpu')  # Note the swap: using cols as rows
-                cols_chunk = rows[i:end_idx].to('cpu')  # Note the swap: using rows as cols
-                
-                # Get only the embeddings we need and normalize only those
-                needed_indices = torch.unique(torch.cat([rows_chunk, cols_chunk]))
-                needed_indices = needed_indices.to(device)
-                
-                # Create a mini-embedding matrix for only needed nodes
-                with torch.no_grad():  # Use no_grad for the index mapping
-                    mini_embeddings = embeddings[needed_indices]
-                    mini_embeddings = F.normalize(mini_embeddings, dim=1, p=2)
-                    
-                    # Create a mapping from original indices to positions in mini_embeddings
-                    index_map = torch.zeros(num_nodes, dtype=torch.long, device='cpu')
-                    for mini_idx, orig_idx in enumerate(needed_indices.cpu()):
-                        index_map[orig_idx] = mini_idx
-                    
-                    # Map the original row and col indices to positions in mini_embeddings
-                    mapped_rows = index_map[rows_chunk]
-                    mapped_cols = index_map[cols_chunk]
-                
-                # Move back to device for calculation
-                mapped_rows = mapped_rows.to(device)
-                mapped_cols = mapped_cols.to(device)
-                
-                # Calculate similarity using the mini-embeddings
-                emb_rows = mini_embeddings[mapped_rows]
-                emb_cols = mini_embeddings[mapped_cols]
-                values_chunk = torch.sum(emb_rows * emb_cols, dim=1)
-                
-                # Store the original rows, cols and values (not the mapped indices)
-                all_rows.append(rows_chunk.to(device))
-                all_cols.append(cols_chunk.to(device))
-                all_values.append(values_chunk)
-                
-                # Clear memory
-                del mini_embeddings, needed_indices, index_map
-                del mapped_rows, mapped_cols, emb_rows, emb_cols
+                # Periodically run garbage collection and empty cache
+                if cleanup_every_n_chunks > 0 and chunk_idx % cleanup_every_n_chunks == 0:
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
             
             # Combine all processed chunks
             rows_sym = torch.cat(all_rows)
