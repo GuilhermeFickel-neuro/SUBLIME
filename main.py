@@ -3,7 +3,7 @@ import copy
 from datetime import datetime
 import math
 
-import tqdm # Changed import
+import tqdm as tqdm_module # Changed import with alias
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -52,7 +52,7 @@ class Experiment:
             reserved_mem = torch.cuda.memory_reserved(self.device)
             max_reserved_mem = torch.cuda.max_memory_reserved(self.device) # Peak since last reset
             # Use tqdm.write to avoid messing with the progress bar
-            tqdm.write(
+            tqdm_module.write(
                 f"[VRAM Log @ {label}] Allocated: {allocated_mem / (1024**2):.2f} MB "
                 f"(Peak Allocated: {max_allocated_mem / (1024**2):.2f} MB) | "
                 f"Reserved: {reserved_mem / (1024**2):.2f} MB "
@@ -778,7 +778,7 @@ class Experiment:
                     phase3_epochs = 0
 
             # Get tqdm iterator
-            epoch_iterator = tqdm.tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs) # Changed to tqdm.tqdm
+            epoch_iterator = tqdm_module.tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs) # Changed to tqdm_module.tqdm
             for epoch in epoch_iterator:
                 self._log_vram(f"Epoch {epoch} Start") # Log start of epoch
                 # Determine current training phase
@@ -907,7 +907,7 @@ class Experiment:
                                        # Maybe try setting it? Or log a warning.
                                        # Let's log a warning first, as forcing requires_grad might mask issues.
                                        if args.verbose:
-                                            tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.")
+                                            tqdm_module.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.") # Changed to tqdm_module.write
                                        # Optionally, try forcing it:
                                        # Adj.edata['w'].requires_grad_(True) # Use with caution
                                else:
@@ -1133,7 +1133,7 @@ class Experiment:
                                    # Maybe try setting it? Or log a warning.
                                    # Let's log a warning first, as forcing requires_grad might mask issues.
                                    if args.verbose:
-                                        tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.")
+                                        tqdm_module.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.") # Changed to tqdm_module.write
                                    # Optionally, try forcing it:
                                    # Adj.edata['w'].requires_grad_(True) # Use with caution
                            else:
@@ -1309,9 +1309,9 @@ class Experiment:
                         learner_grad_norm = learner_grad_norm ** 0.5
                         # Only print if verbose and gradient is calculated
                         if args.verbose and params_with_grad > 0 and epoch % 5 == 0: # Print every 5 epochs in phase 2
-                            tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: {learner_grad_norm:.6f}")
+                            tqdm_module.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: {learner_grad_norm:.6f}") # Changed to tqdm_module.write
                         elif args.verbose and params_with_grad == 0 and epoch % 5 == 0:
-                             tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: N/A (No Grads Found)")
+                             tqdm_module.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: N/A (No Grads Found)") # Changed to tqdm_module.write
 
 
                     # Gradient Clipping based on phase
@@ -1345,7 +1345,7 @@ class Experiment:
                 if is_graph_learner_phase: lr_model_str = "N/A (Phase 2)"
 
                 if args.verbose and epoch % 10 == 0:
-                    tqdm.write(f"Epoch {epoch} [Phase {1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}] - LR model: {lr_model_str}, LR learner: {lr_learner_str}")
+                    tqdm_module.write(f"Epoch {epoch} [Phase {1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}] - LR model: {lr_model_str}, LR learner: {lr_learner_str}") # Changed to tqdm_module.write
 
 
                 # Structure Bootstrapping - Should only happen when learner is active (Phase 2 & 3) and Adj exists
@@ -1469,7 +1469,7 @@ class Experiment:
                         avg_cls_acc = sum(cls_accuracies) / len(cls_accuracies)
                         if args.verbose:
                             # Use tqdm.write for this message
-                            tqdm.write(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}")
+                            tqdm_module.write(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}") # Changed to tqdm_module.write
                         cls_accuracies = []  # Reset for next period
 
                 # Evaluation (remains the same, happens based on epoch freq)
@@ -1503,7 +1503,7 @@ class Experiment:
                             best_epoch = epoch
                             if args.verbose:
                                 # Use tqdm.write for this message
-                                tqdm.write(f"** New Best Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **")
+                                tqdm_module.write(f"** New Best Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **") # Changed to tqdm_module.write
 
                     elif args.downstream_task == 'clustering' and labels is not None:
                         pass # Clustering evaluation logic can remain here if needed
