@@ -368,7 +368,7 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
         knn_std_dev_factor (float): Factor for 'std_dev_k' threshold (mean - factor * std_dev of k-th similarities).
 
     Returns:
-        tuple: (rows, cols, values) representing the filtered graph in COO format
+        tuple: (rows, cols) representing the filtered graph in COO format
                with RAW similarity scores (higher is better).
     """
     t_start_knn = time.time()
@@ -437,9 +437,9 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
     # --- Filtering and Thresholding ---
     # print("  [knn_fast] Filtering neighbors...") # Less verbose
     t_filter_start = time.time()
-    filtered_rows_list = []
-    filtered_cols_list = []
-    filtered_vals_list = []
+    # filtered_rows_list = [] # Removed
+    # filtered_cols_list = [] # Removed
+    # filtered_vals_list = [] # Removed
 
     similarity_threshold = -np.inf # Default: keep all valid neighbors
 
@@ -515,7 +515,7 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
     # Apply the mask
     final_rows_np = np.broadcast_to(row_indices_np, neighbor_inds.shape)[final_keep_mask]
     final_cols_np = neighbor_inds[final_keep_mask]
-    final_vals_np = neighbor_vals[final_keep_mask]
+    # final_vals_np = neighbor_vals[final_keep_mask] # Removed
 
     num_kept_edges = final_rows_np.shape[0]
     # --- End Vectorized Filtering ---
@@ -524,19 +524,19 @@ def knn_fast(X, k, b=None, use_gpu=True, nprobe=None, faiss_index=None, knn_thre
 
     # Convert lists to tensors
     if num_kept_edges > 0:
-        # rows = torch.tensor(filtered_rows_list, dtype=torch.long, device=device)
-        # cols = torch.tensor(filtered_cols_list, dtype=torch.long, device=device)
-        # values = torch.tensor(filtered_vals_list, dtype=torch.float32, device=device)
+        # rows = torch.tensor(filtered_rows_list, dtype=torch.long, device=device) # Removed list logic
+        # cols = torch.tensor(filtered_cols_list, dtype=torch.long, device=device) # Removed list logic
+        # values = torch.tensor(filtered_vals_list, dtype=torch.float32, device=device) # Removed list logic
         rows = torch.from_numpy(final_rows_np).to(device=device, dtype=torch.long)
         cols = torch.from_numpy(final_cols_np).to(device=device, dtype=torch.long)
-        values = torch.from_numpy(final_vals_np).to(device=device, dtype=torch.float32)
+        # values = torch.from_numpy(final_vals_np).to(device=device, dtype=torch.float32) # Removed value conversion
     else:
         rows = torch.tensor([], dtype=torch.long, device=device)
         cols = torch.tensor([], dtype=torch.long, device=device)
-        values = torch.tensor([], dtype=torch.float32, device=device)
+        # values = torch.tensor([], dtype=torch.float32, device=device) # Removed empty value tensor
 
     # print(f"[knn_fast] Finished. Total time: {time.time() - t_start_knn:.4f}s. Returning {rows.shape[0]} edges.") # Less verbose
-    return rows, cols, values # Return raw similarities
+    return rows, cols # Return only indices
 
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):

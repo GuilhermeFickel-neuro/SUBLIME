@@ -235,16 +235,29 @@ class MLP_learner(nn.Module):
         embeddings = self.internal_forward(features)
 
         if self.sparse:
-            rows, cols, values = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
-                                          knn_threshold_type=self.knn_threshold_type,
-                                          knn_std_dev_factor=self.knn_std_dev_factor)
+            # Normalize embeddings for cosine similarity calculation (maintains gradients)
+            embeddings_normalized = F.normalize(embeddings, dim=1, p=2)
 
+            # Get neighbor indices using the non-differentiable knn_fast
+            rows, cols = knn_fast(embeddings, self.k, 1000, faiss_index=faiss_index,
+                                  knn_threshold_type=self.knn_threshold_type,
+                                  knn_std_dev_factor=self.knn_std_dev_factor)
+
+            # Symmetrize indices
             rows_sym = torch.cat((rows, cols))
             cols_sym = torch.cat((cols, rows))
-            values_sym = torch.cat((values, values))
+            
+            # Select embeddings for the edges using the indices
+            emb_rows = embeddings_normalized[rows_sym]
+            emb_cols = embeddings_normalized[cols_sym]
 
+            # Calculate similarity values differentiably (dot product of normalized embeddings)
+            values_sym = torch.sum(emb_rows * emb_cols, dim=1)
+
+            # Apply non-linearity to the differentiable similarity values
             values_processed = apply_non_linearity(values_sym, self.non_linearity, self.i)
 
+            # Create DGL graph and assign differentiable edge weights
             adj = dgl.graph((rows_sym, cols_sym), num_nodes=features.shape[0], device=features.device)
             adj.edata['w'] = values_processed
             return adj
