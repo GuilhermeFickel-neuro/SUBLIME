@@ -120,17 +120,17 @@ class DataManager:
     def load_and_sample_data(self):
         """Loads initial dataframes and applies sampling."""
         print(f"Loading neurolake data from {self.config.neurolake_csv}")
-        self.neurolake_df = pd.read_csv(self.config.neurolake_csv, delimiter='	')
+        self.neurolake_df = pd.read_csv(self.config.neurolake_csv, delimiter='\t')
 
         if self.config.dataset_features_csv and self.config.target_column:
             print(f"Loading dataset features from {self.config.dataset_features_csv}")
-            self.dataset_df = pd.read_csv(self.config.dataset_features_csv, delimiter='	')
+            self.dataset_df = pd.read_csv(self.config.dataset_features_csv, delimiter='\t')
             if len(self.neurolake_df) != len(self.dataset_df):
                 raise ValueError(f"Neurolake ({len(self.neurolake_df)}) and dataset features ({len(self.dataset_df)}) must have the same number of rows!")
 
         if self.config.using_separate_test:
             print(f"Loading separate test data from {self.config.test_csv}")
-            test_df = pd.read_csv(self.config.test_csv, delimiter='	')
+            test_df = pd.read_csv(self.config.test_csv, delimiter='\t')
             neurolake_cols = self.neurolake_df.columns
             missing_neurolake = [col for col in neurolake_cols if col not in test_df.columns]
             if missing_neurolake: raise ValueError(f"Test CSV missing neurolake columns: {missing_neurolake}")
