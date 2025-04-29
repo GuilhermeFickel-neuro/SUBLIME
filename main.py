@@ -847,28 +847,28 @@ class Experiment:
                         elif is_graph_learner_phase:
                             # view 1: anchor graph (Frozen Model)
                             if args.maskfeat_rate_anchor:
-                                mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
-                                features_v1 = features * (1 - mask_v1)
+                               mask_v1, _ = get_feat_mask(features, args.maskfeat_rate_anchor)
+                               features_v1 = features * (1 - mask_v1)
                             else:
-                                features_v1 = copy.deepcopy(features)
-                            with torch.no_grad(): # Ensure model grads aren't calculated
-                                z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
+                               features_v1 = copy.deepcopy(features)
+                            with torch.no_grad(): # Model is frozen
+                               z1, _, _, _ = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
                             # view 2: learned graph (Train Learner, Frozen Model)
                             if args.maskfeat_rate_learner:
-                                mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
-                                features_v2 = features * (1 - mask_v2)
+                               mask_v2, _ = get_feat_mask(features, args.maskfeat_rate_learner)
+                               features_v2 = features * (1 - mask_v2)
                             else:
-                                features_v2 = copy.deepcopy(features)
+                               features_v2 = copy.deepcopy(features)
                             # Learn graph
                             learned_adj = graph_learner(features)
                             if not args.sparse:
-                                learned_adj = symmetrize(learned_adj)
-                                learned_adj = normalize(learned_adj, 'sym', args.sparse)
+                               learned_adj = symmetrize(learned_adj)
+                               learned_adj = normalize(learned_adj, 'sym', args.sparse)
                             Adj = learned_adj # Store for potential use later
-                            # Get learner outputs (Frozen Model)
-                            with torch.no_grad(): # Ensure model grads aren't calculated
-                                z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True)
+                            # Get learner outputs (Frozen Model, allow graph connection)
+                            # REMOVED torch.no_grad() here
+                            z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval()
 
                             # Calculate Contrastive Loss
                             if args.contrast_batch_size:
@@ -1062,9 +1062,9 @@ class Experiment:
                            learned_adj = symmetrize(learned_adj)
                            learned_adj = normalize(learned_adj, 'sym', args.sparse)
                         Adj = learned_adj # Store for potential use later
-                        # Get learner outputs (Frozen Model)
-                        with torch.no_grad(): # Model is frozen
-                           z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True)
+                        # Get learner outputs (Frozen Model, allow graph connection)
+                        # REMOVED torch.no_grad() here
+                        z2, _, _, _ = model(features_v2, learned_adj, 'learner', include_features=True) # Model params frozen via eval()
 
                         # Calculate Contrastive Loss
                         if args.contrast_batch_size:
@@ -1088,7 +1088,7 @@ class Experiment:
                             features_v1 = features * (1 - mask_v1)
                         else:
                             features_v1 = copy.deepcopy(features)
-                        z1, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True) # Need z1, emb1, cls_output1
+                        z1, emb1, _, cls_output1 = model(features_v1, anchor_adj, 'anchor', include_features=True)
 
                         # view 2: learned graph
                         if args.maskfeat_rate_learner:
@@ -1103,7 +1103,7 @@ class Experiment:
                            learned_adj = normalize(learned_adj, 'sym', args.sparse)
                         Adj = learned_adj # Store for potential use later
                         # Get learner outputs
-                        z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True) # Need z2, emb2, cls_output2
+                        z2, emb2, _, cls_output2 = model(features_v2, learned_adj, 'learner', include_features=True)
 
                         # Calculate Contrastive Loss
                         if args.contrast_batch_size:
