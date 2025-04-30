@@ -1508,7 +1508,6 @@ class Experiment:
 
                 # --- Validation & Evaluation Step ---
                 if epoch % args.eval_freq == 0:
-                    tqdm.tqdm.write(f"--- Debug: Entering Validation Step for Epoch {epoch} ---") # DEBUG PRINT ADDED
                     model.eval()
                     graph_learner.eval()
                     # Initialize metrics for this eval step
@@ -1548,15 +1547,13 @@ class Experiment:
                                     Adj_eval = Adj_eval.to(self.device).detach()
                                 # Get learner outputs using the detached evaluation graph
                                 _, emb2_val, _, cls_output2_val = model(features_val, Adj_eval, 'learner', include_features=True)
-                            # else: # <<< REMOVED this else block as it was printing a warning unnecessarily
-                            #     if args.verbose: tqdm.tqdm.write(f"Warning: Adj is None during validation/eval in Phase {2 if is_graph_learner_phase else 3}.")
-                            #     Adj_eval = None # Ensure it's None if something went wrong
+                        else:
+                                if args.verbose: tqdm.tqdm.write(f"Warning: Adj is None during validation/eval in Phase {2 if is_graph_learner_phase else 3}.")
+                                Adj_eval = None # Ensure it's None if something went wrong
 
 
                         # --- Perform Validation Calculations (Only in P1 & P3) ---
-                        tqdm.tqdm.write(f"--- Debug: Epoch {epoch} - Current Phase: {'P1' if is_embedding_phase else ('P2' if is_graph_learner_phase else 'P3')}") # DEBUG PRINT ADDED
                         if is_embedding_phase or is_joint_phase:
-                            tqdm.tqdm.write(f"--- Debug: Epoch {epoch} - Attempting validation calculations (In P1 or P3) ---") # DEBUG PRINT ADDED
                             validation_performed = False # Flag to print header once
                             if val_mask is not None and val_mask.any():
                                 # Ensure val_mask is on device
@@ -1686,20 +1683,15 @@ class Experiment:
 
                             else:
                                  if args.verbose and (is_embedding_phase or is_joint_phase): # Only print if validation was expected
-                                     tqdm.tqdm.write(f"--- Epoch {epoch} Validation --- \\n  Skipped validation calculations: val_mask is None or empty.")
-                        else: # Added else for clarity
-                            tqdm.tqdm.write(f"--- Debug: Epoch {epoch} - Skipping validation calculations (In P2) ---") # DEBUG PRINT ADDED
+                                     tqdm.tqdm.write(f"--- Epoch {epoch} Validation --- \\n  Skipped validation: val_mask is None or empty.")
 
                     # Log all collected validation metrics at once with the correct step
-                    tqdm.tqdm.write(f"--- Debug: Epoch {epoch} - val_log_dict before logging: {val_log_dict}, len={len(val_log_dict)}") # DEBUG PRINT ADDED
                     if len(val_log_dict) > 1: # Log only if metrics were added besides epoch
-                        tqdm.tqdm.write(f"--- Debug: Epoch {epoch} - Logging val_log_dict to wandb (len > 1) ---") # DEBUG PRINT ADDED
                         wandb.log(val_log_dict, step=epoch)
-                    else:
-                        tqdm.tqdm.write(f"--- Debug: Epoch {epoch} - Skipping wandb log for val_log_dict (len <= 1) ---") # DEBUG PRINT ADDED
 
                     # Reset model/learner back to train mode for the next epoch
                     if is_embedding_phase: model.train(); graph_learner.eval() # Keep learner frozen in P1
+                    elif is_graph_learner_phase: model.eval(); graph_learner.train() # Keep model frozen in P2
 
 
                 # --- End Validation & Evaluation Step ---
