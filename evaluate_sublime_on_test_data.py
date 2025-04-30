@@ -1098,7 +1098,7 @@ class Evaluator:
         self.model_configs = {
             'xgboost': {
                 'class': XGBClassifier, 'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'logloss'},
-                'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.6, 1.0], 'min_child_weight': ['int', 1, 10], 'gamma': ['float', 0, 5], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 1, 10]}
+                'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'min_child_weight': ['int', 1, 10], 'gamma': ['float', 0, 5], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             },
             'catboost': {
                 'class': CatBoostClassifier, 'base_params': {'random_seed': 42, 'verbose': False, 'eval_metric': 'AUC'},
@@ -1106,7 +1106,7 @@ class Evaluator:
             },
             'lightgbm': {
                 'class': LGBMClassifier, 'base_params': {'random_state': 42},
-                'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'num_leaves': ['int', 20, 100], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.6, 1.0], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 10]}
+                'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'num_leaves': ['int', 20, 100], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             }
         }
 
@@ -1125,14 +1125,17 @@ class Evaluator:
                     # Use optuna callback for pruning
                     pruning_callback = optuna.integration.LightGBMPruningCallback(trial, eval_metric)
                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
-                              eval_metric=eval_metric, callbacks=[pruning_callback], verbose=-1) # Suppress verbose
+                              eval_metric=eval_metric, callbacks=[pruning_callback], verbose=-1, # Suppress verbose
+                              early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, CatBoostClassifier):
-                    # Removed early_stopping_rounds=10 as per user request
-                    model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False)
+                    # Removed early_stopping_rounds=10 as per user request -> Re-adding it
+                    model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False,
+                              early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, XGBClassifier):
-                     # Removed early_stopping_rounds=10 as per user request
-                     # XGBoost needs explicit early stopping for pruning - Pruning might be less effective now.
-                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False)
+                     # Removed early_stopping_rounds=10 as per user request -> Re-adding it
+                     # XGBoost needs explicit early stopping for pruning - Pruning might be less effective now. -> Early stopping added now
+                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False,
+                               early_stopping_rounds=10) # Added early stopping
                 else:
                     model.fit(train_features, train_labels) # Generic fit
 
