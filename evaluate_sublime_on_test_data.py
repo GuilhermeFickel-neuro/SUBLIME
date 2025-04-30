@@ -1097,7 +1097,8 @@ class Evaluator:
         self.best_params = {} # {model_name: {feature_set: {param: val, ...}}}
         self.model_configs = {
             'xgboost': {
-                'class': XGBClassifier, 'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'logloss', 'early_stopping_rounds': 10},
+                'class': XGBClassifier, 
+                'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'logloss'},
                 'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'min_child_weight': ['int', 1, 10], 'gamma': ['float', 0, 5], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             },
             'catboost': {
@@ -1132,12 +1133,28 @@ class Evaluator:
                     model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False,
                               early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, XGBClassifier):
-                    # For XGBoost 3.0.0, try without early_stopping_rounds in the fit call
+                    # XGBoost 3.0.0 API: callbacks, eval_set, early_stopping_rounds moved to constructor
+                    # Create pruning callback
                     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
-                    model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False,
-                              callbacks=[pruning_callback])
-                    # Note: In XGBoost 3.0.0, early_stopping_rounds might need to be in constructor 
-                    # instead of fit() method
+                    
+                    # Need to recreate the model with the callback
+                    updated_params = params.copy()
+                    # Define eval set
+                    eval_dataset = [(train_features, train_labels), (val_features, val_labels)]
+                    
+                    # In XGBoost 3.0+, need to explicitly pass the callbacks list
+                    updated_model = XGBClassifier(
+                        **updated_params,
+                        callbacks=[pruning_callback],
+                        eval_set=eval_dataset,
+                        early_stopping_rounds=10
+                    )
+                    
+                    # Fit without the moved parameters
+                    updated_model.fit(train_features, train_labels, verbose=False)
+                    
+                    # Replace original model with updated one
+                    model = updated_model
                 else:
                     model.fit(train_features, train_labels) # Generic fit
 
