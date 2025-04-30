@@ -1137,13 +1137,13 @@ class Evaluator:
                     # Create pruning callback - Monitor the validation set (will be eval_0 as it's the only one in fit)
                     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
                     
-                    # Recreate the model with constructor parameters (callbacks, early_stopping_rounds)
+                    # Recreate the model with constructor parameters (callbacks, BUT NO early_stopping_rounds)
                     updated_params = params.copy()
                     updated_model = XGBClassifier(
                         **updated_params,
-                        callbacks=[pruning_callback],
+                        callbacks=[pruning_callback]
                         # eval_set=eval_dataset, # REMOVED from constructor
-                        early_stopping_rounds=10
+                        # early_stopping_rounds=10 # REMOVED internal early stopping
                     )
                     
                     # Fit with eval_set passed here
@@ -1167,6 +1167,7 @@ class Evaluator:
                  print(f"Warning: Trial failed with error: {e}")
                  import logging
                  logging.error(f"Trial failed with error: {e}", exc_info=True)
+                 exit(1)
                  # Return a very low value or handle differently?
                  # Returning 0 might bias Optuna away from potentially good regions if errors are transient
                  return 0.0 # Or perhaps np.nan? Let's use 0 for now.
