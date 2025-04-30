@@ -70,6 +70,7 @@ class Config:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.using_separate_test = self.test_csv is not None
         self.use_loaded_adj_for_extraction = args.use_loaded_adj_for_extraction
+        self.extract_embeddings_only = args.extract_embeddings_only # Added
 
         self.dataset_name = self._derive_dataset_name()
         self.test_dataset_name = self._derive_test_dataset_name()
@@ -1106,7 +1107,7 @@ class Evaluator:
                 'trial_params': {'iterations': ['int', 50, 500], 'depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'l2_leaf_reg': ['float', 1, 10], 'random_strength': ['float', 0, 10], 'bagging_temperature': ['float', 0, 10]}
             },
             'lightgbm': {
-                'class': LGBMClassifier, 'base_params': {'random_state': 42},
+                'class': LGBMClassifier, 'base_params': {'random_state': 42, 'verbosity': -1}, # Added verbosity=-1
                 'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'num_leaves': ['int', 20, 100], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             }
         }
@@ -1126,7 +1127,7 @@ class Evaluator:
                     # Use optuna callback for pruning
                     pruning_callback = optuna.integration.LightGBMPruningCallback(trial, eval_metric)
                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
-                              eval_metric=eval_metric, callbacks=[pruning_callback], verbose=-1, # Suppress verbose
+                              eval_metric=eval_metric, callbacks=[pruning_callback], # Removed verbose=-1
                               early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, CatBoostClassifier):
                     # Removed early_stopping_rounds=10 as per user request -> Re-adding it
@@ -1688,6 +1689,11 @@ def main(args):
             print("Embeddings saved. Evaluation skipped as dataset features/target not provided.")
             return # Exit after saving embeddings
 
+    # --- Added: Exit if only extracting embeddings ---
+    if config.extract_embeddings_only:
+        print("Embeddings extracted and potentially saved/cached. Skipping model training as requested (--extract-embeddings-only).")
+        return
+
     # --- Evaluation Setup ---
     if not (config.dataset_features_csv and config.target_column):
          print("Cannot proceed with evaluation: Dataset features CSV or target column missing.")
@@ -1762,6 +1768,7 @@ if __name__ == "__main__":
     parser.add_argument('--k-neighbors', type=int, nargs='+', default=[], help='List of neighbor counts (k) for KNN features. Values <= 0 are ignored.')
     parser.add_argument('--data-fraction', type=float, default=1.0, help='Fraction of the input training/validation datasets to use (0 to 1).')
     parser.add_argument('--use-loaded-adj-for-extraction', action='store_true', help='Use the loaded adjacency matrix for embedding extraction')
+    parser.add_argument('--extract-embeddings-only', action='store_true', help='Calculate and cache embeddings, then exit without training downstream models.') # Added
 
     args = parser.parse_args()
 
