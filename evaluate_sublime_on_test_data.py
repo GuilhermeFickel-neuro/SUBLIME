@@ -1151,6 +1151,8 @@ class Evaluator:
                  raise # Re-raise prune exceptions
             except Exception as e:
                  print(f"Warning: Trial failed with error: {e}")
+                 import logging
+                 logging.error(f"Trial failed with error: {e}", exc_info=True)
                  # Return a very low value or handle differently?
                  # Returning 0 might bias Optuna away from potentially good regions if errors are transient
                  return 0.0 # Or perhaps np.nan? Let's use 0 for now.
