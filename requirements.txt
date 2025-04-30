@@ -21,3 +21,4 @@ optuna
 boto3
 optuna-integration
 setuptools==59.5.0
+wandb

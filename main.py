@@ -2,6 +2,7 @@ import argparse
 import copy
 from datetime import datetime
 import math
+import wandb # Add wandb import
 
 from tqdm import tqdm # Keep import for now, might be used elsewhere
 import numpy as np
@@ -525,6 +526,13 @@ class Experiment:
 
         if load_data_fn is None:
             raise ValueError("Must provide a data loading function")
+            
+        # Initialize wandb
+        wandb.init(
+            project="SUBLIME_GCL", # Or your preferred project name
+            config=args,
+            # mode="offline" # Uncomment this line to run offline
+        )
             
         # Load data - Expected return: features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, initial_graph_data
         # Note: nclasses might be n_clusters from args in clustering mode
@@ -1460,6 +1468,25 @@ class Experiment:
                 epoch_iterator.set_postfix(postfix_dict)
                 # --- End tqdm postfix update ---
 
+                # Log metrics to wandb at the end of each epoch
+                log_dict = {'epoch': epoch}
+                # Flatten the postfix_dict for wandb logging
+                for key, value in postfix_dict.items():
+                    try:
+                        # Attempt to convert value to float for logging
+                        log_dict[f'train/{key}'] = float(value)
+                    except (ValueError, TypeError):
+                        # If conversion fails, log as string or skip
+                        log_dict[f'train/{key}_str'] = str(value) 
+                        # Or handle specific non-numeric keys like 'Phase' differently if needed
+                
+                # Add learning rates
+                if scheduler_cl: log_dict['train/lr_model'] = optimizer_cl.param_groups[0]['lr']
+                if scheduler_learner: log_dict['train/lr_learner'] = optimizer_learner.param_groups[0]['lr']
+                
+                wandb.log(log_dict)
+
+
                 # Periodic Checkpointing (remains the same, saves state at end of epoch)
                 if epoch > 0 and epoch % args.checkpoint_freq == 0:
                     current_checkpoint_path = self.save_checkpoint(
@@ -1550,6 +1577,8 @@ class Experiment:
                                                 )
                                                 if args.verbose:
                                                     tqdm.write(f"  Classification Val Loss: {val_cls_loss.item():.4f}, Acc: {val_cls_accu.item():.4f}")
+                                                # Log validation classification metrics
+                                                wandb.log({'epoch': epoch, 'val/cls_loss': val_cls_loss.item(), 'val/cls_accuracy': val_cls_accu.item()})
                                             elif args.verbose:
                                                  # Print header only if not already printed by potential subsequent ArcFace validation
                                                  if not (args.use_arcface and current_val_mask.sum().item() > 1):
@@ -1623,6 +1652,8 @@ class Experiment:
                                                         if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
                                                         strategy_msg = "all pairs" if compute_all_pairs else f"{num_pairs_calculated} sampled pairs"
                                                         tqdm.write(f"  ArcFace Val Cosine Dist ({strategy_msg}): 10%={q10:.4f}, 50%={q50:.4f}")
+                                                        # Log ArcFace validation distance quantiles
+                                                        wandb.log({'epoch': epoch, 'val/arcface_dist_q10': q10, 'val/arcface_dist_q50': q50})
                                                 else:
                                                      if args.verbose:
                                                           if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
@@ -1683,6 +1714,9 @@ class Experiment:
         if args.downstream_task == 'classification' and trial != 0:
             self.print_results(validation_accuracies, test_accuracies)
         self._log_vram("Train End") # Log at the very end
+        
+        # Finish the wandb run
+        wandb.finish()
 
     def print_results(self, validation_accu, test_accu):
         s_val = "Val accuracy: {:.4f} +/- {:.4f}".format(np.mean(validation_accu), np.std(validation_accu))
