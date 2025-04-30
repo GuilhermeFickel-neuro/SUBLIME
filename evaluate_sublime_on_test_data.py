@@ -68,6 +68,7 @@ class Config:
         self.data_fraction = args.data_fraction
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.using_separate_test = self.test_csv is not None
+        self.use_loaded_adj_for_extraction = args.use_loaded_adj_for_extraction
 
         self.dataset_name = self._derive_dataset_name()
         self.test_dataset_name = self._derive_test_dataset_name()
@@ -617,9 +618,12 @@ class SublimeHandler:
         cache_file_embeddings = None
         cache_file_classifications = None
         can_cache = self.config.cache_dir and dataset_tag
+        extraction_mode_tag = "_anchor" if self.config.use_loaded_adj_for_extraction else ""
 
         if can_cache:
-            cache_file_embeddings = os.path.join(self.config.cache_dir, f"sublime_embeddings_{self.config.model_name_tag}_{dataset_tag}.npy")
+            cache_file_base_embeddings = f"sublime_embeddings_{self.config.model_name_tag}_{dataset_tag}{extraction_mode_tag}.npy"
+            cache_file_embeddings = os.path.join(self.config.cache_dir, cache_file_base_embeddings)
+
             if os.path.exists(cache_file_embeddings):
                 print(f"Loading cached embeddings from {cache_file_embeddings}")
                 loaded_embeddings = np.load(cache_file_embeddings)
@@ -629,7 +633,8 @@ class SublimeHandler:
                 # Check for cached classification results
                 loaded_classification_probs = None
                 if self.has_classification_head:
-                     cache_file_classifications = os.path.join(self.config.cache_dir, f"sublime_classifications_{self.config.model_name_tag}_{dataset_tag}.npy")
+                     cache_file_base_classifications = f"sublime_classifications_{self.config.model_name_tag}_{dataset_tag}{extraction_mode_tag}.npy"
+                     cache_file_classifications = os.path.join(self.config.cache_dir, cache_file_base_classifications)
                      if os.path.exists(cache_file_classifications):
                           print(f"Loading cached classification results from {cache_file_classifications}")
                           class_results = np.load(cache_file_classifications)
@@ -668,48 +673,62 @@ class SublimeHandler:
                     point_tensor = batch_X_tensor[j].unsqueeze(0) # Process one point at a time
 
                     try:
-                        # --- Replicate Experiment.process_new_point logic --- 
+                        # --- Replicate Experiment.process_new_point logic ---
                         # 1. Find most similar point in loaded features (self.features)
+                        # This is needed regardless of the adj used, to know *which* embedding to extract.
                         normalized_features = F.normalize(self.features, p=2, dim=1)
                         normalized_point = F.normalize(point_tensor, p=2, dim=1)
                         similarities = torch.mm(normalized_point, normalized_features.t())
                         replace_idx = torch.argmax(similarities).item()
 
-                        # 2. Create modified features (temporarily replace the point)
-                        # Note: This modifies a *copy* in memory for each point, can be slow.
-                        modified_features = self.features.clone()
-                        modified_features[replace_idx] = point_tensor
+                        # --- Decide which features and adjacency to use ---
+                        if self.config.use_loaded_adj_for_extraction:
+                            # Mode 1: Use original features and loaded adjacency
+                            print("Using loaded adjacency matrix for extraction.") # Add print statement
+                            features_to_use = self.features
+                            adj_to_use = self.adj
+                            view_type = 'anchor' # Use 'anchor' view as we are not using the learner
+                            
+                        else:
+                            # Mode 2 (Original): Use modified features and learned adjacency
+                            # 2. Create modified features (temporarily replace the point)
+                            modified_features = self.features.clone()
+                            modified_features[replace_idx] = point_tensor
+                            
+                            # 3. Generate new adjacency using the graph learner
+                            new_adj = self.graph_learner(modified_features, faiss_index=self.faiss_index)
+                            if not self.sparse:
+                                if not isinstance(new_adj, torch.Tensor):
+                                    print(f"Warning: Dense graph learner output type is {type(new_adj)}, expected Tensor. Normalization might fail.")
+                                else:
+                                    new_adj = symmetrize(new_adj)
+                                    new_adj = normalize(new_adj, 'sym', self.sparse)
+                            # else: Sparse DGL graph handled by GCL forward
 
-                        # 3. Generate new adjacency using the graph learner
-                        # Ensure graph learner is in eval mode (should be set after loading)
-                        new_adj = self.graph_learner(modified_features, faiss_index=self.faiss_index)
-                        if not self.sparse:
-                            # Handle potential non-tensor output from learner if dense
-                            if not isinstance(new_adj, torch.Tensor):
-                                # This case might need specific handling based on learner output type
-                                print(f"Warning: Dense graph learner output type is {type(new_adj)}, expected Tensor. Normalization might fail.")
-                            else:
-                                new_adj = symmetrize(new_adj)
-                                new_adj = normalize(new_adj, 'sym', self.sparse)
-                        # else: Sparse DGL graph usually handled by GCL forward
+                            features_to_use = modified_features
+                            adj_to_use = new_adj
+                            view_type = 'learner' # Use 'learner' view
 
-                        # 4. Run the model forward pass
-                        # Ensure model is in eval mode (should be set after loading)
+                        # 4. Run the model forward pass with the selected features and adjacency
                         if self.has_classification_head:
                             _, embedding, _, classification_output = self.model(
-                                modified_features, new_adj, 'learner', include_features=True
+                                features_to_use, adj_to_use, view_type=view_type, include_features=True
                             )
                             if classification_output is not None:
+                                # Classification output corresponds to nodes in features_to_use.
+                                # We extract the one corresponding to the most similar original node.
                                 classification_prob_tensor = torch.sigmoid(classification_output[replace_idx])
                                 classification_prob = classification_prob_tensor.item()
                             else:
                                 classification_prob = None
                         else:
-                            _, embedding = self.model(modified_features, new_adj, 'learner')
+                            _, embedding = self.model(features_to_use, adj_to_use, view_type=view_type)
                             classification_prob = None
-                        # --- End Replicated Logic ---
+                        # --- End Modified Logic ---
 
                         # Extract the embedding for the *replaced* index
+                        # Embedding tensor corresponds to nodes in features_to_use.
+                        # We extract the one corresponding to the most similar original node.
                         embedding_tensor = embedding[replace_idx].detach()
 
                         # Check type before calling .cpu() or .numpy()
@@ -751,15 +770,18 @@ class SublimeHandler:
         print(f"Normalization complete. Final embeddings shape: {embeddings_array.shape}")
 
         # --- Save to Cache ---
-        if can_cache and cache_file_embeddings:
-            print(f"Saving embeddings to cache: {cache_file_embeddings}")
-            np.save(cache_file_embeddings, embeddings_array)
+        if can_cache:
+            # Use the correctly tagged filenames defined earlier
+            if cache_file_embeddings:
+                print(f"Saving embeddings to cache: {cache_file_embeddings}")
+                np.save(cache_file_embeddings, embeddings_array)
             if self.has_classification_head and classification_probs_array is not None:
-                 cache_file_classifications = os.path.join(self.config.cache_dir, f"sublime_classifications_{self.config.model_name_tag}_{dataset_tag}.npy")
-                 # Save probabilities and maybe predictions if needed (currently just probs)
-                 # For simplicity, just saving probabilities for now
-                 np.save(cache_file_classifications, classification_probs_array.reshape(-1, 1)) # Save as Nx1 array
-                 print(f"Saving classification probabilities to cache: {cache_file_classifications}")
+                # Use the correctly tagged classification filename defined earlier
+                if cache_file_classifications:
+                    # Save probabilities and maybe predictions if needed (currently just probs)
+                    # For simplicity, just saving probabilities for now
+                    np.save(cache_file_classifications, classification_probs_array.reshape(-1, 1)) # Save as Nx1 array
+                    print(f"Saving classification probabilities to cache: {cache_file_classifications}")
 
         return {'embeddings': embeddings_array, 'classification_probs': classification_probs_array}
 
@@ -1683,6 +1705,7 @@ if __name__ == "__main__":
     parser.add_argument('--embeddings-output', type=str, help='Path to save the extracted SUBLIME embeddings CSV. If specified without evaluation args, only embeddings are saved.')
     parser.add_argument('--k-neighbors', type=int, nargs='+', default=[5, 10, 20], help='List of neighbor counts (k) for KNN features. Values <= 0 are ignored.')
     parser.add_argument('--data-fraction', type=float, default=1.0, help='Fraction of the input training/validation datasets to use (0 to 1).')
+    parser.add_argument('--use-loaded-adj-for-extraction', action='store_true', help='Use the loaded adjacency matrix for embedding extraction')
 
     args = parser.parse_args()
 
