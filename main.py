@@ -529,7 +529,7 @@ class Experiment:
             
         # Initialize wandb
         wandb.init(
-            project="SUBLIME_GCL", # Or your preferred project name
+            project="NeurolakeGraph",
             config=args,
             # mode="offline" # Uncomment this line to run offline
         )
