@@ -1097,7 +1097,7 @@ class Evaluator:
         self.best_params = {} # {model_name: {feature_set: {param: val, ...}}}
         self.model_configs = {
             'xgboost': {
-                'class': XGBClassifier, 'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'logloss'},
+                'class': XGBClassifier, 'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'logloss', 'early_stopping_rounds': 10},
                 'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'min_child_weight': ['int', 1, 10], 'gamma': ['float', 0, 5], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             },
             'catboost': {
@@ -1132,11 +1132,12 @@ class Evaluator:
                     model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False,
                               early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, XGBClassifier):
-                     # Reverting to standard Optuna integration for XGBoost >= 1.6.0
-                     # Using both the callback and early_stopping_rounds argument.
-                     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
-                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False,
-                               early_stopping_rounds=10, callbacks=[pruning_callback])
+                    # For XGBoost 3.0.0, try without early_stopping_rounds in the fit call
+                    pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
+                    model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False,
+                              callbacks=[pruning_callback])
+                    # Note: In XGBoost 3.0.0, early_stopping_rounds might need to be in constructor 
+                    # instead of fit() method
                 else:
                     model.fit(train_features, train_labels) # Generic fit
 
