@@ -413,25 +413,29 @@ def load_person_data(args):
         if features_for_knn.shape[1] == 0:
             raise ValueError("Cannot compute KNN graph with zero features.")
 
-        # Use knn_fast which returns rows, cols, values tensors
         # Convert numpy features to tensor first
         features_knn_tensor = torch.tensor(features_for_knn, dtype=torch.float32).to(device)
+        # Request values from knn_fast
         knn_rows, knn_cols, knn_vals = knn_fast(
             features_knn_tensor,
             k=args.k,
             use_gpu=(device.type == 'cuda'),
             knn_threshold_type=args.knn_threshold_type,
-            knn_std_dev_factor=args.knn_std_dev_factor
+            knn_std_dev_factor=args.knn_std_dev_factor,
+            return_values=True # <-- Request values
         )
         # Create sparse scipy matrix from the COO tensors (move to CPU)
         n = features_knn_tensor.shape[0]
+        # Use knn_vals for the data
         adj_knn_sparse = sp.csr_matrix((knn_vals.cpu().numpy(), (knn_rows.cpu().numpy(), knn_cols.cpu().numpy())),
                                       shape=(n, n))
-        # Make knn graph binary (0/1) as base for combination
-        adj_knn_sparse = adj_knn_sparse.astype(bool).astype(np.float32)
-        # Symmetrize the KNN graph (A = A + A.T)
-        adj_knn_sparse = adj_knn_sparse + adj_knn_sparse.T
-        adj_knn_sparse = adj_knn_sparse.astype(bool).astype(np.float32)
+        # --- Remove binary conversion --- 
+        # adj_knn_sparse = adj_knn_sparse.astype(bool).astype(np.float32)
+        
+        # Symmetrize using maximum to preserve weights
+        adj_knn_sparse = adj_knn_sparse.maximum(adj_knn_sparse.T)
+        # --- Remove binary conversion after symmetrization --- 
+        # adj_knn_sparse = adj_knn_sparse.astype(bool).astype(np.float32)
 
         print(f"  KNN graph computed using knn_fast. Shape: {adj_knn_sparse.shape}, Non-zero entries: {adj_knn_sparse.nnz}")
     except Exception as e:
@@ -505,20 +509,18 @@ def load_person_data(args):
     print("Combining KNN and Relationship graphs...")
     if adj_rel_sparse is not None and adj_rel_sparse.nnz > 0:
         # Combine using maximum: Edges in either graph are kept.
-        # Relationship edges (value 1.0) take precedence over KNN edges (value 1.0).
+        # Relationship edges (value args.relationship_weight) or KNN similarities are kept based on max value.
         initial_graph_sparse = adj_knn_sparse.maximum(adj_rel_sparse)
-        # Ensure it's float32 after maximum operation
-        initial_graph_sparse = initial_graph_sparse.astype(np.float32)
         print(f"  Combined graph non-zero entries: {initial_graph_sparse.nnz} (using maximum)")
     else:
         print("  Using only KNN graph as initial graph (no valid relationships found/created).")
         initial_graph_sparse = adj_knn_sparse # Use only KNN graph
 
-    # Add self-loops (Important for GCNs, do this *after* combining)
-    print("Adding self-loops...")
-    initial_graph_sparse = initial_graph_sparse + sp.eye(initial_graph_sparse.shape[0], dtype=np.float32, format='csr')
-    # Ensure values are clipped to 1 after adding self-loops (making it unweighted)
-    initial_graph_sparse = initial_graph_sparse.astype(bool).astype(np.float32)
+    # Add self-loops with weight 1.0 using maximum
+    print("Adding self-loops (weight 1.0)...")
+    initial_graph_sparse = initial_graph_sparse.maximum(sp.eye(initial_graph_sparse.shape[0], dtype=np.float32, format='csr'))
+    # --- Remove final binary conversion --- 
+    # initial_graph_sparse = initial_graph_sparse.astype(bool).astype(np.float32)
     print(f"  Combined graph + self-loops non-zero entries: {initial_graph_sparse.nnz}")
 
     # --- 8d. Convert Final Sparse Graph to Tensor ---
