@@ -1706,7 +1706,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for SUBLIME feature extraction')
     parser.add_argument('--cache-dir', type=str, default='cache', help='Directory to cache SUBLIME embeddings and classifications')
     parser.add_argument('--embeddings-output', type=str, help='Path to save the extracted SUBLIME embeddings CSV. If specified without evaluation args, only embeddings are saved.')
-    parser.add_argument('--k-neighbors', type=int, nargs='+', default=[5, 10, 20], help='List of neighbor counts (k) for KNN features. Values <= 0 are ignored.')
+    parser.add_argument('--k-neighbors', type=int, nargs='+', default=[], help='List of neighbor counts (k) for KNN features. Values <= 0 are ignored.')
     parser.add_argument('--data-fraction', type=float, default=1.0, help='Fraction of the input training/validation datasets to use (0 to 1).')
     parser.add_argument('--use-loaded-adj-for-extraction', action='store_true', help='Use the loaded adjacency matrix for embedding extraction')
 
