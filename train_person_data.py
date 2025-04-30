@@ -546,15 +546,13 @@ def load_person_data(args):
               initial_graph = torch.eye(n_total_samples, dtype=torch.float32, device=device)
          print(f"Using identity matrix ({ 'sparse' if args.sparse else 'dense'}) on {device}.")
 
-    # <<< DELETE START
     del adj_knn_sparse # No longer needed after combination
     if adj_rel_sparse is not None:
         del adj_rel_sparse # No longer needed after combination
     del initial_graph_sparse # No longer needed after conversion to tensor
     gc.collect()
     print(f"Intermediate sparse matrices deleted. Memory: {get_memory_usage():.2f} GB")
-    # <<< DELETE END
-
+    
     print(f"Prepared combined dataset. Features shape: {features.shape}. Initial graph type: {'Sparse' if args.sparse else 'Dense'}. Labels shape: {combined_labels.shape}.")
 
     # Return combined data

@@ -1482,7 +1482,6 @@ class Experiment:
                     # Initialize metrics for this eval step
                     val_cls_accu = torch.tensor(0.0, device=self.device)
                     val_cls_loss = torch.tensor(0.0, device=self.device)
-                    val_silhouette = None
                     Adj_eval = None # The graph used for evaluation/validation
 
                     with torch.no_grad():
@@ -1646,43 +1645,6 @@ class Experiment:
                                  if args.verbose and (is_embedding_phase or is_joint_phase): # Only print if validation was expected
                                      tqdm.write(f"--- Epoch {epoch} Validation --- \n  Skipped validation: val_mask is None or empty.")
 
-
-                    # --- Downstream Task Evaluation (Original logic, runs in P2 & P3 using Adj_eval) ---
-                    if Adj_eval is not None: # This condition implicitly means Phase 2 or 3
-                        if args.downstream_task == 'classification':
-                            # f_adj is the potentially detached Adj_eval graph computed earlier
-                            f_adj = Adj_eval
-
-                            # Ensure masks are on the correct device
-                            current_train_mask_dev = train_mask.to(self.device) if train_mask is not None else None
-                            current_val_mask_dev = val_mask.to(self.device) if val_mask is not None else None
-                            current_test_mask_dev = test_mask.to(self.device) if test_mask is not None else None
-                            labels_dev = labels.to(self.device) if labels is not None else None
-
-
-                            # Check if masks and labels exist before evaluation
-                            if current_train_mask_dev is None or current_val_mask_dev is None or current_test_mask_dev is None or labels_dev is None:
-                                 if args.verbose: tqdm.write(f"Epoch {epoch}: Skipping downstream evaluation - Missing train/val/test mask or labels.")
-                            else:
-                                # Perform downstream evaluation
-                                self._log_vram(f"Epoch {epoch}: Before Downstream Evaluation")
-                                downstream_val_accu, downstream_test_accu, _ = self.evaluate_adj_by_cls(
-                                    f_adj, features, nfeats, labels_dev, # Pass labels on device
-                                    nclasses, # nclasses was set based on task (e.g., 2 for binary)
-                                    current_train_mask_dev, current_val_mask_dev, current_test_mask_dev, args
-                                )
-                                self._log_vram(f"Epoch {epoch}: After Downstream Evaluation")
-
-                                # Update best downstream validation score
-                                if downstream_val_accu > best_val:
-                                    best_val = downstream_val_accu.item() if isinstance(downstream_val_accu, torch.Tensor) else downstream_val_accu
-                                    best_val_test = downstream_test_accu
-                            best_epoch = epoch
-                            if args.verbose:
-                                        tqdm.write(f"** New Best Downstream Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **")
-
-                    elif args.downstream_task == 'clustering' and labels is not None:
-                             pass # Original clustering evaluation logic (if any)
 
                     # Reset model/learner back to train mode for the next epoch
                     if is_embedding_phase: model.train(); graph_learner.eval() # Keep learner frozen in P1
