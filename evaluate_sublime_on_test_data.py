@@ -685,10 +685,8 @@ class SublimeHandler:
                         # --- Decide which features and adjacency to use ---
                         if self.config.use_loaded_adj_for_extraction:
                             # Mode 1: Use original features and loaded adjacency
-                            print("Using loaded adjacency matrix for extraction.") # Add print statement
                             features_to_use = self.features
                             adj_to_use = self.adj
-                            view_type = 'anchor' # Use 'anchor' view as we are not using the learner
                             
                         else:
                             # Mode 2 (Original): Use modified features and learned adjacency
