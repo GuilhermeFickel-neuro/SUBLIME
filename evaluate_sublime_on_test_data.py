@@ -1156,15 +1156,22 @@ class Evaluator:
                     # --- Manual Pruning Logic ---
                     # Access evaluation results
                     results = model.evals_result()
-                    # The key should be 'eval_0' since eval_set has one entry
-                    validation_scores = results['eval_0'][eval_metric_name]
+                    # Check if results are available before accessing
+                    if 'eval_0' in results and eval_metric_name in results['eval_0']:
+                        validation_scores = results['eval_0'][eval_metric_name]
 
-                    # Report intermediate scores to Optuna for pruning
-                    for step, score in enumerate(validation_scores):
-                        trial.report(score, step)
-                        # Check if pruning is suggested
-                        if trial.should_prune():
-                            raise optuna.TrialPruned()
+                        # Report intermediate scores to Optuna for pruning
+                        for step, score in enumerate(validation_scores):
+                            trial.report(score, step)
+                            # Check if pruning is suggested
+                            if trial.should_prune():
+                                raise optuna.TrialPruned()
+                    else:
+                        # Handle case where results are missing (e.g., finished in 1 iteration)
+                        print(f"Warning: Trial {trial.number} - No validation scores found in evals_result for pruning. Results: {results}")
+                        # Optionally, report a single score if available or just skip reporting
+                        # Here, we'll proceed to calculate final AUC without intermediate reporting/pruning
+                        pass
                     # --- End Manual Pruning Logic ---
 
                     # If loop completes without pruning, calculate final AUC for objective
@@ -1191,19 +1198,14 @@ class Evaluator:
             except KeyError as e:
                  # Handle potential issues accessing evals_result for XGBoost
                  if isinstance(model, XGBClassifier):
-                     print(f"KeyError accessing XGBoost evals_result: {e}. Results dict: {getattr(model, 'evals_result_', 'N/A')()}")
+                     # Corrected print statement: remove trailing ()
+                     print(f"KeyError accessing XGBoost evals_result: {e}. Results dict: {getattr(model, 'evals_result_', 'N/A')}")
                      return 0.0 # Return low score
                  else:
                      # Reraise if not XGBoost related
                      raise
             except Exception as e:
                  print(f"Warning: Trial failed with error: {e}")
-                 import logging
-                 logging.error(f"Trial failed with error: {e}", exc_info=True)
-                 exit(1)
-                 # Return a very low value or handle differently?
-                 # Returning 0 might bias Optuna away from potentially good regions if errors are transient
-                 return 0.0 # Or perhaps np.nan? Let's use 0 for now.
 
         return objective
 
