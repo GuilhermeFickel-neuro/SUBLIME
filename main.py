@@ -52,12 +52,12 @@ class Experiment:
             reserved_mem = torch.cuda.memory_reserved(self.device)
             max_reserved_mem = torch.cuda.max_memory_reserved(self.device) # Peak since last reset
             # Use standard print instead of tqdm.write
-            print(
-                f"[VRAM Log @ {label}] Allocated: {allocated_mem / (1024**2):.2f} MB "
-                f"(Peak Allocated: {max_allocated_mem / (1024**2):.2f} MB) | "
-                f"Reserved: {reserved_mem / (1024**2):.2f} MB "
-                f"(Peak Reserved: {max_reserved_mem / (1024**2):.2f} MB)"
-            )
+            # print(
+            #     f"[VRAM Log @ {label}] Allocated: {allocated_mem / (1024**2):.2f} MB "
+            #     f"(Peak Allocated: {max_allocated_mem / (1024**2):.2f} MB) | "
+            #     f"Reserved: {reserved_mem / (1024**2):.2f} MB "
+            #     f"(Peak Reserved: {max_reserved_mem / (1024**2):.2f} MB)"
+            # )
             # Optionally reset peak stats *after* logging if you want peaks *between* logs
             # torch.cuda.reset_peak_memory_stats(self.device)
 
@@ -1475,41 +1475,222 @@ class Experiment:
                             print(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}")
                         cls_accuracies = []  # Reset for next period
 
-                # Evaluation (remains the same, happens based on epoch freq)
-                # Note: Evaluation uses the 'Adj' computed in the epoch, which is None in Phase 1.
-                # The evaluate_adj_by_cls function might need handling if Adj is None. Let's check it.
-                # Ok, evaluate_adj_by_cls takes Adj. It will likely fail if Adj is None.
-                # We should only evaluate if Adj is available (i.e., in Phase 2 or 3).
-                if Adj is not None and epoch % args.eval_freq == 0:
-                    if args.downstream_task == 'classification':
-                        model.eval() # Set both to eval for consistency during evaluation
-                        graph_learner.eval()
-                        self._log_vram(f"Epoch {epoch}: Before Evaluation")
-                        f_adj = Adj # Use the learned Adj from this epoch for evaluation
+                # --- Validation & Evaluation Step ---
+                if epoch % args.eval_freq == 0:
+                    model.eval()
+                    graph_learner.eval()
+                    # Initialize metrics for this eval step
+                    val_cls_accu = torch.tensor(0.0, device=self.device)
+                    val_cls_loss = torch.tensor(0.0, device=self.device)
+                    val_silhouette = None
+                    Adj_eval = None # The graph used for evaluation/validation
 
-                        if args.sparse:
-                            # Ensure weights are detached for evaluation
-                            f_adj.edata['w'] = f_adj.edata['w'].detach()
+                    with torch.no_grad():
+                        # --- Get necessary outputs for validation/evaluation ---
+                        features_val = features # Use original features for simplicity
+
+                        # Get Anchor outputs (needed for P1 validation/P2&P3 downstream eval)
+                        # Ensure anchor_adj is on the correct device
+                        if isinstance(anchor_adj, dgl.DGLGraph): anchor_adj = anchor_adj.to(self.device)
+                        elif isinstance(anchor_adj, torch.Tensor): anchor_adj = anchor_adj.to(self.device)
+                        
+                        z1_val, emb1_val, _, cls_output1_val = model(features_val, anchor_adj, 'anchor', include_features=True)
+
+                        # Get Learner outputs if needed (P3 validation / P2&P3 downstream eval)
+                        emb2_val, cls_output2_val = None, None
+                        if not is_embedding_phase: # If in P2 or P3, use the learned graph 'Adj' from the training step
+                            Adj_eval = Adj # Use the Adj computed during training step for this epoch
+                            if Adj_eval is not None:
+                                # Ensure Adj_eval is on correct device and detached
+                                if isinstance(Adj_eval, dgl.DGLGraph):
+                                    Adj_eval = Adj_eval.to(self.device)
+                                    # Detach weights specifically if they exist
+                                    if 'w' in Adj_eval.edata:
+                                        Adj_eval_detached = dgl.graph(Adj_eval.edges(), num_nodes=Adj_eval.num_nodes(), device=self.device)
+                                        Adj_eval_detached.edata['w'] = Adj_eval.edata['w'].detach()
+                                        Adj_eval = Adj_eval_detached
+                                    else: # If no weights, just ensure graph is on device
+                                        Adj_eval = dgl.graph(Adj_eval.edges(), num_nodes=Adj_eval.num_nodes(), device=self.device)
+
+                                elif isinstance(Adj_eval, torch.Tensor):
+                                    Adj_eval = Adj_eval.to(self.device).detach()
+                                # Get learner outputs using the detached evaluation graph
+                                _, emb2_val, _, cls_output2_val = model(features_val, Adj_eval, 'learner', include_features=True)
                         else:
-                            f_adj = f_adj.detach()
+                                if args.verbose: tqdm.write(f"Warning: Adj is None during validation/eval in Phase {2 if is_graph_learner_phase else 3}.")
+                                Adj_eval = None # Ensure it's None if something went wrong
 
-                        # Pass labels (combined) and nclasses (determined earlier)
-                        val_accu, test_accu, _ = self.evaluate_adj_by_cls(f_adj, features, nfeats, labels,
-                                                                               nclasses, train_mask, val_mask, test_mask, args)
-                        # Note: evaluation uses the combined labels and nclasses=2 if annotation was provided.
-                        # This evaluates the quality of the learned graph (Adj) for the downstream task.
-                        self._log_vram(f"Epoch {epoch}: After Evaluation")
 
-                        if val_accu > best_val:
-                            best_val = val_accu.item() if isinstance(val_accu, torch.Tensor) else val_accu # Ensure float
-                            best_val_test = test_accu
+                        # --- Perform Validation Calculations (Only in P1 & P3) ---
+                        if is_embedding_phase or is_joint_phase:
+                            validation_performed = False # Flag to print header once
+                            if val_mask is not None and val_mask.any():
+                                # Ensure val_mask is on device
+                                current_val_mask = val_mask.to(self.device)
+
+                                # CLASSIFICATION VALIDATION
+                                if use_classification_head:
+                                    cls_output_val = cls_output1_val if is_embedding_phase else cls_output2_val
+                                    if cls_output_val is not None:
+                                        masked_val_logits = cls_output_val[current_val_mask]
+                                        # Ensure labels are on device before indexing
+                                        labels_dev = labels.to(self.device) if labels is not None else None
+                                        if labels_dev is not None:
+                                            masked_val_labels = labels_dev[current_val_mask]
+
+                                            # Further mask for valid binary labels within the val set
+                                            val_cls_eval_mask = (masked_val_labels != -1)
+                                            if val_cls_eval_mask.any():
+                                                if args.verbose and not validation_performed:
+                                                    tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---")
+                                                    validation_performed = True
+                                                
+                                                val_cls_loss, val_cls_accu = self.loss_binary_cls(
+                                                    masked_val_logits[val_cls_eval_mask],
+                                                    masked_val_labels[val_cls_eval_mask]
+                                                )
+                                                if args.verbose:
+                                                    tqdm.write(f"  Classification Val Loss: {val_cls_loss.item():.4f}, Acc: {val_cls_accu.item():.4f}")
+                                            elif args.verbose:
+                                                 # Print header only if not already printed by potential subsequent ArcFace validation
+                                                 if not (args.use_arcface and current_val_mask.sum().item() > 1):
+                                                      tqdm.write(f"--- Epoch {epoch} Validation ---")
+                                                 tqdm.write(f"  Classification Validation: No valid binary labels found in validation set.")
+
+                                        else:
+                                            if args.verbose: tqdm.write(f"--- Epoch {epoch} Validation --- \n  Classification Validation: Labels tensor is None.")
+                                    else:
+                                        if args.verbose: tqdm.write(f"--- Epoch {epoch} Validation --- \n  Classification Validation: Output is None.")
+
+                                # --- ARCFACE VALIDATION (Pairwise Distance Quantiles) ---
+                                if args.use_arcface:
+                                    embedding_val = emb1_val if is_embedding_phase else emb2_val
+                                    if embedding_val is not None:
+                                        # Ensure val_mask and embedding_val are on the same device
+                                        current_val_mask = current_val_mask.to(embedding_val.device)
+                                        masked_val_embeddings = embedding_val[current_val_mask]
+                                        num_val_samples = masked_val_embeddings.shape[0]
+
+                                        if num_val_samples >= 2:
+                                            try:
+                                                # Normalize embeddings for cosine similarity calculation
+                                                norm_embeddings = F.normalize(masked_val_embeddings, p=2, dim=1)
+                                                
+                                                # Decide on sampling strategy
+                                                num_pairs_to_sample = 1000
+                                                compute_all_pairs = num_val_samples < 50 
+                                                
+                                                if compute_all_pairs:
+                                                    # Calculate all pairwise cosine similarities, then distances
+                                                    # (Efficiently using matrix multiplication)
+                                                    similarity_matrix = torch.mm(norm_embeddings, norm_embeddings.t())
+                                                    # Get upper triangle indices (excluding diagonal) to avoid duplicates and self-comparison
+                                                    indices = torch.triu_indices(num_val_samples, num_val_samples, offset=1, device=similarity_matrix.device)
+                                                    pairwise_similarities = similarity_matrix[indices[0], indices[1]]
+                                                    # Handle potential numerical precision issues slightly outside [-1, 1]
+                                                    pairwise_similarities = torch.clamp(pairwise_similarities, -1.0, 1.0)
+                                                    pairwise_distances = 1.0 - pairwise_similarities 
+                                                    num_pairs_calculated = len(pairwise_distances)
+                                                else:
+                                                    # Sample pairs of indices
+                                                    idx1 = torch.randint(0, num_val_samples, (num_pairs_to_sample,), device=norm_embeddings.device)
+                                                    idx2 = torch.randint(0, num_val_samples, (num_pairs_to_sample,), device=norm_embeddings.device)
+                                                    # Ensure idx1 != idx2 for sampled pairs
+                                                    valid_pair_mask = (idx1 != idx2)
+                                                    idx1 = idx1[valid_pair_mask]
+                                                    idx2 = idx2[valid_pair_mask]
+                                                    num_pairs_calculated = len(idx1)
+
+                                                    if num_pairs_calculated > 0:
+                                                        # Calculate cosine similarity only for sampled pairs
+                                                        emb_pairs1 = norm_embeddings[idx1]
+                                                        emb_pairs2 = norm_embeddings[idx2]
+                                                        # Element-wise dot product for cosine similarity
+                                                        pairwise_similarities = torch.sum(emb_pairs1 * emb_pairs2, dim=1)
+                                                        # Handle potential numerical precision issues slightly outside [-1, 1]
+                                                        pairwise_similarities = torch.clamp(pairwise_similarities, -1.0, 1.0)
+                                                        pairwise_distances = 1.0 - pairwise_similarities
+                                                    else: # Handle unlikely case of no valid pairs sampled
+                                                        pairwise_distances = torch.tensor([], device=norm_embeddings.device)
+                                                
+                                                # Calculate quantiles if we have distances
+                                                if len(pairwise_distances) > 0:
+                                                    quantiles = torch.tensor([0.1, 0.5], device=pairwise_distances.device)
+                                                    distance_quantiles = torch.quantile(pairwise_distances, quantiles)
+                                                    q10 = distance_quantiles[0].item()
+                                                    q50 = distance_quantiles[1].item() # Median
+                                                    
+                                                    if args.verbose:
+                                                        if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                        strategy_msg = "all pairs" if compute_all_pairs else f"{num_pairs_calculated} sampled pairs"
+                                                        tqdm.write(f"  ArcFace Val Cosine Dist ({strategy_msg}): 10%={q10:.4f}, 50%={q50:.4f}")
+                                                else:
+                                                     if args.verbose:
+                                                          if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                          tqdm.write(f"  ArcFace Validation: No valid pairs found/sampled to calculate distances.")
+
+                                            except Exception as e:
+                                                if args.verbose:
+                                                    if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                    tqdm.write(f"  ArcFace Validation: Error calculating distance quantiles: {e}")
+                                        else:
+                                            if args.verbose:
+                                                if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                tqdm.write(f"  ArcFace Validation: Skipped distance quantiles (< 2 samples in val_mask: {num_val_samples}).")
+                                    else:
+                                        if args.verbose:
+                                             if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                             tqdm.write("  ArcFace Validation: Embedding is None.")
+
+                            else:
+                                 if args.verbose and (is_embedding_phase or is_joint_phase): # Only print if validation was expected
+                                     tqdm.write(f"--- Epoch {epoch} Validation --- \n  Skipped validation: val_mask is None or empty.")
+
+
+                    # --- Downstream Task Evaluation (Original logic, runs in P2 & P3 using Adj_eval) ---
+                    if Adj_eval is not None: # This condition implicitly means Phase 2 or 3
+                        if args.downstream_task == 'classification':
+                            # f_adj is the potentially detached Adj_eval graph computed earlier
+                            f_adj = Adj_eval
+
+                            # Ensure masks are on the correct device
+                            current_train_mask_dev = train_mask.to(self.device) if train_mask is not None else None
+                            current_val_mask_dev = val_mask.to(self.device) if val_mask is not None else None
+                            current_test_mask_dev = test_mask.to(self.device) if test_mask is not None else None
+                            labels_dev = labels.to(self.device) if labels is not None else None
+
+
+                            # Check if masks and labels exist before evaluation
+                            if current_train_mask_dev is None or current_val_mask_dev is None or current_test_mask_dev is None or labels_dev is None:
+                                 if args.verbose: tqdm.write(f"Epoch {epoch}: Skipping downstream evaluation - Missing train/val/test mask or labels.")
+                            else:
+                                # Perform downstream evaluation
+                                self._log_vram(f"Epoch {epoch}: Before Downstream Evaluation")
+                                downstream_val_accu, downstream_test_accu, _ = self.evaluate_adj_by_cls(
+                                    f_adj, features, nfeats, labels_dev, # Pass labels on device
+                                    nclasses, # nclasses was set based on task (e.g., 2 for binary)
+                                    current_train_mask_dev, current_val_mask_dev, current_test_mask_dev, args
+                                )
+                                self._log_vram(f"Epoch {epoch}: After Downstream Evaluation")
+
+                                # Update best downstream validation score
+                                if downstream_val_accu > best_val:
+                                    best_val = downstream_val_accu.item() if isinstance(downstream_val_accu, torch.Tensor) else downstream_val_accu
+                                    best_val_test = downstream_test_accu
                             best_epoch = epoch
                             if args.verbose:
-                                # Use standard print for this message
-                                print(f"** New Best Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **")
+                                        tqdm.write(f"** New Best Downstream Eval Val Acc: {best_val:.4f} (Test Acc: {best_val_test.item():.4f}) at Epoch {epoch} **")
 
                     elif args.downstream_task == 'clustering' and labels is not None:
-                        pass # Clustering evaluation logic can remain here if needed
+                             pass # Original clustering evaluation logic (if any)
+
+                    # Reset model/learner back to train mode for the next epoch
+                    if is_embedding_phase: model.train(); graph_learner.eval() # Keep learner frozen in P1
+                    elif is_graph_learner_phase: model.eval(); graph_learner.train() # Keep model frozen in P2
+                    else: model.train(); graph_learner.train() # Both train in P3
+
+
+                # --- End Validation & Evaluation Step ---
             
             # After all epochs, report best classification accuracy if tracked
             if use_classification_head:

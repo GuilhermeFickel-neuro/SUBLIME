@@ -14,6 +14,7 @@ from utils import sparse_mx_to_torch_sparse_tensor, knn_fast, get_memory_usage
 from main import create_parser # Import the shared parser creation function
 import warnings
 import gc # Import garbage collector
+from sklearn.model_selection import train_test_split # Import for validation split
 
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -331,7 +332,36 @@ def load_person_data(args):
     gc.collect()
     print(f"Original dataframes and combined CPFs deleted. Memory usage: {get_memory_usage():.2f} GB")
 
-    # === 5. Combine Labels ===
+    # === 5. Create Train/Val Split (for annotated data) and Masks ===
+    train_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
+    val_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
+    test_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device) # Keep test mask as all False for now
+
+    if extracted_binary_labels is not None and n_annotated > 0:
+        # Create indices for the annotated part of the dataset
+        annotated_indices = np.arange(n_annotated)
+
+        # Split annotated indices into train and validation sets (80/20)
+        # Using a fixed random_state for reproducible splits
+        train_annotated_indices, val_annotated_indices = train_test_split(
+            annotated_indices, test_size=0.20, random_state=42, # Using fixed seed 42
+            stratify=extracted_binary_labels.cpu().numpy() # Stratify by labels if possible
+        )
+
+        print(f"Splitting annotated data: {len(train_annotated_indices)} train, {len(val_annotated_indices)} validation.")
+
+        # Calculate the global indices in the combined dataset for annotated train/val
+        # Annotated data starts after main data (index n_main)
+        global_train_indices = train_annotated_indices + n_main
+        global_val_indices = val_annotated_indices + n_main
+
+        # Populate the masks based on the global indices
+        train_mask[global_train_indices] = True
+        val_mask[global_val_indices] = True
+
+        print(f"Populated train_mask ({train_mask.sum().item()} True) and val_mask ({val_mask.sum().item()} True).")
+
+    # === 5b. Combine Labels (Full labels needed for indexing in main.py) ===
     if extracted_binary_labels is not None:
         print("Creating combined labels tensor (-1 for main, 0/1 for annotated)...")
         main_placeholders = torch.full((n_main,), -1, dtype=torch.long)
@@ -524,11 +554,6 @@ def load_person_data(args):
     gc.collect()
     print(f"Intermediate sparse matrices deleted. Memory: {get_memory_usage():.2f} GB")
     # <<< DELETE END
-
-    # === 9. Create Dummy Masks ===
-    train_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
-    val_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
-    test_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
 
     print(f"Prepared combined dataset. Features shape: {features.shape}. Initial graph type: {'Sparse' if args.sparse else 'Dense'}. Labels shape: {combined_labels.shape}.")
 
