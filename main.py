@@ -785,8 +785,6 @@ class Experiment:
                     phase2_epochs = args.epochs - phase1_epochs
                     phase3_epochs = 0
 
-            # Get tqdm iterator --- REMOVED TQDM WRAPPER
-            from tqdm import tqdm # Explicit import before use
             epoch_iterator = tqdm(range(start_epoch, args.epochs), desc="Training", initial=start_epoch, total=args.epochs)
             for epoch in epoch_iterator: # Iterate over tqdm iterator
                 self._log_vram(f"Epoch {epoch} Start") # Log start of epoch
@@ -1477,14 +1475,15 @@ class Experiment:
                         log_dict[f'train/{key}'] = float(value)
                     except (ValueError, TypeError):
                         # If conversion fails, log as string or skip
-                        log_dict[f'train/{key}_str'] = str(value) 
+                        log_dict[f'train/{key}_str'] = str(value)
                         # Or handle specific non-numeric keys like 'Phase' differently if needed
-                
+
                 # Add learning rates
                 if scheduler_cl: log_dict['train/lr_model'] = optimizer_cl.param_groups[0]['lr']
                 if scheduler_learner: log_dict['train/lr_learner'] = optimizer_learner.param_groups[0]['lr']
-                
-                wandb.log(log_dict)
+
+                # Log with explicit step
+                wandb.log(log_dict, step=epoch)
 
 
                 # Periodic Checkpointing (remains the same, saves state at end of epoch)
@@ -1510,6 +1509,7 @@ class Experiment:
                     val_cls_accu = torch.tensor(0.0, device=self.device)
                     val_cls_loss = torch.tensor(0.0, device=self.device)
                     Adj_eval = None # The graph used for evaluation/validation
+                    val_log_dict = {'epoch': epoch} # Initialize dict for validation metrics
 
                     with torch.no_grad():
                         # --- Get necessary outputs for validation/evaluation ---
@@ -1578,7 +1578,9 @@ class Experiment:
                                                 if args.verbose:
                                                     tqdm.write(f"  Classification Val Loss: {val_cls_loss.item():.4f}, Acc: {val_cls_accu.item():.4f}")
                                                 # Log validation classification metrics
-                                                wandb.log({'epoch': epoch, 'val/cls_loss': val_cls_loss.item(), 'val/cls_accuracy': val_cls_accu.item()})
+                                                # wandb.log({'epoch': epoch, 'val/cls_loss': val_cls_loss.item(), 'val/cls_accuracy': val_cls_accu.item()}) # Old call
+                                                val_log_dict['val/cls_loss'] = val_cls_loss.item()
+                                                val_log_dict['val/cls_accuracy'] = val_cls_accu.item()
                                             elif args.verbose:
                                                  # Print header only if not already printed by potential subsequent ArcFace validation
                                                  if not (args.use_arcface and current_val_mask.sum().item() > 1):
@@ -1653,7 +1655,9 @@ class Experiment:
                                                         strategy_msg = "all pairs" if compute_all_pairs else f"{num_pairs_calculated} sampled pairs"
                                                         tqdm.write(f"  ArcFace Val Cosine Dist ({strategy_msg}): 10%={q10:.4f}, 50%={q50:.4f}")
                                                         # Log ArcFace validation distance quantiles
-                                                        wandb.log({'epoch': epoch, 'val/arcface_dist_q10': q10, 'val/arcface_dist_q50': q50})
+                                                        # wandb.log({'epoch': epoch, 'val/arcface_dist_q10': q10, 'val/arcface_dist_q50': q50}) # Old call
+                                                        val_log_dict['val/arcface_dist_q10'] = q10
+                                                        val_log_dict['val/arcface_dist_q50'] = q50
                                                 else:
                                                      if args.verbose:
                                                           if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
@@ -1676,11 +1680,13 @@ class Experiment:
                                  if args.verbose and (is_embedding_phase or is_joint_phase): # Only print if validation was expected
                                      tqdm.write(f"--- Epoch {epoch} Validation --- \n  Skipped validation: val_mask is None or empty.")
 
+                    # Log all collected validation metrics at once with the correct step
+                    if len(val_log_dict) > 1: # Log only if metrics were added besides epoch
+                        wandb.log(val_log_dict, step=epoch)
 
                     # Reset model/learner back to train mode for the next epoch
                     if is_embedding_phase: model.train(); graph_learner.eval() # Keep learner frozen in P1
                     elif is_graph_learner_phase: model.eval(); graph_learner.train() # Keep model frozen in P2
-                    else: model.train(); graph_learner.train() # Both train in P3
 
 
                 # --- End Validation & Evaluation Step ---
