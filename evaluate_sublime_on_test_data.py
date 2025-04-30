@@ -1133,10 +1133,10 @@ class Evaluator:
                               early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, XGBClassifier):
                      # Re-adding early stopping and Optuna pruning callback
-                     # The eval_metric is 'logloss', and the eval_set is named 'validation_0' by XGBoost.
-                     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "validation_0-logloss")
+                     # Changing monitored metric name from validation_0 to eval_0
+                     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
                      model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)], verbose=False,
-                               early_stopping_rounds=10, callbacks=[pruning_callback]) # Added Optuna callback
+                               early_stopping_rounds=10, callbacks=[pruning_callback]) # Using Optuna callback
                 else:
                     model.fit(train_features, train_labels) # Generic fit
 
