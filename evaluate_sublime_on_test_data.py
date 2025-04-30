@@ -1097,8 +1097,8 @@ class Evaluator:
         self.best_params = {} # {model_name: {feature_set: {param: val, ...}}}
         self.model_configs = {
             'xgboost': {
-                'class': XGBClassifier, 
-                'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'auc'},
+                'class': XGBClassifier,
+                'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'auc', 'tree_method': 'gpu_hist'},
                 'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'min_child_weight': ['int', 1, 10], 'gamma': ['float', 0, 5], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             },
             'catboost': {
