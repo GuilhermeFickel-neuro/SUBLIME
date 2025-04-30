@@ -6,6 +6,7 @@ import os
 import joblib
 from tqdm import tqdm
 import optuna
+import torch.nn.functional as F
 from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
@@ -712,7 +713,7 @@ class SublimeHandler:
                         # 4. Run the model forward pass with the selected features and adjacency
                         if self.has_classification_head:
                             _, embedding, _, classification_output = self.model(
-                                features_to_use, adj_to_use, view_type=view_type, include_features=True
+                                features_to_use, adj_to_use, include_features=True
                             )
                             if classification_output is not None:
                                 # Classification output corresponds to nodes in features_to_use.
@@ -722,7 +723,7 @@ class SublimeHandler:
                             else:
                                 classification_prob = None
                         else:
-                            _, embedding = self.model(features_to_use, adj_to_use, view_type=view_type)
+                            _, embedding = self.model(features_to_use, adj_to_use)
                             classification_prob = None
                         # --- End Modified Logic ---
 
