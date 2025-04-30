@@ -1098,7 +1098,7 @@ class Evaluator:
         self.model_configs = {
             'xgboost': {
                 'class': XGBClassifier, 
-                'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'logloss'},
+                'base_params': {'random_state': 42, 'use_label_encoder': False, 'eval_metric': 'auc'},
                 'trial_params': {'n_estimators': ['int', 50, 500], 'max_depth': ['int', 3, 10], 'learning_rate': ['float', 0.01, 0.3], 'subsample': ['float', 0.6, 1.0], 'colsample_bytree': ['float', 0.3, 1.0], 'min_child_weight': ['int', 1, 10], 'gamma': ['float', 0, 5], 'reg_alpha': ['float', 0, 10], 'reg_lambda': ['float', 0, 15]}
             },
             'catboost': {
@@ -1133,36 +1133,69 @@ class Evaluator:
                     model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False,
                               early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, XGBClassifier):
-                    # XGBoost 3.0.0 API: callbacks, eval_set, early_stopping_rounds moved to constructor
-                    # Create pruning callback - Monitor the validation set (will be eval_0 as it's the only one in fit)
-                    pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
-                    
-                    # Recreate the model with constructor parameters (callbacks, BUT NO early_stopping_rounds)
-                    updated_params = params.copy()
-                    updated_model = XGBClassifier(
-                        **updated_params,
-                        callbacks=[pruning_callback]
-                        # eval_set=eval_dataset, # REMOVED from constructor
-                        # early_stopping_rounds=10 # REMOVED internal early stopping
-                    )
-                    
-                    # Fit with eval_set passed here
-                    eval_dataset = [(val_features, val_labels)] # Only pass validation set to fit
-                    updated_model.fit(train_features, train_labels, eval_set=eval_dataset, verbose=False)
-                    
-                    # Replace original model with updated one
-                    model = updated_model
+                    # Manual Pruning Implementation for XGBoost >= 1.6
+                    # Combine base and trial parameters
+                    params.update(base_params) # Use base_params as default
+
+                    eval_set = [(val_features, val_labels)]
+                    eval_metric_name = params.get('eval_metric', 'auc') # Ensure AUC is used
+
+                    # Add early stopping rounds for manual pruning logic
+                    early_stopping_rounds = 20 # Set desired rounds
+
+                    # Instantiate model with params AND early stopping
+                    model = XGBClassifier(**params,
+                                          early_stopping_rounds=early_stopping_rounds)
+                                          # No Optuna callback needed
+
+                    # Fit with eval_set. Early stopping happens internally.
+                    model.fit(train_features, train_labels,
+                              eval_set=eval_set,
+                              verbose=False)
+
+                    # --- Manual Pruning Logic ---
+                    # Access evaluation results
+                    results = model.evals_result()
+                    # The key should be 'eval_0' since eval_set has one entry
+                    validation_scores = results['eval_0'][eval_metric_name]
+
+                    # Report intermediate scores to Optuna for pruning
+                    for step, score in enumerate(validation_scores):
+                        trial.report(score, step)
+                        # Check if pruning is suggested
+                        if trial.should_prune():
+                            raise optuna.TrialPruned()
+                    # --- End Manual Pruning Logic ---
+
+                    # If loop completes without pruning, calculate final AUC for objective
+                    preds_proba = model.predict_proba(val_features)[:, 1]
+                    final_auc = roc_auc_score(val_labels, preds_proba)
+                    return final_auc
+
                 else:
                     model.fit(train_features, train_labels) # Generic fit
 
-                # Check for pruning
-                if trial.should_prune():
+                # Check for pruning (for models using Optuna callbacks)
+                # Note: XGBoost pruning is handled manually above
+                if not isinstance(model, XGBClassifier) and trial.should_prune():
                      raise optuna.TrialPruned()
 
-                preds_proba = model.predict_proba(val_features)[:, 1]
-                return roc_auc_score(val_labels, preds_proba)
+                # Calculate AUC for non-XGBoost models or if XGBoost wasn't pruned
+                if not isinstance(model, XGBClassifier):
+                     preds_proba = model.predict_proba(val_features)[:, 1]
+                     return roc_auc_score(val_labels, preds_proba)
+                # If XGBoost survived pruning, its final_auc is returned above
+
             except optuna.TrialPruned:
                  raise # Re-raise prune exceptions
+            except KeyError as e:
+                 # Handle potential issues accessing evals_result for XGBoost
+                 if isinstance(model, XGBClassifier):
+                     print(f"KeyError accessing XGBoost evals_result: {e}. Results dict: {getattr(model, 'evals_result_', 'N/A')()}")
+                     return 0.0 # Return low score
+                 else:
+                     # Reraise if not XGBoost related
+                     raise
             except Exception as e:
                  print(f"Warning: Trial failed with error: {e}")
                  import logging
