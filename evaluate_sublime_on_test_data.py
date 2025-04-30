@@ -1156,9 +1156,9 @@ class Evaluator:
                     # --- Manual Pruning Logic ---
                     # Access evaluation results
                     results = model.evals_result()
-                    # Check if results are available before accessing
-                    if 'eval_0' in results and eval_metric_name in results['eval_0']:
-                        validation_scores = results['eval_0'][eval_metric_name]
+                    # Check if results are available before accessing - Use 'validation_0'
+                    if 'validation_0' in results and eval_metric_name in results['validation_0']:
+                        validation_scores = results['validation_0'][eval_metric_name]
 
                         # Report intermediate scores to Optuna for pruning
                         for step, score in enumerate(validation_scores):
