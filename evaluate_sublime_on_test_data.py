@@ -1134,24 +1134,21 @@ class Evaluator:
                               early_stopping_rounds=10) # Added early stopping
                 elif isinstance(model, XGBClassifier):
                     # XGBoost 3.0.0 API: callbacks, eval_set, early_stopping_rounds moved to constructor
-                    # Create pruning callback - Monitor the validation set (now eval_0 since it's the only one)
+                    # Create pruning callback - Monitor the validation set (will be eval_0 as it's the only one in fit)
                     pruning_callback = optuna.integration.XGBoostPruningCallback(trial, "eval_0-logloss")
                     
-                    # Need to recreate the model with the callback
+                    # Recreate the model with constructor parameters (callbacks, early_stopping_rounds)
                     updated_params = params.copy()
-                    # Define eval set - ONLY validation set
-                    eval_dataset = [(val_features, val_labels)] # Only pass validation set
-                    
-                    # In XGBoost 3.0+, need to explicitly pass the callbacks list
                     updated_model = XGBClassifier(
                         **updated_params,
                         callbacks=[pruning_callback],
-                        eval_set=eval_dataset,
+                        # eval_set=eval_dataset, # REMOVED from constructor
                         early_stopping_rounds=10
                     )
                     
-                    # Fit without the moved parameters
-                    updated_model.fit(train_features, train_labels, verbose=False)
+                    # Fit with eval_set passed here
+                    eval_dataset = [(val_features, val_labels)] # Only pass validation set to fit
+                    updated_model.fit(train_features, train_labels, eval_set=eval_dataset, verbose=False)
                     
                     # Replace original model with updated one
                     model = updated_model
