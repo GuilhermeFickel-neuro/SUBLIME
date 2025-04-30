@@ -917,7 +917,7 @@ class Experiment:
                                        # Maybe try setting it? Or log a warning.
                                        # Let's log a warning first, as forcing requires_grad might mask issues.
                                        if args.verbose:
-                                            tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.") # Changed to tqdm.write
+                                            tqdm.tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.") # Changed to tqdm.write
                                        # Optionally, try forcing it:
                                        # Adj.edata['w'].requires_grad_(True) # Use with caution
                                else:
@@ -1143,7 +1143,7 @@ class Experiment:
                                    # Maybe try setting it? Or log a warning.
                                    # Let's log a warning first, as forcing requires_grad might mask issues.
                                    if args.verbose:
-                                        tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.") # Changed to tqdm.write
+                                        tqdm.tqdm.write(f"Warning: Epoch {epoch} [Phase 2] - Learned graph edge weights (Adj.edata['w']) do not require gradients. Grad flow to learner might be broken.") # Changed to tqdm.write
                                    # Optionally, try forcing it:
                                    # Adj.edata['w'].requires_grad_(True) # Use with caution
                            else:
@@ -1319,9 +1319,11 @@ class Experiment:
                         learner_grad_norm = learner_grad_norm ** 0.5
                         # Only print if verbose and gradient is calculated
                         if args.verbose and params_with_grad > 0 and epoch % 5 == 0: # Print every 5 epochs in phase 2
-                            tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: {learner_grad_norm:.6f}") # Changed to tqdm.write
+                            # tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: {learner_grad_norm:.6f}") # Changed to tqdm.write
+                            tqdm.tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: {learner_grad_norm:.6f}") # Use tqdm.tqdm.write
                         elif args.verbose and params_with_grad == 0 and epoch % 5 == 0:
-                             tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: N/A (No Grads Found)") # Changed to tqdm.write
+                             # tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: N/A (No Grads Found)") # Changed to tqdm.write
+                             tqdm.tqdm.write(f"Epoch {epoch} [Phase 2] - Learner Grad Norm: N/A (No Grads Found)") # Use tqdm.tqdm.write
 
 
                     # Gradient Clipping based on phase
@@ -1355,7 +1357,8 @@ class Experiment:
                 if is_graph_learner_phase: lr_model_str = "N/A (Phase 2)"
 
                 if args.verbose and epoch % 10 == 0:
-                    tqdm.write(f"Epoch {epoch} [Phase {1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}] - LR model: {lr_model_str}, LR learner: {lr_learner_str}") # Changed to tqdm.write
+                    # tqdm.write(f"Epoch {epoch} [Phase {1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}] - LR model: {lr_model_str}, LR learner: {lr_learner_str}") # Changed to tqdm.write
+                    tqdm.tqdm.write(f"Epoch {epoch} [Phase {1 if is_embedding_phase else (2 if is_graph_learner_phase else 3)}] - LR model: {lr_model_str}, LR learner: {lr_learner_str}") # Use tqdm.tqdm.write
 
 
                 # Structure Bootstrapping - Should only happen when learner is active (Phase 2 & 3) and Adj exists
@@ -1499,7 +1502,8 @@ class Experiment:
                         avg_cls_acc = sum(cls_accuracies) / len(cls_accuracies)
                         if args.verbose:
                             # Use standard print for this message
-                            print(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}")
+                            # print(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}")
+                            tqdm.tqdm.write(f"Checkpoint @ Epoch {epoch}: Avg ClsAcc over last {len(cls_accuracies)} tracked epochs: {avg_cls_acc:.4f}") # Use tqdm.tqdm.write
                         cls_accuracies = []  # Reset for next period
 
                 # --- Validation & Evaluation Step ---
@@ -1544,7 +1548,7 @@ class Experiment:
                                 # Get learner outputs using the detached evaluation graph
                                 _, emb2_val, _, cls_output2_val = model(features_val, Adj_eval, 'learner', include_features=True)
                         else:
-                                if args.verbose: tqdm.write(f"Warning: Adj is None during validation/eval in Phase {2 if is_graph_learner_phase else 3}.")
+                                if args.verbose: tqdm.tqdm.write(f"Warning: Adj is None during validation/eval in Phase {2 if is_graph_learner_phase else 3}.")
                                 Adj_eval = None # Ensure it's None if something went wrong
 
 
@@ -1569,7 +1573,7 @@ class Experiment:
                                             val_cls_eval_mask = (masked_val_labels != -1)
                                             if val_cls_eval_mask.any():
                                                 if args.verbose and not validation_performed:
-                                                    tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---")
+                                                    tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---")
                                                     validation_performed = True
                                                 
                                                 val_cls_loss, val_cls_accu = self.loss_binary_cls(
@@ -1577,7 +1581,7 @@ class Experiment:
                                                     masked_val_labels[val_cls_eval_mask]
                                                 )
                                                 if args.verbose:
-                                                    tqdm.write(f"  Classification Val Loss: {val_cls_loss.item():.4f}, Acc: {val_cls_accu.item():.4f}")
+                                                    tqdm.tqdm.write(f"  Classification Val Loss: {val_cls_loss.item():.4f}, Acc: {val_cls_accu.item():.4f}")
                                                 # Log validation classification metrics
                                                 # wandb.log({'epoch': epoch, 'val/cls_loss': val_cls_loss.item(), 'val/cls_accuracy': val_cls_accu.item()}) # Old call
                                                 val_log_dict['val/cls_loss'] = val_cls_loss.item()
@@ -1585,13 +1589,13 @@ class Experiment:
                                             elif args.verbose:
                                                  # Print header only if not already printed by potential subsequent ArcFace validation
                                                  if not (args.use_arcface and current_val_mask.sum().item() > 1):
-                                                      tqdm.write(f"--- Epoch {epoch} Validation ---")
-                                                 tqdm.write(f"  Classification Validation: No valid binary labels found in validation set.")
+                                                      tqdm.tqdm.write(f"--- Epoch {epoch} Validation ---")
+                                                 tqdm.tqdm.write(f"  Classification Validation: No valid binary labels found in validation set.")
 
                                         else:
-                                            if args.verbose: tqdm.write(f"--- Epoch {epoch} Validation --- \n  Classification Validation: Labels tensor is None.")
+                                            if args.verbose: tqdm.tqdm.write(f"--- Epoch {epoch} Validation --- \\n  Classification Validation: Labels tensor is None.")
                                     else:
-                                        if args.verbose: tqdm.write(f"--- Epoch {epoch} Validation --- \n  Classification Validation: Output is None.")
+                                        if args.verbose: tqdm.tqdm.write(f"--- Epoch {epoch} Validation --- \\n  Classification Validation: Output is None.")
 
                                 # --- ARCFACE VALIDATION (Pairwise Distance Quantiles) ---
                                 if args.use_arcface:
@@ -1652,34 +1656,34 @@ class Experiment:
                                                     q50 = distance_quantiles[1].item() # Median
                                                     
                                                     if args.verbose:
-                                                        if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                        if not validation_performed: tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
                                                         strategy_msg = "all pairs" if compute_all_pairs else f"{num_pairs_calculated} sampled pairs"
-                                                        tqdm.write(f"  ArcFace Val Cosine Dist ({strategy_msg}): 10%={q10:.4f}, 50%={q50:.4f}")
+                                                        tqdm.tqdm.write(f"  ArcFace Val Cosine Dist ({strategy_msg}): 10%={q10:.4f}, 50%={q50:.4f}")
                                                         # Log ArcFace validation distance quantiles
                                                         # wandb.log({'epoch': epoch, 'val/arcface_dist_q10': q10, 'val/arcface_dist_q50': q50}) # Old call
                                                         val_log_dict['val/arcface_dist_q10'] = q10
                                                         val_log_dict['val/arcface_dist_q50'] = q50
                                                 else:
                                                      if args.verbose:
-                                                          if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
-                                                          tqdm.write(f"  ArcFace Validation: No valid pairs found/sampled to calculate distances.")
+                                                          if not validation_performed: tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                          tqdm.tqdm.write(f"  ArcFace Validation: No valid pairs found/sampled to calculate distances.")
 
                                             except Exception as e:
                                                 if args.verbose:
-                                                    if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
-                                                    tqdm.write(f"  ArcFace Validation: Error calculating distance quantiles: {e}")
+                                                    if not validation_performed: tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                    tqdm.tqdm.write(f"  ArcFace Validation: Error calculating distance quantiles: {e}")
                                         else:
                                             if args.verbose:
-                                                if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
-                                                tqdm.write(f"  ArcFace Validation: Skipped distance quantiles (< 2 samples in val_mask: {num_val_samples}).")
+                                                if not validation_performed: tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                                tqdm.tqdm.write(f"  ArcFace Validation: Skipped distance quantiles (< 2 samples in val_mask: {num_val_samples}).")
                                     else:
                                         if args.verbose:
-                                             if not validation_performed: tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
-                                             tqdm.write("  ArcFace Validation: Embedding is None.")
+                                             if not validation_performed: tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
+                                             tqdm.tqdm.write("  ArcFace Validation: Embedding is None.")
 
                             else:
                                  if args.verbose and (is_embedding_phase or is_joint_phase): # Only print if validation was expected
-                                     tqdm.write(f"--- Epoch {epoch} Validation --- \n  Skipped validation: val_mask is None or empty.")
+                                     tqdm.tqdm.write(f"--- Epoch {epoch} Validation --- \\n  Skipped validation: val_mask is None or empty.")
 
                     # Log all collected validation metrics at once with the correct step
                     if len(val_log_dict) > 1: # Log only if metrics were added besides epoch
