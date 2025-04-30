@@ -531,6 +531,7 @@ class Experiment:
         wandb.init(
             project="NeurolakeGraph",
             config=args,
+            name=args.wandb_experiment_name # Use the new argument for the run name
             # mode="offline" # Uncomment this line to run offline
         )
             
@@ -1849,6 +1850,9 @@ def create_parser():
     parser.add_argument('-gpu', type=int, default=0)
     parser.add_argument('-verbose', type=int, default=1, 
                        help='Control verbosity: 1 to show all prints, 0 to show only final results')
+    # Add argument for Wandb experiment name
+    parser.add_argument('--wandb_experiment_name', type=str, default=None,
+                        help='Optional name for the Wandb experiment run')
     # One Cycle Learning Rate Scheduler parameters
     parser.add_argument('-use_one_cycle', type=int, default=0,
                         help='Whether to use OneCycleLR scheduler (0=disabled, 1=enabled)')
