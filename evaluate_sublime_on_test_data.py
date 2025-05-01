@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
+import lightgbm
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, roc_curve
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
 from sklearn.compose import ColumnTransformer
@@ -1124,11 +1125,11 @@ class Evaluator:
             try:
                 if isinstance(model, LGBMClassifier):
                     eval_metric = 'auc'
-                    # Use optuna callback for pruning
                     pruning_callback = optuna.integration.LightGBMPruningCallback(trial, eval_metric)
+                    early_stopping_callback = lightgbm.early_stopping(stopping_rounds=10, verbose=False) # Use verbose=False
                     model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
-                              eval_metric=eval_metric, callbacks=[pruning_callback], # Removed verbose=-1
-                              early_stopping_rounds=10) # Added early stopping
+                              eval_metric=eval_metric, callbacks=[pruning_callback, early_stopping_callback]) # Pass both callbacks
+                          # Removed direct early_stopping_rounds=10 argument
                 elif isinstance(model, CatBoostClassifier):
                     # Removed early_stopping_rounds=10 as per user request -> Re-adding it
                     model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False,
