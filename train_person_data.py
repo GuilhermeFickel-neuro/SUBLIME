@@ -271,7 +271,10 @@ def load_person_data(args):
     # === 1. Load Main Data ===
     print(f"Loading main dataset from {args.dataset}")
     try:
-        df_main = pd.read_csv(args.dataset, delimiter='\t')
+        # Specify dtype for potential CPF column to ensure it's read as string
+        main_cpf_col_name = 'CPF' # Assume this is the most likely name
+        dtypes_main = {main_cpf_col_name: str}
+        df_main = pd.read_csv(args.dataset, delimiter='\\t', dtype=dtypes_main)
         n_main = len(df_main)
     except FileNotFoundError:
         print(f"Error: Main dataset file not found at {args.dataset}")
@@ -289,7 +292,10 @@ def load_person_data(args):
     if args.annotated_dataset:
         print(f"Loading annotated dataset from {args.annotated_dataset}")
         try:
-            df_annotated = pd.read_csv(args.annotated_dataset, delimiter='\t')
+            # Specify dtype for potential CPF column
+            annotated_cpf_col_name = 'CPF' # Assume this is the most likely name
+            dtypes_annotated = {annotated_cpf_col_name: str}
+            df_annotated = pd.read_csv(args.annotated_dataset, delimiter='\\t', dtype=dtypes_annotated)
             n_annotated = len(df_annotated)
 
             # Check for and extract target column
@@ -328,7 +334,13 @@ def load_person_data(args):
     if hasattr(args, 'relationship_dataset') and args.relationship_dataset:
         print(f"Loading relationship dataset from {args.relationship_dataset}")
         try:
-            df_relationships = pd.read_csv(args.relationship_dataset, sep='\t') # Assuming default delimiter is comma, adjust if needed
+            # <<< EDIT START
+            # Specify dtype for potential relationship CPF columns
+            rel_cpf_col1 = 'CPF' # Assume likely names
+            rel_cpf_col2 = 'CPF_VINCULO'
+            dtypes_rel = {rel_cpf_col1: str, rel_cpf_col2: str}
+            df_relationships = pd.read_csv(args.relationship_dataset, sep='\\t', dtype=dtypes_rel)
+            # <<< EDIT END
             # Minimal validation: Check if required columns exist
             required_rel_cols = ['CPF', 'CPF_VINCULO'] # Assuming these are the linking columns
             # Use find_column_case_insensitive
@@ -382,7 +394,12 @@ def load_person_data(args):
     actual_cpf_col_annotated = None
     if args.annotated_dataset:
         try:
-            df_annotated_temp_for_cpf = pd.read_csv(args.annotated_dataset, delimiter='\t')
+            # <<< EDIT START
+            # Specify dtype for potential CPF column when reloading for mapping
+            annotated_cpf_col_name = 'CPF' # Assume this is the most likely name
+            dtypes_annotated_temp = {annotated_cpf_col_name: str}
+            df_annotated_temp_for_cpf = pd.read_csv(args.annotated_dataset, delimiter='\\t', dtype=dtypes_annotated_temp)
+            # <<< EDIT END
             actual_cpf_col_annotated = find_column_case_insensitive(df_annotated_temp_for_cpf.columns, cpf_col_target_name.lower())
             if actual_cpf_col_annotated is None:
                  raise ValueError(f"Annotated dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive).")
