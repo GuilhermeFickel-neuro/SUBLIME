@@ -301,15 +301,27 @@ def load_person_data(args):
 
             print(f"Extracting labels from target column '{target_column}'...")
             try:
-                # Ensure labels are integer 0 or 1
+                # Get all label values
                 label_values = df_annotated[target_column].values
-                unique_labels = np.unique(label_values)
-                if not np.all(np.isin(unique_labels, [0, 1])):
-                     raise ValueError(f"Target column '{target_column}' contains values other than 0 or 1: {unique_labels}")
-                extracted_binary_labels = torch.tensor(label_values, dtype=torch.long) # Keep on CPU for now
-                print(f"  Found {len(torch.unique(extracted_binary_labels))} unique binary labels.")
-                # Drop the target column *before* preprocessing
-                df_annotated = df_annotated.drop(columns=[target_column])
+
+                # Find indices where labels are 0 or 1 (ignore -1 or others)
+                valid_label_indices = np.where(np.isin(label_values, [0, 1]))[0]
+
+                if len(valid_label_indices) == 0:
+                    print(f"Warning: No valid labels (0 or 1) found in target column '{target_column}'. Treating as unlabeled.")
+                    extracted_binary_labels = None
+                    n_annotated = 0
+                    df_annotated = None # No valid annotated data to process
+                else:
+                    print(f"  Found {len(valid_label_indices)} rows with valid labels (0 or 1) out of {len(df_annotated)} total annotated rows.")
+                    # Filter labels to keep only 0s and 1s
+                    extracted_binary_labels = torch.tensor(label_values[valid_label_indices], dtype=torch.long) # Keep on CPU for now
+                    # Filter the dataframe to keep only rows with valid labels
+                    df_annotated = df_annotated.iloc[valid_label_indices].copy() # Keep only valid rows. Use .copy()
+                    n_annotated = len(df_annotated) # Update n_annotated based on filtered data
+                    # Drop the target column *after* filtering and extracting labels
+                    df_annotated = df_annotated.drop(columns=[target_column])
+
             except Exception as e:
                 print(f"Error processing target column '{target_column}': {e}")
                 raise
