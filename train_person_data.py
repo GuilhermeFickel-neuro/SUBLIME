@@ -282,7 +282,7 @@ def load_person_data(args):
 
     # === 2. Load Annotated Data (if specified) ===
     df_annotated = None
-    extracted_binary_labels = None
+    extracted_labels_all = None
     n_annotated = 0
     target_column = args.annotation_column if hasattr(args, 'annotation_column') else None
 
@@ -301,26 +301,25 @@ def load_person_data(args):
 
             print(f"Extracting labels from target column '{target_column}'...")
             try:
-                # Get all label values
-                label_values = df_annotated[target_column].values
+                # Get all label values (-1, 0, 1)
+                label_values_all = df_annotated[target_column].values
+                unique_labels = np.unique(label_values_all)
+                print(f"  Found unique label values in target column: {unique_labels}")
 
-                # Find indices where labels are 0 or 1 (ignore -1 or others)
-                valid_label_indices = np.where(np.isin(label_values, [0, 1]))[0]
-
-                if len(valid_label_indices) == 0:
-                    print(f"Warning: No valid labels (0 or 1) found in target column '{target_column}'. Treating as unlabeled.")
-                    extracted_binary_labels = None
-                    n_annotated = 0
-                    df_annotated = None # No valid annotated data to process
+                # Check if at least 0 and 1 are present for classification task splitting
+                if not np.any(np.isin(label_values_all, [0, 1])):
+                    print(f"Warning: No valid labels (0 or 1) found in target column '{target_column}'. Masks will be empty.")
+                    # Store all labels including -1 for combined_labels tensor
+                    extracted_labels_all = torch.tensor(label_values_all, dtype=torch.long)
                 else:
-                    print(f"  Found {len(valid_label_indices)} rows with valid labels (0 or 1) out of {len(df_annotated)} total annotated rows.")
-                    # Filter labels to keep only 0s and 1s
-                    extracted_binary_labels = torch.tensor(label_values[valid_label_indices], dtype=torch.long) # Keep on CPU for now
-                    # Filter the dataframe to keep only rows with valid labels
-                    df_annotated = df_annotated.iloc[valid_label_indices].copy() # Keep only valid rows. Use .copy()
-                    n_annotated = len(df_annotated) # Update n_annotated based on filtered data
-                    # Drop the target column *after* filtering and extracting labels
-                    df_annotated = df_annotated.drop(columns=[target_column])
+                    # Store all labels including -1 for combined_labels tensor
+                    extracted_labels_all = torch.tensor(label_values_all, dtype=torch.long)
+
+                # Keep the original n_annotated (count before filtering)
+                # n_annotated is already set correctly before this block
+
+                # Drop the target column from the original df_annotated
+                df_annotated = df_annotated.drop(columns=[target_column])
 
             except Exception as e:
                 print(f"Error processing target column '{target_column}': {e}")
@@ -415,35 +414,47 @@ def load_person_data(args):
     val_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device)
     test_mask = torch.zeros(n_total_samples, dtype=torch.bool, device=device) # Keep test mask as all False for now
 
-    if extracted_binary_labels is not None and n_annotated > 0:
-        # Create indices for the annotated part of the dataset
-        annotated_indices = np.arange(n_annotated)
+    if extracted_labels_all is not None and n_annotated > 0:
+        # Identify indices within the annotated data that have valid labels (0 or 1)
+        annotated_indices_relative = np.arange(n_annotated)
+        valid_labels_mask_annotated = np.isin(extracted_labels_all.cpu().numpy(), [0, 1])
+        valid_annotated_indices_relative = annotated_indices_relative[valid_labels_mask_annotated]
 
-        # Split annotated indices into train and validation sets (80/20)
-        # Using a fixed random_state for reproducible splits
-        train_annotated_indices, val_annotated_indices = train_test_split(
-            annotated_indices, test_size=0.20, random_state=42, # Using fixed seed 42
-            stratify=extracted_binary_labels.cpu().numpy() # Stratify by labels if possible
-        )
+        if len(valid_annotated_indices_relative) > 0:
+            # Get the actual labels (0 or 1) for stratification
+            labels_for_split = extracted_labels_all[valid_labels_mask_annotated].cpu().numpy()
 
-        print(f"Splitting annotated data: {len(train_annotated_indices)} train, {len(val_annotated_indices)} validation.")
+            print(f"Splitting {len(valid_annotated_indices_relative)} annotated samples with valid labels (0 or 1)...")
+            # Split only the valid relative indices
+            train_valid_indices_relative, val_valid_indices_relative = train_test_split(
+                valid_annotated_indices_relative,
+                test_size=0.20,
+                random_state=42,
+                stratify=labels_for_split
+            )
 
-        # Calculate the global indices in the combined dataset for annotated train/val
-        # Annotated data starts after main data (index n_main)
-        global_train_indices = train_annotated_indices + n_main
-        global_val_indices = val_annotated_indices + n_main
+            print(f"  Train split size: {len(train_valid_indices_relative)}, Validation split size: {len(val_valid_indices_relative)}")
 
-        # Populate the masks based on the global indices
-        train_mask[global_train_indices] = True
-        val_mask[global_val_indices] = True
+            # Calculate the global indices in the combined dataset for these splits
+            # Annotated data starts after main data (index n_main)
+            global_train_indices = train_valid_indices_relative + n_main
+            global_val_indices = val_valid_indices_relative + n_main
 
-        print(f"Populated train_mask ({train_mask.sum().item()} True) and val_mask ({val_mask.sum().item()} True).")
+            # Populate the masks based on the global indices of valid samples
+            train_mask[global_train_indices] = True
+            val_mask[global_val_indices] = True
+
+            print(f"Populated train_mask ({train_mask.sum().item()} True) and val_mask ({val_mask.sum().item()} True) using only labels 0/1.")
+        else:
+            print("No annotated samples with valid labels (0 or 1) found to create train/val split.")
+    else:
+        print("No annotated data provided or extracted_labels_all is None. train_mask and val_mask remain False.")
 
     # === 5b. Combine Labels (Full labels needed for indexing in main.py) ===
-    if extracted_binary_labels is not None:
+    if extracted_labels_all is not None:
         print("Creating combined labels tensor (-1 for main, 0/1 for annotated)...")
         main_placeholders = torch.full((n_main,), -1, dtype=torch.long)
-        combined_labels = torch.cat((main_placeholders, extracted_binary_labels)).to(device)
+        combined_labels = torch.cat((main_placeholders, extracted_labels_all)).to(device)
         # Verify shape
         if len(combined_labels) != n_total_samples:
              raise ValueError(f"Combined labels length ({len(combined_labels)}) does not match total samples ({n_total_samples}).")
@@ -458,7 +469,7 @@ def load_person_data(args):
     if args.downstream_task == 'clustering':
         nclasses_or_clusters = args.n_clusters if hasattr(args, 'n_clusters') else n_total_samples # Default to nodes if not specified
         print(f"Downstream task is clustering. Using n_clusters = {nclasses_or_clusters} for evaluation.")
-    elif extracted_binary_labels is not None:
+    elif extracted_labels_all is not None:
         # If classification task and we have binary labels, nclasses for evaluation is 2
         nclasses_or_clusters = 2
         print(f"Downstream task is classification. Using n_classes = {nclasses_or_clusters} for evaluation.")
