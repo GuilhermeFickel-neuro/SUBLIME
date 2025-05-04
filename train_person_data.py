@@ -492,7 +492,6 @@ def load_person_data(args):
         if valid_edges > 0:
             adj_rel_sparse = sp.csr_matrix((data, (rows, cols)), shape=(n_total_samples, n_total_samples), dtype=np.float32)
             adj_rel_sparse.sum_duplicates() # Remove duplicates
-            adj_rel_sparse = adj_rel_sparse.astype(bool).astype(np.float32) # Ensure binary 0/1
             print(f"  Relationship graph computed. Shape: {adj_rel_sparse.shape}, Non-zero entries: {adj_rel_sparse.nnz}")
             print(f"  (Found {valid_edges} valid relationship pairs. Skipped {skipped_edges} edges due to missing CPFs "
                   f"[{missing_cpf1} missing {actual_cpf_rel_col1_used}, {missing_cpf2} missing {actual_cpf_rel_col2_used}] and {skipped_self_loops} self-loops)")
