@@ -536,6 +536,8 @@ def load_person_data(args):
         skipped_self_loops = 0
         missing_cpf1 = 0
         missing_cpf2 = 0
+        missing_cpf1_values = set() # Store missing CPF1 values
+        missing_cpf2_values = set() # Store missing CPF2 values
 
         # Use actual column names found earlier
         actual_cpf_rel_col1_used = actual_cpf_rel_col1
@@ -560,8 +562,12 @@ def load_person_data(args):
                     skipped_self_loops += 1
             else:
                 skipped_edges += 1
-                if idx1 is None: missing_cpf1 += 1
-                if idx2 is None: missing_cpf2 += 1
+                if idx1 is None:
+                    missing_cpf1 += 1
+                    missing_cpf1_values.add(cpf1) # Add missing CPF1
+                if idx2 is None:
+                    missing_cpf2 += 1
+                    missing_cpf2_values.add(cpf2) # Add missing CPF2
 
         if valid_edges > 0:
             adj_rel_sparse = sp.csr_matrix((data, (rows, cols)), shape=(n_total_samples, n_total_samples), dtype=np.float32)
@@ -569,8 +575,18 @@ def load_person_data(args):
             print(f"  Relationship graph computed. Shape: {adj_rel_sparse.shape}, Non-zero entries: {adj_rel_sparse.nnz}")
             print(f"  (Found {valid_edges} valid relationship pairs. Skipped {skipped_edges} edges due to missing CPFs "
                   f"[{missing_cpf1} missing {actual_cpf_rel_col1_used}, {missing_cpf2} missing {actual_cpf_rel_col2_used}] and {skipped_self_loops} self-loops)")
+            # Print the missing CPFs if any were found
+            if missing_cpf1_values:
+                print(f"    Missing CPFs from '{actual_cpf_rel_col1_used}' column: {sorted(list(missing_cpf1_values))}")
+            if missing_cpf2_values:
+                print(f"    Missing CPFs from '{actual_cpf_rel_col2_used}' column: {sorted(list(missing_cpf2_values))}")
         else:
             print(f"  No valid relationship edges created. Total skipped edges: {skipped_edges}, self-loops: {skipped_self_loops}.")
+            # Print the missing CPFs even if no valid edges were created
+            if missing_cpf1_values:
+                print(f"    Missing CPFs from '{actual_cpf_rel_col1_used}' column: {sorted(list(missing_cpf1_values))}")
+            if missing_cpf2_values:
+                print(f"    Missing CPFs from '{actual_cpf_rel_col2_used}' column: {sorted(list(missing_cpf2_values))}")
             adj_rel_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32) # Empty sparse matrix
 
         # Delete relationship dataframe after use
