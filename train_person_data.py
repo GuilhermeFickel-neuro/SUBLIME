@@ -378,22 +378,14 @@ def load_person_data(args):
     all_cpfs_list = [df_main[actual_cpf_col_main]]
 
     # Reload annotated df briefly JUST to get CPF column if needed, then discard
-    df_annotated_temp_for_cpf = None
+    # df_annotated_temp_for_cpf = None # No longer needed
     actual_cpf_col_annotated = None
-    if args.annotated_dataset:
-        try:
-            df_annotated_temp_for_cpf = pd.read_csv(args.annotated_dataset, delimiter='\t')
-            actual_cpf_col_annotated = find_column_case_insensitive(df_annotated_temp_for_cpf.columns, cpf_col_target_name.lower())
-            if actual_cpf_col_annotated is None:
-                 raise ValueError(f"Annotated dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive).")
-            all_cpfs_list.append(df_annotated_temp_for_cpf[actual_cpf_col_annotated])
-        except Exception as e:
-            print(f"Error loading annotated dataset for CPF mapping: {e}")
-            raise
-        finally:
-             if df_annotated_temp_for_cpf is not None:
-                 del df_annotated_temp_for_cpf # Free memory
-
+    if args.annotated_dataset and df_annotated is not None: # Check if df_annotated exists
+        actual_cpf_col_annotated = find_column_case_insensitive(df_annotated.columns, cpf_col_target_name.lower())
+        if actual_cpf_col_annotated is None:
+                raise ValueError(f"Annotated dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive) after potential modifications.")
+        all_cpfs_list.append(df_annotated[actual_cpf_col_annotated]) # Append from existing df
+     
     combined_cpfs = pd.concat(all_cpfs_list, ignore_index=True)
     if len(combined_cpfs) != n_total_samples:
          raise ValueError(f"Length of combined CPFs ({len(combined_cpfs)}) does not match total samples ({n_total_samples}).")
