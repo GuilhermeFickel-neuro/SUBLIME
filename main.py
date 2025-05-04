@@ -1613,7 +1613,7 @@ class Experiment:
                                                 norm_embeddings = F.normalize(masked_val_embeddings, p=2, dim=1)
                                                 
                                                 # Decide on sampling strategy
-                                                num_pairs_to_sample = 1000
+                                                num_pairs_to_sample = 10000
                                                 compute_all_pairs = num_val_samples < 50 
                                                 
                                                 if compute_all_pairs:
@@ -1651,10 +1651,11 @@ class Experiment:
                                                 
                                                 # Calculate quantiles if we have distances
                                                 if len(pairwise_distances) > 0:
-                                                    quantiles = torch.tensor([0.1, 0.5], device=pairwise_distances.device)
+                                                    quantiles = torch.tensor([0.01, 0.1, 0.5], device=pairwise_distances.device)
                                                     distance_quantiles = torch.quantile(pairwise_distances, quantiles)
-                                                    q10 = distance_quantiles[0].item()
-                                                    q50 = distance_quantiles[1].item() # Median
+                                                    q01 = distance_quantiles[0].item()
+                                                    q10 = distance_quantiles[1].item()
+                                                    q50 = distance_quantiles[2].item() # Median
                                                     
                                                     if args.verbose:
                                                         if not validation_performed: tqdm.tqdm.write(f"--- Epoch {epoch} Validation (Phase {1 if is_embedding_phase else 3}) ---"); validation_performed = True
@@ -1662,6 +1663,7 @@ class Experiment:
                                                         tqdm.tqdm.write(f"  ArcFace Val Cosine Dist ({strategy_msg}): 10%={q10:.4f}, 50%={q50:.4f}")
                                                         # Log ArcFace validation distance quantiles
                                                         # wandb.log({'epoch': epoch, 'val/arcface_dist_q10': q10, 'val/arcface_dist_q50': q50}) # Old call
+                                                        val_log_dict['val/arcface_dist_q01'] = q01
                                                         val_log_dict['val/arcface_dist_q10'] = q10
                                                         val_log_dict['val/arcface_dist_q50'] = q50
                                                 else:
