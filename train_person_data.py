@@ -93,7 +93,6 @@ def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_co
     transformer_path = os.path.join(output_dir, 'data_transformer.joblib')
     preprocessor = None
 
-    # Separate numerical and categorical columns from the *main* dataframe
     # Assume the annotated dataframe has the same relevant columns for transformation
     categorical_cols = df_main.select_dtypes(include=['object', 'category']).columns.tolist()
     numerical_cols = df_main.select_dtypes(include=['int64', 'float64']).columns.tolist()
@@ -113,28 +112,100 @@ def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_co
         if joblib and os.path.exists(transformer_path):
             print(f"Loading transformer from {transformer_path}")
             preprocessor = joblib.load(transformer_path)
+
+            # --- Transform Data using Loaded Transformer ---
+            print("Transforming main data using loaded transformer...")
+            processed_main = preprocessor.transform(df_main)
+            print(f"Original main shape: {df_main.shape}")
+            print(f"Processed main shape: {processed_main.shape}")
+            ok, processed_main = _check_processed_data(processed_main, "Main Data (Loaded Transformer)")
+            if not ok:
+                raise ValueError("Preprocessing check failed for main data using loaded transformer.")
+
+            if df_annotated is not None:
+                print("Transforming annotated data using loaded transformer...")
+                # Ensure annotated data only has columns the transformer expects
+                # These are the columns used during fitting (numerical_cols + categorical_cols determined during fit)
+                # We need to get these columns from the loaded preprocessor
+                fit_cols = []
+                for name, _, cols in preprocessor.transformers_:
+                    if name != 'remainder': # Exclude remainder if it exists
+                       fit_cols.extend(cols)
+
+                # Select only the necessary columns from df_annotated
+                df_annotated_for_transform = df_annotated[fit_cols]
+
+                processed_annotated = preprocessor.transform(df_annotated_for_transform)
+                print(f"Original annotated shape: {df_annotated.shape}")
+                print(f"Processed annotated shape: {processed_annotated.shape}")
+                ok, processed_annotated = _check_processed_data(processed_annotated, "Annotated Data (Loaded Transformer)")
+                if not ok:
+                    raise ValueError("Preprocessing check failed for annotated data using loaded transformer.")
+
+                # Check feature dimensions match (should match if loaded correctly)
+                if processed_main.shape[1] != processed_annotated.shape[1]:
+                     raise ValueError(f"Feature dimension mismatch after processing with loaded transformer: "
+                                      f"Main data has {processed_main.shape[1]} features, "
+                                      f"Annotated data has {processed_annotated.shape[1]} features.")
+
         else:
-            print("Transformer not found. Fitting new transformer ON MAIN DATA...")
+            print("Transformer not found. Preparing data for fitting new transformer...")
+
+            # --- Prepare Data for Fitting --- #
+            # Columns to use for fitting are determined ONLY by df_main's structure
+            main_cols = df_main.columns.tolist()
+            cols_for_fitting = [col for col in main_cols if col != target_column]
+
+            # Create the dataframe to fit on
+            df_fit = df_main[cols_for_fitting].copy()
+            if df_annotated is not None:
+                # Select only columns present in df_main from df_annotated
+                annotated_cols_to_use = [col for col in cols_for_fitting if col in df_annotated.columns]
+                if len(annotated_cols_to_use) != len(cols_for_fitting):
+                    print("Warning: Not all columns from df_main used for fitting were found in df_annotated. Using available subset.")
+                    # Find missing columns for clarity
+                    missing_cols = list(set(cols_for_fitting) - set(annotated_cols_to_use))
+                    print(f"  Missing columns in annotated data: {missing_cols}")
+
+                # Concatenate using only the common columns found
+                df_annotated_subset = df_annotated[annotated_cols_to_use].copy()
+                df_fit = pd.concat([df_fit[annotated_cols_to_use], df_annotated_subset], ignore_index=True)
+                print(f"Concatenated main and annotated data (columns from main) for fitting. Fit data shape: {df_fit.shape}")
+            else:
+                print(f"Fitting transformer ONLY on main data. Fit data shape: {df_fit.shape}")
+
+            # --- Identify Column Types from the Combined Fitting Data --- #
+            numerical_cols_fit = df_fit.select_dtypes(include=np.number).columns.tolist()
+            categorical_cols_fit = df_fit.select_dtypes(include=['object', 'category']).columns.tolist()
+            print(f"Identified {len(numerical_cols_fit)} numerical and {len(categorical_cols_fit)} categorical columns from fitting data.")
+
+            # --- Create and Fit Preprocessor --- #
             # Create preprocessing pipelines
             numerical_pipeline = Pipeline([
-                ('imputer', SimpleImputer(strategy='median')),
+                ('imputer', SimpleImputer(strategy='median')), # Use median for numeric
                 ('scaler', MinMaxScaler(feature_range=(-1, 1)))
             ])
             categorical_pipeline = Pipeline([
-                ('imputer', SimpleImputer(strategy='most_frequent')),
+                ('imputer', SimpleImputer(strategy='most_frequent')), # Use most_frequent for categoric
                 ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
             ])
-            # Combine pipelines
+            # Combine pipelines using types identified from df_fit
             preprocessor = ColumnTransformer(
                 transformers=[
-                    ('num', numerical_pipeline, numerical_cols),
-                    ('cat', categorical_pipeline, categorical_cols)
+                    ('num', numerical_pipeline, numerical_cols_fit),
+                    ('cat', categorical_pipeline, categorical_cols_fit)
                 ],
-                remainder='drop' # Drop columns not specified (like target column if present)
+                remainder='drop' # Drop columns not specified
             )
-            # Fit ONLY on main data
-            preprocessor.fit(df_main)
+            # Fit on the combined data (or just main data if no annotated)
+            print("Fitting new transformer...")
+            preprocessor.fit(df_fit)
             print("Transformer fitted.")
+
+            # Clean up large intermediate dataframe
+            del df_fit
+            gc.collect()
+
             # Save the transformer
             if joblib:
                 print(f"Saving transformer to {transformer_path}")
@@ -142,31 +213,34 @@ def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_co
             else:
                 print("joblib not installed. Cannot save transformer.")
 
-        # --- Transform Main Data ---
-        print("Transforming main data...")
-        processed_main = preprocessor.transform(df_main)
-        print(f"Original main shape: {df_main.shape}")
-        print(f"Processed main shape: {processed_main.shape}")
-        ok, processed_main = _check_processed_data(processed_main, "Main Data")
-        if not ok:
-            raise ValueError("Preprocessing check failed for main data.")
-
-        # --- Transform Annotated Data (if provided) ---
-        if df_annotated is not None:
-            print("Transforming annotated data...")
-            processed_annotated = preprocessor.transform(df_annotated)
-            print(f"Original annotated shape: {df_annotated.shape}")
-            print(f"Processed annotated shape: {processed_annotated.shape}")
-            ok, processed_annotated = _check_processed_data(processed_annotated, "Annotated Data")
+            # --- Transform Data using Newly Fitted Transformer --- #
+            print("Transforming main data using newly fitted transformer...")
+            processed_main = preprocessor.transform(df_main)
+            print(f"Original main shape: {df_main.shape}")
+            print(f"Processed main shape: {processed_main.shape}")
+            ok, processed_main = _check_processed_data(processed_main, "Main Data (New Transformer)")
             if not ok:
-                raise ValueError("Preprocessing check failed for annotated data.")
+                raise ValueError("Preprocessing check failed for main data after fitting.")
 
-            # Check if feature dimensions match
-            if processed_main.shape[1] != processed_annotated.shape[1]:
-                 raise ValueError(f"Feature dimension mismatch after processing: "
-                                  f"Main data has {processed_main.shape[1]} features, "
-                                  f"Annotated data has {processed_annotated.shape[1]} features. "
-                                  "Ensure both datasets have compatible columns and the transformer is applied correctly.")
+            if df_annotated is not None:
+                print("Transforming annotated data using newly fitted transformer...")
+                # Select columns for transform based on what was fitted
+                fit_cols_new = numerical_cols_fit + categorical_cols_fit
+                df_annotated_for_transform = df_annotated[fit_cols_new]
+
+                processed_annotated = preprocessor.transform(df_annotated_for_transform)
+                print(f"Original annotated shape: {df_annotated.shape}")
+                print(f"Processed annotated shape: {processed_annotated.shape}")
+                ok, processed_annotated = _check_processed_data(processed_annotated, "Annotated Data (New Transformer)")
+                if not ok:
+                    raise ValueError("Preprocessing check failed for annotated data after fitting.")
+
+                # Check feature dimensions match
+                if processed_main.shape[1] != processed_annotated.shape[1]:
+                     raise ValueError(f"Feature dimension mismatch after processing: "
+                                      f"Main data has {processed_main.shape[1]} features, "
+                                      f"Annotated data has {processed_annotated.shape[1]} features. "
+                                      "Ensure both datasets have compatible columns and the transformer is applied correctly.")
 
     except Exception as e:
         print(f"Error during preprocessing: {e}")
