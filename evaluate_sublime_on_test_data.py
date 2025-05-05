@@ -26,6 +26,7 @@ import sys # Import sys for sys.exit
 # Add necessary imports from main and model/graph_learner
 from main import Experiment, GCL, FGP_learner, MLP_learner, ATT_learner, GNN_learner, normalize, symmetrize, sparse_mx_to_torch_sparse_tensor, torch_sparse_to_dgl_graph, dgl_graph_to_torch_sparse
 import dgl # Make sure dgl is imported
+from sklearn.linear_model import LogisticRegression # Add this import
 
 # Define coerce_numeric at the top level
 def coerce_numeric(df_):
@@ -982,7 +983,7 @@ class FeatureEngineer:
         return knn_features_array
 
     def create_all_feature_sets(self, split_data):
-        """Creates 'dataset', 'concat', and 'knn_kX' feature sets for train/val/test."""
+        """Creates 'dataset', 'sublime', 'concat', and 'knn_kX' feature sets for train/val/test."""
         feature_sets = {}
         y_train = split_data['y_train']
         y_train_val = split_data['y_train_val']
@@ -998,32 +999,59 @@ class FeatureEngineer:
             print(f"Dataset features shapes: Train={feature_sets['dataset']['train'].shape}, Val={feature_sets['dataset']['val'].shape}, Test={feature_sets['dataset']['test'].shape}")
         else:
              print("Warning: Dataset features not found in split_data. Skipping 'dataset' feature set.")
-             # Create empty placeholders if needed downstream? Or raise error? For now, just skip.
+
+        # --- Base: SUBLIME Embeddings Only ---
+        if 'sublime_train' in split_data:
+            feature_sets['sublime'] = {
+                'train': split_data['sublime_train'],
+                'val': split_data['sublime_val'],
+                'test': split_data['sublime_test'],
+                'train_val': split_data['sublime_train_val']
+            }
+            print(f"SUBLIME features shapes: Train={feature_sets['sublime']['train'].shape}, Val={feature_sets['sublime']['val'].shape}, Test={feature_sets['sublime']['test'].shape}")
+        else:
+            print("Warning: Sublime embeddings not found in split_data. Skipping 'sublime' feature set.")
+
 
         # --- Concatenated Features ---
-        if 'sublime_train' in split_data and 'dataset' in feature_sets:
+        # Ensure 'dataset' and 'sublime' sets exist before creating 'concat'
+        if 'dataset' in feature_sets and 'sublime' in feature_sets:
             try:
-                # Base concatenation
-                concat_train = np.hstack((feature_sets['dataset']['train'], split_data['sublime_train']))
-                concat_val = np.hstack((feature_sets['dataset']['val'], split_data['sublime_val']))
-                concat_test = np.hstack((feature_sets['dataset']['test'], split_data['sublime_test']))
-                concat_train_val = np.hstack((feature_sets['dataset']['train_val'], split_data['sublime_train_val']))
+                # Base concatenation using the newly created 'dataset' and 'sublime' sets
+                concat_train = np.hstack((feature_sets['dataset']['train'], feature_sets['sublime']['train']))
+                concat_val = np.hstack((feature_sets['dataset']['val'], feature_sets['sublime']['val']))
+                concat_test = np.hstack((feature_sets['dataset']['test'], feature_sets['sublime']['test']))
+                concat_train_val = np.hstack((feature_sets['dataset']['train_val'], feature_sets['sublime']['train_val']))
 
                 # Add classification probabilities if available
                 if 'cls_probs_train' in split_data:
                      print("Adding SUBLIME classification probability feature.")
-                     concat_train = np.hstack((concat_train, split_data['cls_probs_train'].reshape(-1, 1)))
-                     concat_val = np.hstack((concat_val, split_data['cls_probs_val'].reshape(-1, 1)))
-                     concat_train_val = np.hstack((concat_train_val, split_data['cls_probs_train_val'].reshape(-1, 1)))
+                     # Ensure shapes match before hstack
+                     cls_prob_train = split_data['cls_probs_train'].reshape(-1, 1)
+                     cls_prob_val = split_data['cls_probs_val'].reshape(-1, 1)
+                     cls_prob_train_val = split_data['cls_probs_train_val'].reshape(-1, 1)
+
+                     if cls_prob_train.shape[0] == concat_train.shape[0]:
+                         concat_train = np.hstack((concat_train, cls_prob_train))
+                     if cls_prob_val.shape[0] == concat_val.shape[0]:
+                         concat_val = np.hstack((concat_val, cls_prob_val))
+                     if cls_prob_train_val.shape[0] == concat_train_val.shape[0]:
+                         concat_train_val = np.hstack((concat_train_val, cls_prob_train_val))
+
                      # Add for test if available
                      if 'cls_probs_test' in split_data:
-                          concat_test = np.hstack((concat_test, split_data['cls_probs_test'].reshape(-1, 1)))
+                          cls_prob_test = split_data['cls_probs_test'].reshape(-1, 1)
+                          if cls_prob_test.shape[0] == concat_test.shape[0]:
+                              concat_test = np.hstack((concat_test, cls_prob_test))
+                          else: # Impute test if shapes mismatch or missing
+                               print("Warning: Test classification probabilities shape mismatch or missing for concatenation. Filling with 0.5.")
+                               prob_col = np.full((concat_test.shape[0], 1), 0.5)
+                               concat_test = np.hstack((concat_test, prob_col))
                      else:
-                          # If test probs missing, impute with 0.5
+                          # If test probs missing entirely
                           print("Warning: Test classification probabilities missing for concatenation. Filling with 0.5.")
-                          # nan_col = np.full((concat_test.shape[0], 1), np.nan) # Old line
-                          prob_col = np.full((concat_test.shape[0], 1), 0.5) # New line
-                          concat_test = np.hstack((concat_test, prob_col)) # Use prob_col
+                          prob_col = np.full((concat_test.shape[0], 1), 0.5)
+                          concat_test = np.hstack((concat_test, prob_col))
 
                 feature_sets['concat'] = {
                      'train': concat_train, 'val': concat_val, 'test': concat_test, 'train_val': concat_train_val
@@ -1032,33 +1060,31 @@ class FeatureEngineer:
 
             except ValueError as e:
                  print(f"Error during feature concatenation: {e}. Check shapes:")
-                 print(f"  Dataset train: {feature_sets['dataset']['train'].shape}")
-                 print(f"  Sublime train: {split_data['sublime_train'].shape}")
+                 print(f"  Dataset train: {feature_sets.get('dataset', {}).get('train', np.array([])).shape}")
+                 print(f"  Sublime train: {feature_sets.get('sublime', {}).get('train', np.array([])).shape}")
                  if 'cls_probs_train' in split_data: print(f"  ClsProb train: {split_data['cls_probs_train'].shape}")
                  # Skip concat if failed
                  if 'concat' in feature_sets: del feature_sets['concat']
             except Exception as e:
                  print(f"Unexpected error during concatenation: {e}")
                  if 'concat' in feature_sets: del feature_sets['concat']
-        elif 'sublime_train' not in split_data:
-             print("Warning: Sublime embeddings not found in split_data. Skipping 'concat' and 'knn' feature sets.")
+        elif 'sublime' not in feature_sets:
+             print("Warning: Sublime embeddings missing. Skipping 'concat' and 'knn' feature sets.")
         elif 'dataset' not in feature_sets:
              print("Warning: Base 'dataset' features missing. Skipping 'concat' and 'knn' feature sets.")
 
 
         # --- KNN Features ---
+        # Ensure 'concat' exists before creating KNN features
         if 'concat' in feature_sets and self.config.active_k_values:
+            # Use the 'sublime' features from split_data directly for KNN calculation
             sublime_train = split_data['sublime_train']
             sublime_val = split_data['sublime_val']
             sublime_test = split_data['sublime_test']
             sublime_train_val = split_data['sublime_train_val']
-            
-            # Embeddings are already normalized by SublimeHandler. No need to re-normalize here.
-            # sublime_train = sublime_train / np.linalg.norm(sublime_train, axis=1, keepdims=True)
-            # sublime_val = sublime_val / np.linalg.norm(sublime_val, axis=1, keepdims=True)
-            # sublime_test = sublime_test / np.linalg.norm(sublime_test, axis=1, keepdims=True)
-            # sublime_train_val = sublime_train_val / np.linalg.norm(sublime_train_val, axis=1, keepdims=True)
-            
+
+            # Embeddings should already be normalized by SublimeHandler
+
             for k in self.config.active_k_values:
                 print(f"Calculating KNN features for k={k}...")
                 knn_key = f'knn_k{k}'
@@ -1068,7 +1094,7 @@ class FeatureEngineer:
                     knn_feat_val = self._calculate_knn_features_single(sublime_val, sublime_train, y_train, k, query_is_index=False)
                     # Use train+val as the index for test set KNN features
                     knn_feat_test = self._calculate_knn_features_single(sublime_test, sublime_train_val, y_train_val, k, query_is_index=False)
-                    
+
                     # Combine train and val KNN features for the final training step
                     knn_feat_train_val = np.vstack((knn_feat_train, knn_feat_val))
 
@@ -1084,19 +1110,23 @@ class FeatureEngineer:
                     print(f"Error calculating or combining KNN features for k={k}: {e}")
                     # Ensure partial results for this k are removed if error occurs
                     if knn_key in feature_sets: del feature_sets[knn_key]
-                    
+
         elif not self.config.active_k_values:
              print("No valid k values provided. Skipping KNN feature generation.")
+        elif 'concat' not in feature_sets:
+             print("Warning: 'concat' feature set missing. Skipping KNN feature generation.")
+
 
         return feature_sets
 
 # --- Evaluation Class ---
 class Evaluator:
-    """Runs Optuna optimization, trains final models, and evaluates performance."""
+    """Runs Optuna optimization, trains final models, evaluates performance, and runs stacking."""
     def __init__(self, config):
         self.config = config
         self.results = {} # {model_name: {feature_set: {metric: val, ...}}}
         self.best_params = {} # {model_name: {feature_set: {param: val, ...}}}
+        self.stacking_results = {} # Store stacking results separately
         self.model_configs = {
             'xgboost': {
                 'class': XGBClassifier,
@@ -1216,6 +1246,22 @@ class Evaluator:
         print("Running model evaluation loop...")
         labels = {split: split_data[f'y_{split}'] for split in ['train', 'val', 'test', 'train_val']}
 
+        # Make sure 'sublime' feature set exists if embeddings are available
+        if 'sublime' not in feature_sets and 'sublime_train' in split_data:
+            print("Warning: 'sublime' feature set missing from FeatureEngineer output but data exists.")
+            # Attempt to add it manually, though it should be there
+            feature_sets['sublime'] = {
+                'train': split_data['sublime_train'],
+                'val': split_data['sublime_val'],
+                'test': split_data['sublime_test'],
+                'train_val': split_data['sublime_train_val']
+            }
+
+        # Ensure feature_sets isn't empty before proceeding
+        if not feature_sets:
+            print("Error: No feature sets available to evaluate. Aborting.")
+            return # Exit evaluation if no features
+
         for model_name, config in self.model_configs.items():
             print(f"{'='*50}\n{model_name.upper()} Models\n{'='*50}")
             self.results[model_name] = {}
@@ -1224,17 +1270,36 @@ class Evaluator:
             base_params = config['base_params']
             trial_params = config['trial_params']
 
+            # Now includes 'sublime' if available
             for feature_set_name, features in feature_sets.items():
                 print(f"--- Evaluating Feature Set: {feature_set_name} ---")
+
+                # Handle potential missing splits within a feature set gracefully
+                required_splits = ['train', 'val', 'test', 'train_val']
+                if not all(s in features for s in required_splits):
+                    print(f"Warning: Feature set '{feature_set_name}' is missing required data splits. Skipping evaluation for this set.")
+                    continue
+                if not all(l in labels for l in required_splits):
+                     print(f"Warning: Labels are missing required data splits. Skipping evaluation for this set.")
+                     continue
+
+
                 X_train, X_val, X_test, X_train_val = features['train'], features['val'], features['test'], features['train_val']
                 y_train, y_val, y_test, y_train_val = labels['train'], labels['val'], labels['test'], labels['train_val']
+
+                # Check for empty arrays before proceeding
+                if X_train.shape[0] == 0 or X_val.shape[0] == 0:
+                    print(f"Warning: Empty train ({X_train.shape}) or validation ({X_val.shape}) features for {model_name} - {feature_set_name}. Skipping Optuna.")
+                    self.results[model_name][feature_set_name] = {'error': 'Empty train/val features'}
+                    continue
+
 
                 # --- Optuna Optimization ---
                 print(f"Optimizing {model_name.upper()} for {feature_set_name} features...")
                 try:
                     objective_func = self._create_objective(model_class, X_train, y_train, X_val, y_val, base_params, trial_params)
                     study = optuna.create_study(direction='maximize', pruner=optuna.pruners.MedianPruner())
-                    study.optimize(objective_func, n_trials=self.config.n_trials, n_jobs=1, show_progress_bar=True) # Use n_jobs=1 for safer debugging/logging
+                    study.optimize(objective_func, n_trials=self.config.n_trials, n_jobs=1, show_progress_bar=True)
                     best_trial_params = study.best_params
                     self.best_params[model_name][feature_set_name] = best_trial_params
                     best_val_auc = study.best_value
@@ -1243,7 +1308,7 @@ class Evaluator:
                 except Exception as e:
                     print(f"ERROR during Optuna optimization for {model_name} - {feature_set_name}: {e}")
                     print("Skipping evaluation for this combination.")
-                    self.results[model_name][feature_set_name] = {'error': str(e)} # Store error marker
+                    self.results[model_name][feature_set_name] = {'error': str(e)}
                     continue # Skip to next feature set
 
                 # --- Final Model Training & Testing ---
@@ -1251,10 +1316,13 @@ class Evaluator:
                 final_params = {**base_params, **best_trial_params}
                 final_model = model_class(**final_params)
                 try:
-                    # Some models might benefit from fitting on train+val with early stopping against test?
-                    # Standard practice is train on train+val without early stopping using best params.
+                    # Check for empty train_val data
+                    if X_train_val.shape[0] == 0 or X_test.shape[0] == 0:
+                         print(f"Warning: Empty train_val ({X_train_val.shape}) or test ({X_test.shape}) features for {model_name} - {feature_set_name}. Skipping final training/testing.")
+                         self.results[model_name][feature_set_name] = {'error': 'Empty train_val/test features'}
+                         continue
+
                     if isinstance(final_model, (CatBoostClassifier, LGBMClassifier)):
-                         # No eval set needed here, just fit on combined data
                          final_model.fit(X_train_val, y_train_val)
                     else: # XGBoost, others
                          final_model.fit(X_train_val, y_train_val)
@@ -1279,14 +1347,144 @@ class Evaluator:
                     }
                 except Exception as e:
                     print(f"ERROR during final model training/testing for {model_name} - {feature_set_name}: {e}")
-                    self.results[model_name][feature_set_name] = {'error': str(e)} # Store error marker
-                    # Don't store best_params if final training failed? Or keep them? Keep for now.
+                    self.results[model_name][feature_set_name] = {'error': str(e)}
+
+    def run_stacking_evaluation(self, feature_sets, split_data):
+        """Trains base models and a meta-model for stacking."""
+        print(f"\n{'='*50}\nSTACKING EVALUATION\n{'='*50}")
+
+        # --- Configuration ---
+        # Define which models and feature sets to use as base learners
+        # Example: Use best XGBoost on 'dataset' and best LightGBM on 'sublime'
+        base_model_configs = [
+            {'model_name': 'xgboost', 'feature_set': 'dataset'},
+            {'model_name': 'lightgbm', 'feature_set': 'sublime'} # Use 'sublime' set now
+        ]
+        meta_model_class = LogisticRegression
+        meta_model_params = {'random_state': 42, 'solver': 'liblinear'} # Simple params
+
+        # --- Check Availability ---
+        oof_preds_list = []
+        test_preds_list = []
+        labels = {split: split_data[f'y_{split}'] for split in ['train', 'val', 'test', 'train_val']}
+        y_val = labels['val']
+        y_test = labels['test']
+
+        print("Preparing base models for stacking...")
+        for config in base_model_configs:
+            model_name = config['model_name']
+            feature_set = config['feature_set']
+            print(f"  Base Model: {model_name.upper()} on Feature Set: {feature_set}")
+
+            # Check if features and results exist
+            if feature_set not in feature_sets:
+                print(f"    ERROR: Feature set '{feature_set}' not found. Skipping this base model.")
+                continue
+            if model_name not in self.best_params or feature_set not in self.best_params[model_name]:
+                print(f"    ERROR: Best parameters for {model_name}-{feature_set} not found (likely failed during optimization). Skipping this base model.")
+                continue
+            if 'train' not in feature_sets[feature_set] or 'val' not in feature_sets[feature_set] or 'test' not in feature_sets[feature_set] or 'train_val' not in feature_sets[feature_set]:
+                 print(f"    ERROR: Missing data splits for feature set '{feature_set}'. Skipping this base model.")
+                 continue
+
+
+            # Get features
+            X_train = feature_sets[feature_set]['train']
+            X_val = feature_sets[feature_set]['val']
+            X_test = feature_sets[feature_set]['test']
+            X_train_val = feature_sets[feature_set]['train_val'] # For final prediction on test
+            y_train = labels['train']
+            y_train_val = labels['train_val']
+
+            # Get model class and best params
+            model_class = self.model_configs[model_name]['class']
+            base_params = self.model_configs[model_name]['base_params']
+            best_trial_params = self.best_params[model_name][feature_set]
+            final_params = {**base_params, **best_trial_params}
+
+            try:
+                # --- Generate Validation (OOF) Predictions ---
+                print(f"    Training {model_name}-{feature_set} on train split for validation predictions...")
+                model_for_oof = model_class(**final_params)
+                if isinstance(model_for_oof, (CatBoostClassifier, LGBMClassifier)):
+                    model_for_oof.fit(X_train, y_train)
+                else: # XGBoost, others
+                    model_for_oof.fit(X_train, y_train)
+                oof_preds = model_for_oof.predict_proba(X_val)[:, 1]
+                oof_preds_list.append(oof_preds)
+                print(f"    Generated validation predictions. Shape: {oof_preds.shape}")
+
+                # --- Generate Test Predictions ---
+                print(f"    Training {model_name}-{feature_set} on train+val split for test predictions...")
+                model_for_test = model_class(**final_params)
+                if isinstance(model_for_test, (CatBoostClassifier, LGBMClassifier)):
+                    model_for_test.fit(X_train_val, y_train_val)
+                else: # XGBoost, others
+                    model_for_test.fit(X_train_val, y_train_val)
+                test_preds = model_for_test.predict_proba(X_test)[:, 1]
+                test_preds_list.append(test_preds)
+                print(f"    Generated test predictions. Shape: {test_preds.shape}")
+
+            except Exception as e:
+                print(f"    ERROR training or predicting base model {model_name}-{feature_set}: {e}")
+                # Need to handle this - maybe remove the partial predictions?
+                # For simplicity, let's just skip this base model if it fails.
+                # Ensure lists are consistent if a model fails mid-way
+                if len(oof_preds_list) > len(test_preds_list): oof_preds_list.pop()
+                if len(test_preds_list) > len(oof_preds_list): test_preds_list.pop()
+                continue
+
+        # --- Train Meta-Model ---
+        if len(oof_preds_list) < 2: # Need at least two base models for stacking
+            print("\nERROR: Not enough successful base models (< 2) to perform stacking. Aborting stacking evaluation.")
+            self.stacking_results = {'error': 'Insufficient base models'}
+            return
+
+        print("\nTraining meta-model...")
+        try:
+            meta_X_train = np.column_stack(oof_preds_list)
+            meta_X_test = np.column_stack(test_preds_list)
+
+            print(f"  Meta-model input shape (validation set): {meta_X_train.shape}")
+            print(f"  Meta-model input shape (test set): {meta_X_test.shape}")
+
+            meta_model = meta_model_class(**meta_model_params)
+            meta_model.fit(meta_X_train, y_val)
+            print("  Meta-model trained.")
+
+            # --- Evaluate Meta-Model ---
+            print("Evaluating stacked model on test data...")
+            final_preds_proba = meta_model.predict_proba(meta_X_test)[:, 1]
+            final_preds = (final_preds_proba >= 0.5).astype(int) # Standard threshold
+
+            acc_stack = accuracy_score(y_test, final_preds)
+            auc_stack = roc_auc_score(y_test, final_preds_proba)
+            fpr_stack, tpr_stack, _ = roc_curve(y_test, final_preds_proba)
+            ks_stack = np.max(tpr_stack - fpr_stack) if len(tpr_stack) > 0 and len(fpr_stack) > 0 else 0.0
+
+            print(f"STACKING MODEL - Test AUC: {auc_stack:.4f}, KS: {ks_stack:.4f}")
+            print("Test Set Classification Report (Stacked Model):")
+            print(classification_report(y_test, final_preds))
+
+            self.stacking_results = {
+                'acc': acc_stack, 'auc': auc_stack, 'ks': ks_stack,
+                'fpr': fpr_stack, 'tpr': tpr_stack,
+                'base_model_configs': base_model_configs # Store config for reference
+            }
+
+        except Exception as e:
+            print(f"ERROR during meta-model training or evaluation: {e}")
+            self.stacking_results = {'error': str(e)}
+
 
     def get_results(self):
         return self.results
 
     def get_best_params(self):
         return self.best_params
+
+    def get_stacking_results(self):
+        return self.stacking_results
 
 # --- Reporting Class ---
 class Reporter:
@@ -1313,14 +1511,15 @@ class Reporter:
         else:
             return [] # Unknown feature set
 
-    def generate_roc_plots(self, eval_results):
-        """Generates and saves ROC curve plots for each model."""
+    def generate_roc_plots(self, eval_results, stacking_results=None): # Add stacking_results parameter
+        """Generates and saves ROC curve plots for each model, including stacking."""
         print("Generating ROC plots...")
         for model_name, model_type_results in eval_results.items():
             plt.figure(figsize=(10, 8))
             has_plot_data = False
             # Sort keys for consistent plot legend order
-            sorted_feature_keys = sorted(model_type_results.keys(), key=lambda k: (k.startswith('knn'), k))
+            # Ensure 'sublime' is also included in sorting logic if present
+            sorted_feature_keys = sorted(model_type_results.keys(), key=lambda k: (k.startswith('knn'), k == 'concat', k == 'sublime', k))
 
             for feature_key in sorted_feature_keys:
                  data = model_type_results[feature_key]
@@ -1329,21 +1528,41 @@ class Reporter:
                      if feature_key.startswith('knn_k'): label = f"KNN (k={feature_key.split('knn_k')[1]})"
                      elif feature_key == 'concat': label = "Dataset + SUBLIME" + (" + ClsProb" if 'cls_probs_train' in self.config.__dict__ else "") # Rough check
                      elif feature_key == 'dataset': label = "Dataset Features"
+                     elif feature_key == 'sublime': label = "SUBLIME Features" # Label for sublime only
 
                      plt.plot(data['fpr'], data['tpr'], lw=2,
                               label=f'{label} (AUC = {data["auc"]:.4f}, KS = {data["ks"]:.4f})')
                      has_plot_data = True
                  else:
-                     print(f"Skipping ROC plot for {model_name} - {feature_key} due to missing data.")
+                     # print(f"Skipping ROC plot for {model_name} - {feature_key} due to missing data.") # Less verbose
+                     pass
+
+            # Add Stacking results to the plot of the *first* base model (e.g., xgboost) for simplicity
+            # Or create a separate stacking plot? Let's add to first plot.
+            if model_name == list(eval_results.keys())[0] and stacking_results and 'fpr' in stacking_results:
+                 plt.plot(stacking_results['fpr'], stacking_results['tpr'], lw=2.5, linestyle='--', color='black',
+                          label=f'Stacking Model (AUC = {stacking_results["auc"]:.4f}, KS = {stacking_results["ks"]:.4f})')
+                 has_plot_data = True
+
 
             if has_plot_data:
                  plt.plot([0, 1], [0, 1], 'k--', lw=1)
                  plt.xlabel('False Positive Rate')
                  plt.ylabel('True Positive Rate')
-                 plt.title(f'ROC Curves on Test Set - {self.config.dataset_name} - {model_name.upper()}')
+                 # Adjust title if stacking included
+                 plot_title = f'ROC Curves on Test Set - {self.config.dataset_name} - {model_name.upper()}'
+                 if model_name == list(eval_results.keys())[0] and stacking_results and 'fpr' in stacking_results:
+                     plot_title += " (+ Stacking)"
+
+                 plt.title(plot_title)
                  plt.legend(loc='lower right')
                  plt.grid(alpha=0.4)
-                 plot_path = os.path.join(self.config.plots_dir, f"{self.config.dataset_name}_{model_name}_test_roc_curves_k_{self.config.k_str}.png")
+                 plot_filename = f"{self.config.dataset_name}_{model_name}_test_roc_curves_k_{self.config.k_str}.png"
+                 # Modify filename if stacking is included on this plot
+                 if model_name == list(eval_results.keys())[0] and stacking_results and 'fpr' in stacking_results:
+                      plot_filename = plot_filename.replace('.png', '_with_stacking.png')
+
+                 plot_path = os.path.join(self.config.plots_dir, plot_filename)
                  plt.savefig(plot_path)
                  print(f"Saved ROC plot: {plot_path}")
             else:
@@ -1399,36 +1618,46 @@ class Reporter:
                  # print(f"Saved importance plot: {plot_path}") # Can be verbose
                  plt.close()
 
-    def save_results_summary(self, eval_results):
-        """Compiles and saves the summary metrics to a CSV file."""
+    def save_results_summary(self, eval_results, stacking_results=None): # Add stacking_results
+        """Compiles and saves the summary metrics to a CSV file, including stacking."""
         print("Saving results summary...")
         summary_list = []
         for model_name, model_type_results in eval_results.items():
-            # Ensure base 'dataset' results exist before processing this model
+            # Check required base metrics first
             base_metrics = model_type_results.get('dataset', {})
-            if not base_metrics or 'error' in base_metrics:
-                print(f"Warning: Base 'dataset' results missing or invalid for {model_name}. Skipping.")
-                continue
+            sublime_metrics = model_type_results.get('sublime', {}) # Get sublime-only results
+            concat_metrics = model_type_results.get('concat', {})
 
             result_row = {
                 'dataset': self.config.dataset_name,
                 'model': model_name,
-                'k_values_used': '_'.join(map(str, self.config.active_k_values)),
+                'k_values_used': '_'.join(map(str, self.config.active_k_values)) if self.config.active_k_values else 'none',
+            }
+
+            # Add Dataset metrics
+            if 'error' in base_metrics: base_metrics = {}
+            result_row.update({
                 'dataset_acc': base_metrics.get('acc'),
                 'dataset_auc': base_metrics.get('auc'),
                 'dataset_ks': base_metrics.get('ks'),
-            }
+            })
 
-            # Add concat metrics
-            concat_metrics = model_type_results.get('concat', {})
-            if 'error' in concat_metrics: concat_metrics = {} # Treat error as missing
+            # Add SUBLIME-only metrics
+            if 'error' in sublime_metrics: sublime_metrics = {}
+            result_row.update({
+                'sublime_acc': sublime_metrics.get('acc'),
+                'sublime_auc': sublime_metrics.get('auc'),
+                'sublime_ks': sublime_metrics.get('ks'),
+            })
+
+            # Add Concat metrics
+            if 'error' in concat_metrics: concat_metrics = {}
             result_row.update({
                 'concat_acc': concat_metrics.get('acc'),
                 'concat_auc': concat_metrics.get('auc'),
                 'concat_ks': concat_metrics.get('ks'),
-                'concat_vs_dataset_improvement_auc': (concat_metrics.get('auc') - base_metrics.get('auc')) if concat_metrics.get('auc') is not None and base_metrics.get('auc') is not None else np.nan,
-                # Add other improvement metrics similarly if needed (acc, ks)
             })
+            # Removed concat_vs_dataset_improvement_auc and similar lines as they can be calculated later
 
             # Add KNN metrics
             for k in self.config.active_k_values:
@@ -1437,29 +1666,59 @@ class Reporter:
                 knn_metrics = model_type_results.get(knn_key, {})
                 if 'error' in knn_metrics: knn_metrics = {} # Treat error as missing
 
-                base_auc = base_metrics.get('auc')
-                concat_auc = concat_metrics.get('auc')
-                knn_auc = knn_metrics.get('auc')
-
                 result_row.update({
                     f'{metric_prefix}_acc': knn_metrics.get('acc'),
-                    f'{metric_prefix}_auc': knn_auc,
+                    f'{metric_prefix}_auc': knn_metrics.get('auc'),
                     f'{metric_prefix}_ks': knn_metrics.get('ks'),
-                    f'{metric_prefix}_vs_dataset_improvement_auc': (knn_auc - base_auc) if knn_auc is not None and base_auc is not None else np.nan,
-                    f'{metric_prefix}_vs_concat_improvement_auc': (knn_auc - concat_auc) if knn_auc is not None and concat_auc is not None else np.nan,
-                     # Add other improvement metrics similarly if needed (acc, ks)
                 })
+                # Removed knn_vs_dataset/concat improvement calculations
 
             summary_list.append(result_row)
+
+        # Add Stacking results as a separate row (or column?) Let's do a row.
+        if stacking_results and 'error' not in stacking_results:
+             stacking_row = {
+                 'dataset': self.config.dataset_name,
+                 'model': 'Stacking', # Special model name
+                 'k_values_used': '_'.join(map(str, self.config.active_k_values)) if self.config.active_k_values else 'none',
+                 # Add metrics, leaving others blank
+                 'stacking_acc': stacking_results.get('acc'),
+                 'stacking_auc': stacking_results.get('auc'),
+                 'stacking_ks': stacking_results.get('ks'),
+             }
+             # Optionally detail which base models were used
+             base_info = " | ".join([f"{c['model_name']}-{c['feature_set']}" for c in stacking_results.get('base_model_configs', [])])
+             stacking_row['stacking_base_models'] = base_info
+             summary_list.append(stacking_row)
+        elif stacking_results and 'error' in stacking_results:
+             summary_list.append({
+                 'dataset': self.config.dataset_name, 'model': 'Stacking', 'error': stacking_results['error']
+             })
+
 
         if not summary_list:
             print("No valid results to save in summary.")
             return
 
         results_df = pd.DataFrame(summary_list)
+        # Define columns explicitly for consistent order, adding new ones
+        base_cols = ['dataset', 'model', 'k_values_used']
+        dataset_cols = ['dataset_acc', 'dataset_auc', 'dataset_ks']
+        sublime_cols = ['sublime_acc', 'sublime_auc', 'sublime_ks']
+        concat_cols = ['concat_acc', 'concat_auc', 'concat_ks']
+        knn_cols = []
+        for k in self.config.active_k_values:
+            knn_cols.extend([f'knn_k{k}_acc', f'knn_k{k}_auc', f'knn_k{k}_ks'])
+        stacking_cols = ['stacking_acc', 'stacking_auc', 'stacking_ks', 'stacking_base_models', 'error']
+
+        all_cols_ordered = base_cols + dataset_cols + sublime_cols + concat_cols + knn_cols + stacking_cols
+        # Filter cols to only those present in the dataframe
+        final_cols = [col for col in all_cols_ordered if col in results_df.columns]
+
+
         results_filename = f"{self.config.dataset_name}_all_models_test_results_k_{self.config.k_str}.csv"
         results_path = os.path.join(self.config.output_dir, results_filename)
-        results_df.to_csv(results_path, index=False)
+        results_df[final_cols].to_csv(results_path, index=False, float_format='%.4f') # Use float format
         print(f"Test results summary saved to {results_path}")
 
     def save_best_params(self, best_params):
@@ -1480,114 +1739,93 @@ class Reporter:
             params_df.to_csv(params_path, index=False)
         print(f"Best parameters saved to {self.config.output_dir}")
 
-    def print_final_summary(self, eval_results):
-        """Prints a summary of the best performing models to the console."""
+    def print_final_summary(self, eval_results, stacking_results=None): # Add stacking_results
+        """Prints a summary of the best performing models to the console, including stacking."""
         print("" + "="*80)
         print("EVALUATION SUMMARY")
         print("="*80)
         print(f"Dataset: {self.config.dataset_name}")
 
-        best_overall_auc_improvement = -float('inf')
-        best_model_name_auc = 'N/A'
-        best_feature_key_auc = 'N/A'
-        best_model_auc = 0
-        best_base_auc = 0
-
-        best_overall_ks = -1.0
-        best_model_name_ks = 'N/A'
-        best_feature_key_ks = 'N/A'
-        best_base_ks = -1.0
-        best_base_ks_model = 'N/A'
-
-        for model_name, model_type_results in eval_results.items():
-            base_metrics = model_type_results.get('dataset', {})
-            current_base_auc = base_metrics.get('auc')
-            current_base_ks = base_metrics.get('ks')
-
-            if current_base_ks is not None and current_base_ks > best_base_ks:
-                 best_base_ks = current_base_ks
-                 best_base_ks_model = model_name
-
-            if current_base_auc is None: continue # Cannot compare if base failed
-
-            for feature_key, data in model_type_results.items():
-                 current_auc = data.get('auc')
-                 current_ks = data.get('ks')
-
-                 # Check AUC improvement
-                 if current_auc is not None:
-                      improvement = current_auc - current_base_auc
-                      if improvement > best_overall_auc_improvement:
-                          best_overall_auc_improvement = improvement
-                          best_model_name_auc = model_name
-                          best_feature_key_auc = feature_key
-                          best_model_auc = current_auc
-                          best_base_auc = current_base_auc # Store base AUC of the best improved model
-
-                 # Check overall best KS
-                 if feature_key != 'dataset' and current_ks is not None:
-                      if current_ks > best_overall_ks:
-                           best_overall_ks = current_ks
-                           best_model_name_ks = model_name
-                           best_feature_key_ks = feature_key
-
-        # --- AUC Summary ---
-        print("Best Performing Model Setup (Based on AUC Improvement vs. Dataset Features):")
-        if best_model_name_auc != 'N/A':
-            print(f"  Best Model Type: {best_model_name_auc.upper()}")
-            print(f"  Best Feature Set: {best_feature_key_auc}")
-            print(f"  Test AUC: {best_model_auc:.4f}")
-            print(f"  Improvement vs Dataset AUC ({best_base_auc:.4f}): {best_overall_auc_improvement:.4f}")
-            # Add comparison vs concat if KNN was best
-            if best_feature_key_auc.startswith('knn_k'):
-                 concat_auc = eval_results.get(best_model_name_auc, {}).get('concat', {}).get('auc')
-                 if concat_auc is not None:
-                     knn_vs_concat_improvement = best_model_auc - concat_auc
-                     print(f"  Improvement vs Concat AUC ({concat_auc:.4f}): {knn_vs_concat_improvement:.4f}")
-                 else:
-                     print("  Improvement vs Concat AUC: N/A (concat results missing)")
-        else:
-            print("  No improvement found over dataset features for any setup.")
-
-        # --- KS Summary ---
-        print("Overall KS Performance Comparison (Across All Models):")
-        if best_base_ks >= 0:
-            print(f"Best KS using Dataset Features Only:      {best_base_ks:.4f} (Model: {best_base_ks_model.upper()})")
-        else:
-            print("Best KS using Dataset Features Only:      N/A")
-
-        if best_overall_ks >= 0:
-            print(f"Best KS using Enhanced Features:          {best_overall_ks:.4f} (Model: {best_model_name_ks.upper()}, Features: {best_feature_key_ks})")
-            if best_base_ks >= 0:
-                ks_improvement = best_overall_ks - best_base_ks
-                print(f"Improvement in KS vs. Best Dataset Only:  {ks_improvement:.4f}")
-            else:
-                print("Improvement in KS vs. Best Dataset Only:  N/A")
-        else:
-            print("Best KS using Enhanced Features:          N/A")
-        print("="*80)
-
         # --- Detailed Per-Setup Summary ---
         print("Detailed Results per Setup:")
+        all_results_for_comparison = [] # Collect tuples (model, feature_set, auc, ks)
         for model_name, model_type_results in eval_results.items():
             print(f"--- {model_name.upper()} ---")
-            sorted_keys = sorted(model_type_results.keys(), key=lambda k: (k.startswith('knn'), k))
+            # Add 'sublime' to sorting logic
+            sorted_keys = sorted(model_type_results.keys(), key=lambda k: (k.startswith('knn'), k == 'concat', k == 'sublime', k))
             for feature_key in sorted_keys:
                 data = model_type_results[feature_key]
                 label = feature_key.replace('_', ' ').title()
                 if feature_key.startswith('knn_k'): label = f"KNN (k={feature_key.split('knn_k')[1]})"
                 elif feature_key == 'concat': label = "Dataset + SUBLIME" # Simplified label
                 elif feature_key == 'dataset': label = "Dataset Features"
-                
+                elif feature_key == 'sublime': label = "SUBLIME Features"
+
                 print(f"  {label:<30}: ", end="")
                 if 'error' in data:
-                    print(f"ERROR ({data['error'][:50]}...)") # Show truncated error
+                    print(f"ERROR ({data['error'][:50]}...)")
                 elif 'auc' in data:
-                    print(f"Acc={data.get('acc', float('nan')):.4f}, AUC={data.get('auc', float('nan')):.4f}, KS={data.get('ks', float('nan')):.4f}")
+                    auc_val = data.get('auc', float('nan'))
+                    ks_val = data.get('ks', float('nan'))
+                    acc_val = data.get('acc', float('nan'))
+                    print(f"Acc={acc_val:.4f}, AUC={auc_val:.4f}, KS={ks_val:.4f}")
+                    if not np.isnan(auc_val) and not np.isnan(ks_val):
+                        all_results_for_comparison.append((model_name, feature_key, auc_val, ks_val))
                 else:
                     print("Metrics N/A")
+
+        # Add Stacking results to detailed summary
+        if stacking_results:
+             print(f"--- Stacking ---")
+             print(f"  {'Stacked Model':<30}: ", end="")
+             if 'error' in stacking_results:
+                 print(f"ERROR ({stacking_results['error'][:50]}...)")
+             elif 'auc' in stacking_results:
+                 auc_val = stacking_results.get('auc', float('nan'))
+                 ks_val = stacking_results.get('ks', float('nan'))
+                 acc_val = stacking_results.get('acc', float('nan'))
+                 print(f"Acc={acc_val:.4f}, AUC={auc_val:.4f}, KS={ks_val:.4f}")
+                 if not np.isnan(auc_val) and not np.isnan(ks_val):
+                     all_results_for_comparison.append(('Stacking', 'Stacking', auc_val, ks_val))
+                 base_info = " | ".join([f"{c['model_name']}-{c['feature_set']}" for c in stacking_results.get('base_model_configs', [])])
+                 print(f"  {'Base Models Used':<30}: {base_info}")
+             else:
+                 print("Metrics N/A")
+
         print("="*80)
 
+        # --- Best Performance Summary (based on collected results) ---
+        if not all_results_for_comparison:
+            print("No valid results found for performance comparison.")
+            print("="*80)
+            return
+
+        # Find best overall AUC
+        best_auc_res = max(all_results_for_comparison, key=lambda item: item[2])
+        # Find best overall KS
+        best_ks_res = max(all_results_for_comparison, key=lambda item: item[3])
+        # Find best baseline (dataset only) AUC and KS across models
+        baseline_results = [res for res in all_results_for_comparison if res[1] == 'dataset']
+        best_baseline_auc_res = max(baseline_results, key=lambda item: item[2]) if baseline_results else None
+        best_baseline_ks_res = max(baseline_results, key=lambda item: item[3]) if baseline_results else None
+
+
+        print("Best Overall Performance (Test Set):")
+        print(f"  Highest AUC: {best_auc_res[2]:.4f} (Model: {best_auc_res[0].upper()}, Features: {best_auc_res[1]})")
+        if best_baseline_auc_res:
+             auc_improvement = best_auc_res[2] - best_baseline_auc_res[2]
+             print(f"    vs. Best Dataset AUC ({best_baseline_auc_res[2]:.4f}, Model: {best_baseline_auc_res[0].upper()}): {auc_improvement:+.4f}")
+        else:
+             print("    vs. Best Dataset AUC: N/A (No baseline results)")
+
+        print(f"  Highest KS:  {best_ks_res[3]:.4f} (Model: {best_ks_res[0].upper()}, Features: {best_ks_res[1]})")
+        if best_baseline_ks_res:
+            ks_improvement = best_ks_res[3] - best_baseline_ks_res[3]
+            print(f"    vs. Best Dataset KS ({best_baseline_ks_res[3]:.4f}, Model: {best_baseline_ks_res[0].upper()}):  {ks_improvement:+.4f}")
+        else:
+            print("    vs. Best Dataset KS: N/A (No baseline results)")
+
+        print("="*80)
 
 # --- Main Execution Logic ---
 def main(args):
@@ -1596,104 +1834,106 @@ def main(args):
 
     # 1. Data Management
     data_manager = DataManager(config)
-    data_manager.load_and_sample_data()
-    data_manager.filter_target_variable() # Apply target filtering early
+    # ... (loading, filtering, preprocessing) ...
+    try:
+        data_manager.load_and_sample_data()
+        data_manager.filter_target_variable() # Apply target filtering early
 
-    # Check if dataframes are empty after loading/filtering
-    if data_manager.neurolake_df is None or data_manager.neurolake_df.empty:
-        print(f"WARNING: Neurolake DataFrame for dataset {config.dataset_name} is empty after loading/filtering. Skipping evaluation for this dataset.")
-        # Exit cleanly for this dataset iteration. The calling shell script will continue.
-        sys.exit(0)
-    # Also check the primary dataset df if it exists (it should mirror neurolake_df's row count after filtering)
-    if config.dataset_features_csv and (data_manager.dataset_df is None or data_manager.dataset_df.empty):
-        print(f"WARNING: Dataset Features DataFrame for dataset {config.dataset_name} is empty after loading/filtering. Skipping evaluation for this dataset.")
-        sys.exit(0)
+        if data_manager.neurolake_df is None or data_manager.neurolake_df.empty:
+            print(f"WARNING: Neurolake DataFrame for dataset {config.dataset_name} is empty after loading/filtering. Skipping evaluation.")
+            # Exit cleanly for this dataset iteration. The calling shell script will continue.
+            sys.exit(0)
+        if config.dataset_features_csv and (data_manager.dataset_df is None or data_manager.dataset_df.empty):
+            print(f"WARNING: Dataset Features DataFrame for dataset {config.dataset_name} is empty after loading/filtering. Skipping evaluation.")
+            sys.exit(0)
 
-    data_manager.preprocess_neurolake()
-    # Only preprocess dataset features if needed for evaluation
-    if config.dataset_features_csv and config.target_column:
-        data_manager.preprocess_dataset_features()
-    else:
-        print("Skipping dataset feature preprocessing as CSV or target column not provided.")
+        data_manager.preprocess_neurolake()
+        # Only preprocess dataset features if needed for evaluation
+        if config.dataset_features_csv and config.target_column:
+            data_manager.preprocess_dataset_features()
+        else:
+            print("Skipping dataset feature preprocessing as CSV or target column not provided.")
 
+    except Exception as e:
+        print(f"ERROR during Data Management phase: {e}")
+        sys.exit(1) # Exit if data handling fails
 
     # 2. SUBLIME Handling
     sublime_handler = SublimeHandler(config)
-    sublime_handler.load_model()
-    sublime_handler.build_faiss_index_if_needed() # Build index after loading features
+    # ... (load model, extract embeddings, save if requested) ...
+    try:
+        sublime_handler.load_model()
+        sublime_handler.build_faiss_index_if_needed()
 
-    # Extract embeddings for train/val data
-    train_val_sublime_results = sublime_handler.extract_embeddings(
-        data_manager.X_neurolake, dataset_tag=config.dataset_name
-    )
-    # Extract for test data if separate test set exists
-    test_sublime_results = None
-    if config.using_separate_test and data_manager.X_test_neurolake is not None:
-         test_sublime_results = sublime_handler.extract_embeddings(
-             data_manager.X_test_neurolake, dataset_tag=config.test_dataset_name
-         )
-    elif not config.using_separate_test and data_manager.X_neurolake is not None:
-        # If not using separate test, test embeddings will be handled during split
-        pass
-
-
-    # --- Optional: Save Embeddings ---
-    if config.embeddings_output:
-        print(f"Saving SUBLIME embeddings...")
-        # Train/Val embeddings
-        embeddings_df = pd.DataFrame(
-            train_val_sublime_results['embeddings'],
-            columns=[f"sublime_{i}" for i in range(train_val_sublime_results['embeddings'].shape[1])]
+        train_val_sublime_results = sublime_handler.extract_embeddings(
+            data_manager.X_neurolake, dataset_tag=config.dataset_name
         )
-        if 'id' in data_manager.neurolake_df.columns: # Use original unsampled/unfiltered df for IDs? Or filtered? Use filtered.
-             # Need to re-attach IDs carefully if filtering/sampling happened
-             # This part might need adjustment depending on exact ID requirement
-             if len(embeddings_df) == len(data_manager.neurolake_df):
-                  embeddings_df['id'] = data_manager.neurolake_df['id'].values
-             else:
-                  print("Warning: Length mismatch between embeddings and current neurolake dataframe state "
-                        f"({len(embeddings_df)} vs {len(data_manager.neurolake_df)}). "
-                        "This can happen due to sampling or filtering. Cannot reliably attach original IDs.")
+        test_sublime_results = None
+        if config.using_separate_test and data_manager.X_test_neurolake is not None:
+             test_sublime_results = sublime_handler.extract_embeddings(
+                 data_manager.X_test_neurolake, dataset_tag=config.test_dataset_name
+             )
+        # ... (optional embeddings save) ...
+        if config.embeddings_output:
+             print(f"Saving SUBLIME embeddings...")
+             # Train/Val embeddings
+             embeddings_df = pd.DataFrame(
+                 train_val_sublime_results['embeddings'],
+                 columns=[f"sublime_{i}" for i in range(train_val_sublime_results['embeddings'].shape[1])]
+             )
+             if 'id' in data_manager.neurolake_df.columns: # Use original unsampled/unfiltered df for IDs? Or filtered? Use filtered.
+                  # Need to re-attach IDs carefully if filtering/sampling happened
+                  # This part might need adjustment depending on exact ID requirement
+                  if len(embeddings_df) == len(data_manager.neurolake_df):
+                       embeddings_df['id'] = data_manager.neurolake_df['id'].values
+                  else:
+                       print("Warning: Length mismatch between embeddings and current neurolake dataframe state "
+                             f"({len(embeddings_df)} vs {len(data_manager.neurolake_df)}). "
+                             "This can happen due to sampling or filtering. Cannot reliably attach original IDs.")
 
-        if sublime_handler.has_classification_head and train_val_sublime_results.get('classification_probs') is not None:
-            embeddings_df['classification_probability'] = train_val_sublime_results['classification_probs']
-            embeddings_df['classification_prediction'] = (train_val_sublime_results['classification_probs'] >= 0.5).astype(int)
+             if sublime_handler.has_classification_head and train_val_sublime_results.get('classification_probs') is not None:
+                 embeddings_df['classification_probability'] = train_val_sublime_results['classification_probs']
+                 embeddings_df['classification_prediction'] = (train_val_sublime_results['classification_probs'] >= 0.5).astype(int)
 
-        embeddings_df.to_csv(config.embeddings_output, index=False)
-        print(f"Train/Val embeddings saved to {config.embeddings_output}")
+             embeddings_df.to_csv(config.embeddings_output, index=False)
+             print(f"Train/Val embeddings saved to {config.embeddings_output}")
 
-        # Test embeddings (if applicable)
-        if test_sublime_results:
-            test_embeddings_df = pd.DataFrame(
-                test_sublime_results['embeddings'],
-                columns=[f"sublime_{i}" for i in range(test_sublime_results['embeddings'].shape[1])]
-            )
-            # Add ID and classification if available for test set
-            if data_manager.test_neurolake_df is not None and 'id' in data_manager.test_neurolake_df.columns:
-                 if len(test_embeddings_df) == len(data_manager.test_neurolake_df):
-                     test_embeddings_df['id'] = data_manager.test_neurolake_df['id'].values
-                 else:
-                     print("Warning: Length mismatch between test embeddings and test neurolake dataframe state "
-                           f"({len(test_embeddings_df)} vs {len(data_manager.test_neurolake_df)}). "
-                           "Cannot reliably attach original IDs.")
+             # Test embeddings (if applicable)
+             if test_sublime_results:
+                 test_embeddings_df = pd.DataFrame(
+                     test_sublime_results['embeddings'],
+                     columns=[f"sublime_{i}" for i in range(test_sublime_results['embeddings'].shape[1])]
+                 )
+                 # Add ID and classification if available for test set
+                 if data_manager.test_neurolake_df is not None and 'id' in data_manager.test_neurolake_df.columns:
+                      if len(test_embeddings_df) == len(data_manager.test_neurolake_df):
+                          test_embeddings_df['id'] = data_manager.test_neurolake_df['id'].values
+                      else:
+                          print("Warning: Length mismatch between test embeddings and test neurolake dataframe state "
+                                f"({len(test_embeddings_df)} vs {len(data_manager.test_neurolake_df)}). "
+                                "Cannot reliably attach original IDs.")
 
-            if sublime_handler.has_classification_head and test_sublime_results.get('classification_probs') is not None:
-                test_embeddings_df['classification_probability'] = test_sublime_results['classification_probs']
-                test_embeddings_df['classification_prediction'] = (test_sublime_results['classification_probs'] >= 0.5).astype(int)
+                 if sublime_handler.has_classification_head and test_sublime_results.get('classification_probs') is not None:
+                     test_embeddings_df['classification_probability'] = test_sublime_results['classification_probs']
+                     test_embeddings_df['classification_prediction'] = (test_sublime_results['classification_probs'] >= 0.5).astype(int)
 
-            test_output_path = config.embeddings_output.replace('.csv', f'_test_{config.k_str}.csv')
-            test_embeddings_df.to_csv(test_output_path, index=False)
-            print(f"Test embeddings saved to {test_output_path}")
+                 test_output_path = config.embeddings_output.replace('.csv', f'_test_{config.k_str}.csv')
+                 test_embeddings_df.to_csv(test_output_path, index=False)
+                 print(f"Test embeddings saved to {test_output_path}")
+             # Exit if only saving embeddings
+             if not (config.dataset_features_csv and config.target_column):
+                 print("Embeddings saved. Evaluation skipped as dataset features/target not provided.")
+                 return # Exit after saving embeddings
 
-        # Exit if only saving embeddings
-        if not (config.dataset_features_csv and config.target_column):
-            print("Embeddings saved. Evaluation skipped as dataset features/target not provided.")
-            return # Exit after saving embeddings
+        # --- Added: Exit if only extracting embeddings ---
+        if config.extract_embeddings_only:
+            print("Embeddings extracted and potentially saved/cached. Skipping model training as requested (--extract-embeddings-only).")
+            return
 
-    # --- Added: Exit if only extracting embeddings ---
-    if config.extract_embeddings_only:
-        print("Embeddings extracted and potentially saved/cached. Skipping model training as requested (--extract-embeddings-only).")
-        return
+    except Exception as e:
+        print(f"ERROR during SUBLIME Handling phase: {e}")
+        sys.exit(1)
+
 
     # --- Evaluation Setup ---
     if not (config.dataset_features_csv and config.target_column):
@@ -1703,19 +1943,22 @@ def main(args):
          print("Cannot proceed with evaluation: Dataset features or target variable not processed correctly.")
          return
 
-    # --- Evaluate Built-in Classifier (if exists) ---
-    # Evaluate on train/val data first
-    sublime_handler.evaluate_builtin_classifier(train_val_sublime_results, data_manager.y, "train_val_data")
-    # Evaluate on test data if separate test set used
-    if config.using_separate_test and test_sublime_results and data_manager.y_test is not None:
-         sublime_handler.evaluate_builtin_classifier(test_sublime_results, data_manager.y_test, "external_test_data")
-    # Note: If not using external test, built-in classifier on the test split will be evaluated later if needed
+    # --- Evaluate Built-in Classifier ---
+    try:
+        sublime_handler.evaluate_builtin_classifier(train_val_sublime_results, data_manager.y, "train_val_data")
+        if config.using_separate_test and test_sublime_results and data_manager.y_test is not None:
+             sublime_handler.evaluate_builtin_classifier(test_sublime_results, data_manager.y_test, "external_test_data")
+    except Exception as e:
+         print(f"Warning: Error during built-in classifier evaluation: {e}")
 
 
     # 3. Split Data for Evaluation Models
-    data_manager.perform_train_val_test_split(train_val_sublime_results, test_sublime_results)
-    split_data = data_manager.get_split_data()
-
+    try:
+        data_manager.perform_train_val_test_split(train_val_sublime_results, test_sublime_results)
+        split_data = data_manager.get_split_data()
+    except Exception as e:
+        print(f"ERROR during Data Splitting phase: {e}")
+        sys.exit(1)
     # Evaluate built-in on the actual test split if *not* using external test
     if not config.using_separate_test:
          # Need to reconstruct test sublime results from the split
@@ -1726,30 +1969,61 @@ def main(args):
 
 
     # 4. Feature Engineering
-    feature_engineer = FeatureEngineer(config)
-    feature_sets = feature_engineer.create_all_feature_sets(split_data)
+    try:
+        feature_engineer = FeatureEngineer(config)
+        feature_sets = feature_engineer.create_all_feature_sets(split_data)
+        if not feature_sets:
+            print("No feature sets were generated. Aborting evaluation.")
+            return
+    except Exception as e:
+        print(f"ERROR during Feature Engineering phase: {e}")
+        sys.exit(1)
 
-    # 5. Run Evaluation
+
+    # 5. Run Evaluation (Base Models)
     evaluator = Evaluator(config)
     # Ensure feature sets were created successfully
     if not feature_sets:
          print("No feature sets were generated. Aborting evaluation.")
          return
-    evaluator.run_evaluation(feature_sets, split_data)
+    try:
+        evaluator.run_evaluation(feature_sets, split_data)
+    except Exception as e:
+         print(f"ERROR during Base Model Evaluation phase: {e}")
+         # Continue to stacking if possible, but log the error
+
+
+    # --- Run Stacking Evaluation ---
+    # This runs after the main loop, using the results/params found
+    try:
+        evaluator.run_stacking_evaluation(feature_sets, split_data)
+    except Exception as e:
+        print(f"ERROR during Stacking Evaluation phase: {e}")
+        # Stacking failed, but might still have base results
+
 
     # 6. Reporting
     reporter = Reporter(config)
     eval_results = evaluator.get_results()
     best_params = evaluator.get_best_params()
+    stacking_results = evaluator.get_stacking_results() # Get stacking results
 
-    reporter.generate_roc_plots(eval_results)
-    reporter.generate_feature_importance_plots(eval_results, data_manager, split_data) # Pass data_manager for names
-    reporter.save_results_summary(eval_results)
-    reporter.save_best_params(best_params)
-    reporter.print_final_summary(eval_results)
+    try:
+        reporter.generate_roc_plots(eval_results, stacking_results) # Pass stacking results
+        # Feature importance plots only make sense for base models, not the meta-model directly
+        reporter.generate_feature_importance_plots(eval_results, data_manager, split_data) # Pass data_manager for names
+        reporter.save_results_summary(eval_results, stacking_results) # Pass stacking results
+        reporter.save_best_params(best_params)
+        reporter.print_final_summary(eval_results, stacking_results) # Pass stacking results
+    except Exception as e:
+        print(f"ERROR during Reporting phase: {e}")
+
 
     # 7. Save Dataset Preprocessor
-    data_manager.save_preprocessor()
+    try:
+        data_manager.save_preprocessor()
+    except Exception as e:
+        print(f"Warning: Failed to save dataset preprocessor: {e}")
 
     print("Evaluation script finished.")
 
