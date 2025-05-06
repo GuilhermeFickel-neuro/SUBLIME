@@ -1914,7 +1914,7 @@ class Experiment:
             model = XGBClassifier(**param)
 
             try:
-                model.fit(X_train_emb, y_train_bin, eval_set=eval_set, verbose=False, early_stopping_rounds=early_stopping_rounds)
+                model.fit(X_train_emb, y_train_bin, eval_set=eval_set, verbose=False)
                 preds = model.predict_proba(X_val_emb)[:, 1]
                 auc = roc_auc_score(y_val_bin, preds)
                 return auc
