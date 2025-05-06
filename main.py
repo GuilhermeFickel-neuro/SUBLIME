@@ -3,6 +3,10 @@ import copy
 from datetime import datetime
 import math
 import wandb # Add wandb import
+import optuna # Add Optuna import
+from xgboost import XGBClassifier # Add XGBoost import
+from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score # Add scikit-learn metric imports
+from sklearn.model_selection import train_test_split # Add train_test_split import
 
 from tqdm import tqdm # Keep import for now, might be used elsewhere
 import numpy as np
@@ -1692,6 +1696,26 @@ class Experiment:
                     if len(val_log_dict) > 1: # Log only if metrics were added besides epoch
                         wandb.log(val_log_dict, step=epoch)
 
+                    # --- XGBoost Embedding Evaluation (Periodic) ---
+                    if epoch > 0 and args.eval_xgb_freq > 0 and epoch % args.eval_xgb_freq == 0:
+                        # Ensure we have the necessary components (labels, masks)
+                        if labels is not None and train_mask is not None and val_mask is not None and test_mask is not None and emb1_val is not None:
+                            # Call the helper function using the ANCHOR embedding (emb1_val) for consistency
+                            try:
+                                xgb_ks_score = self._evaluate_embeddings_xgboost(
+                                    emb1_val, labels, train_mask, val_mask, test_mask, args
+                                )
+                                if not math.isnan(xgb_ks_score):
+                                    tqdm.tqdm.write(f"  Periodic XGBoost Eval @ Epoch {epoch}: Validation KS = {xgb_ks_score:.4f}")
+                                    wandb.log({'eval/xgb_val_ks': xgb_ks_score}, step=epoch)
+                                else:
+                                     tqdm.tqdm.write(f"  Periodic XGBoost Eval @ Epoch {epoch}: Failed or skipped (NaN result).")
+                            except Exception as e:
+                                tqdm.tqdm.write(f"ERROR during periodic XGBoost evaluation @ Epoch {epoch}: {e}")
+                        else:
+                            tqdm.tqdm.write(f"Skipping periodic XGBoost eval @ Epoch {epoch}: Missing required data (labels, masks, or embeddings).")
+                    # --- End XGBoost Embedding Evaluation ---
+
                     # Reset model/learner back to train mode for the next epoch
                     if is_embedding_phase: model.train(); graph_learner.eval() # Keep learner frozen in P1
                     elif is_graph_learner_phase: model.eval(); graph_learner.train() # Keep model frozen in P2
@@ -1821,6 +1845,123 @@ class Experiment:
 
         return model, graph_learner, optimizer_cl, optimizer_learner, 0, None # Return initial state
 
+    def _evaluate_embeddings_xgboost(self, embedding_tensor, labels, train_mask, val_mask, test_mask, args):
+        """Evaluate embeddings using XGBoost (trained on train, evaluated on val) tuned with Optuna."""
+        if args.eval_xgb_optuna_trials <= 0:
+            print("Skipping XGBoost evaluation: eval_xgb_optuna_trials is 0.")
+            return float('nan') # Return NaN if trials are 0
+
+        t_start = datetime.now()
+        print("Starting XGBoost embedding evaluation (on validation set)...")
+
+        # Ensure tensors are on CPU for scikit-learn compatibility
+        embeddings = embedding_tensor.cpu().numpy()
+        labels = labels.cpu().numpy()
+        train_mask = train_mask.cpu().numpy()
+        val_mask = val_mask.cpu().numpy()
+        # test_mask is no longer used here, but kept in signature for compatibility with the call site
+        # test_mask = test_mask.cpu().numpy()
+
+        # 1. Filter for binary labels (0 or 1)
+        binary_mask = (labels == 0) | (labels == 1)
+        if not np.any(binary_mask):
+            print("No binary labels (0 or 1) found. Cannot perform XGBoost evaluation.")
+            return float('nan')
+
+        filtered_embeddings = embeddings[binary_mask]
+        filtered_labels = labels[binary_mask]
+
+        # Apply original masks to the *filtered* data indices
+        filtered_indices = np.where(binary_mask)[0]
+        original_train_indices = np.where(train_mask)[0]
+        original_val_indices = np.where(val_mask)[0]
+
+        index_map = {orig_idx: filtered_idx for filtered_idx, orig_idx in enumerate(filtered_indices)}
+
+        train_indices_in_filtered = [index_map[i] for i in original_train_indices if i in index_map]
+        val_indices_in_filtered = [index_map[i] for i in original_val_indices if i in index_map]
+
+        if not train_indices_in_filtered or not val_indices_in_filtered:
+            print("Warning: Not enough data in train or validation splits after filtering for binary labels. Skipping XGBoost evaluation.")
+            return float('nan')
+
+        X_train_emb = filtered_embeddings[train_indices_in_filtered]
+        y_train_bin = filtered_labels[train_indices_in_filtered]
+        X_val_emb = filtered_embeddings[val_indices_in_filtered]
+        y_val_bin = filtered_labels[val_indices_in_filtered]
+
+        print(f"  Filtered data shapes for XGBoost: Train=({X_train_emb.shape}, {y_train_bin.shape}), "
+              f"Val=({X_val_emb.shape}, {y_val_bin.shape})")
+
+        # 2. Optuna Objective for XGBoost (uses train/val split)
+        def objective(trial):
+            param = {
+                'objective': 'binary:logistic',
+                'eval_metric': 'auc',
+                'eta': trial.suggest_float('eta', 1e-8, 1.0, log=True),
+                'max_depth': trial.suggest_int('max_depth', 1, 9),
+                'subsample': trial.suggest_float('subsample', 0.2, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.2, 1.0),
+                'min_child_weight': trial.suggest_int('min_child_weight', 0, 10),
+                'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
+                'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True), # L2 reg
+                'alpha': trial.suggest_float('alpha', 1e-8, 1.0, log=True),    # L1 reg
+                'use_label_encoder': False
+            }
+
+            eval_set = [(X_val_emb, y_val_bin)]
+            early_stopping_rounds = 15 # Use early stopping within Optuna trial
+            model = XGBClassifier(**param)
+
+            try:
+                model.fit(X_train_emb, y_train_bin, eval_set=eval_set, verbose=False, early_stopping_rounds=early_stopping_rounds)
+                preds = model.predict_proba(X_val_emb)[:, 1]
+                auc = roc_auc_score(y_val_bin, preds)
+                return auc
+            except Exception as e:
+                 print(f"Optuna trial failed: {e}")
+                 return 0.0
+
+        # 3. Run Optuna Study
+        study = optuna.create_study(direction='maximize', pruner=optuna.pruners.MedianPruner())
+        try:
+            study.optimize(objective, n_trials=args.eval_xgb_optuna_trials, n_jobs=1, show_progress_bar=args.verbose)
+            best_params = study.best_params
+            best_val_auc_optuna = study.best_value # AUC on validation set during Optuna
+            print(f"  Optuna finished. Best validation AUC during tuning: {best_val_auc_optuna:.4f}")
+        except Exception as e:
+            print(f"  Optuna study failed: {e}. Using default XGBoost parameters.")
+            best_params = {}
+
+        # 4. Train Final XGBoost Model (on TRAIN data only)
+        final_xgb_params = {
+            'objective': 'binary:logistic',
+            'eval_metric': 'auc',
+            'use_label_encoder': False
+        }
+        final_xgb_params.update(best_params)
+
+        final_model = XGBClassifier(**final_xgb_params)
+        try:
+            # Train only on the training split
+            final_model.fit(X_train_emb, y_train_bin, verbose=False)
+        except Exception as e:
+            print(f"Error fitting final XGBoost model: {e}")
+            return float('nan')
+
+        # 5. Evaluate on VALIDATION Set and Calculate KS
+        try:
+            val_probs = final_model.predict_proba(X_val_emb)[:, 1]
+            fpr, tpr, thresholds = roc_curve(y_val_bin, val_probs)
+            ks_score = np.max(tpr - fpr) if len(tpr) > 0 and len(fpr) > 0 else 0.0
+        except Exception as e:
+            print(f"Error evaluating XGBoost model on validation set: {e}")
+            ks_score = float('nan')
+
+        t_end = datetime.now()
+        print(f"XGBoost evaluation finished. Validation KS: {ks_score:.4f}. Time: {t_end - t_start}")
+        return ks_score
+
 
 def create_parser():
     parser = argparse.ArgumentParser()
@@ -1948,6 +2089,12 @@ def create_parser():
     # Gradient Clipping
     parser.add_argument('-clip_norm', type=float, default=1.0,
                        help='Max norm for gradient clipping (0 to disable)')
+
+    # XGBoost Embedding Evaluation Arguments
+    parser.add_argument('--eval_xgb_freq', type=int, default=200,
+                       help='Frequency (in epochs) for evaluating embeddings with XGBoost (0 to disable)')
+    parser.add_argument('--eval_xgb_optuna_trials', type=int, default=60,
+                        help='Number of Optuna trials for XGBoost hyperparameter tuning during evaluation')
 
     # New argument for relationship dataset
     parser.add_argument('-relationship_dataset', type=str, default=None,
