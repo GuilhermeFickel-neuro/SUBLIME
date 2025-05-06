@@ -73,6 +73,7 @@ class Config:
         self.using_separate_test = self.test_csv is not None
         self.use_loaded_adj_for_extraction = args.use_loaded_adj_for_extraction
         self.extract_embeddings_only = args.extract_embeddings_only # Added
+        self.class_weight_multiplier = args.class_weight_multiplier # Added
 
         self.dataset_name = self._derive_dataset_name()
         self.test_dataset_name = self._derive_test_dataset_name()
@@ -1124,6 +1125,7 @@ class Evaluator:
     """Runs Optuna optimization, trains final models, evaluates performance, and runs stacking."""
     def __init__(self, config):
         self.config = config
+        self.class_weight_multiplier = config.class_weight_multiplier # Store the multiplier
         self.results = {} # {model_name: {feature_set: {metric: val, ...}}}
         self.best_params = {} # {model_name: {feature_set: {param: val, ...}}}
         self.stacking_results = {} # Store stacking results separately
@@ -1145,6 +1147,20 @@ class Evaluator:
 
     def _create_objective(self, model_class, train_features, train_labels, val_features, val_labels, base_params, trial_params):
         """Creates the Optuna objective function for a given model setup."""
+
+        # --- Calculate Class Weights --- # Added
+        calculated_weight = None
+        if self.class_weight_multiplier > 1.0:
+            neg_count = np.sum(train_labels == 0)
+            pos_count = np.sum(train_labels == 1)
+            if pos_count > 0:
+                base_weight = neg_count / pos_count
+                calculated_weight = base_weight * self.class_weight_multiplier
+                print(f"  Applying class weight multiplier: {self.class_weight_multiplier:.2f}. Base weight: {base_weight:.2f}, Final weight for class 1: {calculated_weight:.2f}")
+            else:
+                print("  Warning: No positive samples in training labels for objective. Cannot calculate class weight.")
+        # --- End Class Weight Calculation --- #
+
         def objective(trial):
             params = base_params.copy()
             for name, suggester_args in trial_params.items():
@@ -1157,13 +1173,31 @@ class Evaluator:
                     eval_metric = 'auc'
                     pruning_callback = optuna.integration.LightGBMPruningCallback(trial, eval_metric)
                     early_stopping_callback = lightgbm.early_stopping(stopping_rounds=10, verbose=False) # Use verbose=False
-                    model.fit(train_features, train_labels, eval_set=[(val_features, val_labels)],
-                              eval_metric=eval_metric, callbacks=[pruning_callback, early_stopping_callback]) # Pass both callbacks
+
+                    # Apply class weight if calculated # Added
+                    fit_params = {
+                        'eval_set': [(val_features, val_labels)],
+                        'eval_metric': eval_metric,
+                        'callbacks': [pruning_callback, early_stopping_callback]
+                    }
+                    if calculated_weight is not None:
+                         # LightGBM uses class_weight dict
+                         fit_params['class_weight'] = {0: 1, 1: calculated_weight}
+
+                    model.fit(train_features, train_labels, **fit_params)
                           # Removed direct early_stopping_rounds=10 argument
                 elif isinstance(model, CatBoostClassifier):
-                    # Removed early_stopping_rounds=10 as per user request -> Re-adding it
-                    model.fit(train_features, train_labels, eval_set=(val_features, val_labels), verbose=False,
-                              early_stopping_rounds=10) # Added early stopping
+                    # Apply class weight if calculated # Added
+                    fit_params = {
+                        'eval_set': (val_features, val_labels),
+                        'verbose': False,
+                        'early_stopping_rounds': 10
+                    }
+                    if calculated_weight is not None:
+                         # CatBoost uses class_weights list [weight_for_0, weight_for_1]
+                         fit_params['class_weights'] = [1, calculated_weight]
+
+                    model.fit(train_features, train_labels, **fit_params)
                 elif isinstance(model, XGBClassifier):
                     # Manual Pruning Implementation for XGBoost >= 1.6
                     # Combine base and trial parameters
@@ -1171,6 +1205,10 @@ class Evaluator:
 
                     eval_set = [(val_features, val_labels)]
                     eval_metric_name = params.get('eval_metric', 'auc') # Ensure AUC is used
+
+                    # Apply class weight if calculated # Added
+                    if calculated_weight is not None:
+                        params['scale_pos_weight'] = calculated_weight
 
                     # Add early stopping rounds for manual pruning logic
                     early_stopping_rounds = 20 # Set desired rounds
@@ -1315,6 +1353,20 @@ class Evaluator:
                 print("Training final model on train+validation data...")
                 final_params = {**base_params, **best_trial_params}
                 final_model = model_class(**final_params)
+
+                # --- Calculate Class Weights for Final Training --- # Added
+                calculated_weight_final = None
+                if self.class_weight_multiplier > 1.0:
+                     neg_count_final = np.sum(y_train_val == 0)
+                     pos_count_final = np.sum(y_train_val == 1)
+                     if pos_count_final > 0:
+                          base_weight_final = neg_count_final / pos_count_final
+                          calculated_weight_final = base_weight_final * self.class_weight_multiplier
+                          print(f"  Applying final class weight multiplier: {self.class_weight_multiplier:.2f}. Base weight: {base_weight_final:.2f}, Final weight for class 1: {calculated_weight_final:.2f}")
+                     else:
+                          print("  Warning: No positive samples in train+val labels. Cannot calculate final class weight.")
+                 # --- End Final Class Weight Calculation --- #
+
                 try:
                     # Check for empty train_val data
                     if X_train_val.shape[0] == 0 or X_test.shape[0] == 0:
@@ -1322,9 +1374,21 @@ class Evaluator:
                          self.results[model_name][feature_set_name] = {'error': 'Empty train_val/test features'}
                          continue
 
-                    if isinstance(final_model, (CatBoostClassifier, LGBMClassifier)):
-                         final_model.fit(X_train_val, y_train_val)
-                    else: # XGBoost, others
+                    # Apply weights during final fit # Added
+                    fit_params_final = {}
+                    if isinstance(final_model, LGBMClassifier):
+                         if calculated_weight_final is not None:
+                              fit_params_final['class_weight'] = {0: 1, 1: calculated_weight_final}
+                         final_model.fit(X_train_val, y_train_val, **fit_params_final)
+                    elif isinstance(final_model, CatBoostClassifier):
+                         if calculated_weight_final is not None:
+                              fit_params_final['class_weights'] = [1, calculated_weight_final]
+                         final_model.fit(X_train_val, y_train_val, **fit_params_final)
+                    elif isinstance(final_model, XGBClassifier):
+                         if calculated_weight_final is not None:
+                              final_model.set_params(scale_pos_weight=calculated_weight_final)
+                         final_model.fit(X_train_val, y_train_val) # Fit after setting param
+                    else: # Others without specific weight params
                          final_model.fit(X_train_val, y_train_val)
 
                     print("Evaluating final model on test data...")
@@ -1370,6 +1434,27 @@ class Evaluator:
         y_val = labels['val']
         y_test = labels['test']
 
+        # --- Calculate Meta-Model Class Weights --- # Added
+        meta_class_weight_dict = None
+        if self.class_weight_multiplier > 1.0:
+             neg_count_meta = np.sum(y_val == 0) # Meta model trained on val predictions/labels
+             pos_count_meta = np.sum(y_val == 1)
+             if pos_count_meta > 0:
+                 base_weight_meta = neg_count_meta / pos_count_meta
+                 calculated_weight_meta = base_weight_meta * self.class_weight_multiplier
+                 meta_class_weight_dict = {0: 1, 1: calculated_weight_meta}
+                 print(f"Applying meta-model class weight multiplier: {self.class_weight_multiplier:.2f}. Final weight for class 1: {calculated_weight_meta:.2f}")
+             else:
+                 print("Warning: No positive samples in validation labels for meta-model. Cannot calculate meta class weight.")
+
+        # Define meta model params, including class weight
+        meta_model_params = {
+             'random_state': 42,
+             'solver': 'liblinear',
+             'class_weight': meta_class_weight_dict # Will be None if multiplier is 1 or pos_count is 0
+        }
+        # --- End Meta-Model Weight Calculation --- #
+
         print("Preparing base models for stacking...")
         for config in base_model_configs:
             model_name = config['model_name']
@@ -1396,6 +1481,24 @@ class Evaluator:
             y_train = labels['train']
             y_train_val = labels['train_val']
 
+            # --- Calculate Base Model Weights --- # Added
+            calculated_weight_oof = None # For OOF prediction model (trained on train)
+            calculated_weight_test = None # For test prediction model (trained on train+val)
+            if self.class_weight_multiplier > 1.0:
+                # Weight for OOF model (using y_train)
+                neg_count_oof = np.sum(y_train == 0)
+                pos_count_oof = np.sum(y_train == 1)
+                if pos_count_oof > 0:
+                    base_weight_oof = neg_count_oof / pos_count_oof
+                    calculated_weight_oof = base_weight_oof * self.class_weight_multiplier
+                # Weight for test model (using y_train_val)
+                neg_count_test = np.sum(y_train_val == 0)
+                pos_count_test = np.sum(y_train_val == 1)
+                if pos_count_test > 0:
+                    base_weight_test = neg_count_test / pos_count_test
+                    calculated_weight_test = base_weight_test * self.class_weight_multiplier
+            # --- End Base Model Weight Calculation --- #
+
             # Get model class and best params
             model_class = self.model_configs[model_name]['class']
             base_params = self.model_configs[model_name]['base_params']
@@ -1403,24 +1506,48 @@ class Evaluator:
             final_params = {**base_params, **best_trial_params}
 
             try:
-                # --- Generate Validation (OOF) Predictions ---
+                # --- Generate Validation (OOF) Predictions --- # Modified fit calls
                 print(f"    Training {model_name}-{feature_set} on train split for validation predictions...")
                 model_for_oof = model_class(**final_params)
-                if isinstance(model_for_oof, (CatBoostClassifier, LGBMClassifier)):
+                fit_params_oof = {}
+                if isinstance(model_for_oof, LGBMClassifier):
+                    if calculated_weight_oof is not None:
+                        fit_params_oof['class_weight'] = {0: 1, 1: calculated_weight_oof}
+                    model_for_oof.fit(X_train, y_train, **fit_params_oof)
+                elif isinstance(model_for_oof, CatBoostClassifier):
+                    if calculated_weight_oof is not None:
+                        fit_params_oof['class_weights'] = [1, calculated_weight_oof]
+                    model_for_oof.fit(X_train, y_train, **fit_params_oof)
+                elif isinstance(model_for_oof, XGBClassifier):
+                    if calculated_weight_oof is not None:
+                        model_for_oof.set_params(scale_pos_weight=calculated_weight_oof)
                     model_for_oof.fit(X_train, y_train)
-                else: # XGBoost, others
+                else: # Others without specific weight params
                     model_for_oof.fit(X_train, y_train)
+
                 oof_preds = model_for_oof.predict_proba(X_val)[:, 1]
                 oof_preds_list.append(oof_preds)
                 print(f"    Generated validation predictions. Shape: {oof_preds.shape}")
 
-                # --- Generate Test Predictions ---
+                # --- Generate Test Predictions --- # Modified fit calls
                 print(f"    Training {model_name}-{feature_set} on train+val split for test predictions...")
                 model_for_test = model_class(**final_params)
-                if isinstance(model_for_test, (CatBoostClassifier, LGBMClassifier)):
+                fit_params_test = {}
+                if isinstance(model_for_test, LGBMClassifier):
+                    if calculated_weight_test is not None:
+                        fit_params_test['class_weight'] = {0: 1, 1: calculated_weight_test}
+                    model_for_test.fit(X_train_val, y_train_val, **fit_params_test)
+                elif isinstance(model_for_test, CatBoostClassifier):
+                    if calculated_weight_test is not None:
+                        fit_params_test['class_weights'] = [1, calculated_weight_test]
+                    model_for_test.fit(X_train_val, y_train_val, **fit_params_test)
+                elif isinstance(model_for_test, XGBClassifier):
+                    if calculated_weight_test is not None:
+                        model_for_test.set_params(scale_pos_weight=calculated_weight_test)
                     model_for_test.fit(X_train_val, y_train_val)
-                else: # XGBoost, others
+                else: # Others without specific weight params
                     model_for_test.fit(X_train_val, y_train_val)
+
                 test_preds = model_for_test.predict_proba(X_test)[:, 1]
                 test_preds_list.append(test_preds)
                 print(f"    Generated test predictions. Shape: {test_preds.shape}")
@@ -2044,6 +2171,7 @@ if __name__ == "__main__":
     parser.add_argument('--data-fraction', type=float, default=1.0, help='Fraction of the input training/validation datasets to use (0 to 1).')
     parser.add_argument('--use-loaded-adj-for-extraction', action='store_true', help='Use the loaded adjacency matrix for embedding extraction')
     parser.add_argument('--extract-embeddings-only', action='store_true', help='Calculate and cache embeddings, then exit without training downstream models.') # Added
+    parser.add_argument('--class-weight-multiplier', type=float, default=1.0, help='Multiplier for the weight of the positive class (class 1) during training. Default is 1 (no extra weight).') # Added
 
     args = parser.parse_args()
 
