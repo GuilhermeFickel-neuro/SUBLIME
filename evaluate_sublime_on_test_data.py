@@ -1167,7 +1167,17 @@ class Evaluator:
                  suggester_func = getattr(trial, f"suggest_{suggester_args[0]}")
                  params[name] = suggester_func(name, *suggester_args[1:])
 
-            model = model_class(**params)
+            # Add class weights to initialization params if applicable # MODIFIED
+            init_params = params.copy()
+            if calculated_weight is not None:
+                 if model_class == LGBMClassifier:
+                      init_params['class_weight'] = {0: 1, 1: calculated_weight}
+                 elif model_class == CatBoostClassifier:
+                      init_params['class_weights'] = [1, calculated_weight]
+                 elif model_class == XGBClassifier:
+                      init_params['scale_pos_weight'] = calculated_weight
+
+            model = model_class(**init_params) # Use modified init_params
             try:
                 if isinstance(model, LGBMClassifier):
                     eval_metric = 'auc'
@@ -1180,9 +1190,7 @@ class Evaluator:
                         'eval_metric': eval_metric,
                         'callbacks': [pruning_callback, early_stopping_callback]
                     }
-                    if calculated_weight is not None:
-                         # LightGBM uses class_weight dict
-                         fit_params['class_weight'] = {0: 1, 1: calculated_weight}
+                    # REMOVED class weight from fit_params for LGBM
 
                     model.fit(train_features, train_labels, **fit_params)
                           # Removed direct early_stopping_rounds=10 argument
@@ -1193,22 +1201,18 @@ class Evaluator:
                         'verbose': False,
                         'early_stopping_rounds': 10
                     }
-                    if calculated_weight is not None:
-                         # CatBoost uses class_weights list [weight_for_0, weight_for_1]
-                         fit_params['class_weights'] = [1, calculated_weight]
+                    # REMOVED class weight from fit_params for CatBoost
 
                     model.fit(train_features, train_labels, **fit_params)
                 elif isinstance(model, XGBClassifier):
                     # Manual Pruning Implementation for XGBoost >= 1.6
-                    # Combine base and trial parameters
-                    params.update(base_params) # Use base_params as default
+                    # XGBoost weight already handled during init_params creation above
 
+                    # Removed application here
+
+                    # eval_set calculation remains the same
                     eval_set = [(val_features, val_labels)]
                     eval_metric_name = params.get('eval_metric', 'auc') # Ensure AUC is used
-
-                    # Apply class weight if calculated # Added
-                    if calculated_weight is not None:
-                        params['scale_pos_weight'] = calculated_weight
 
                     # Add early stopping rounds for manual pruning logic
                     early_stopping_rounds = 20 # Set desired rounds
@@ -1352,7 +1356,7 @@ class Evaluator:
                 # --- Final Model Training & Testing ---
                 print("Training final model on train+validation data...")
                 final_params = {**base_params, **best_trial_params}
-                final_model = model_class(**final_params)
+                # final_model = model_class(**final_params)
 
                 # --- Calculate Class Weights for Final Training --- # Added
                 calculated_weight_final = None
@@ -1367,6 +1371,18 @@ class Evaluator:
                           print("  Warning: No positive samples in train+val labels. Cannot calculate final class weight.")
                  # --- End Final Class Weight Calculation --- #
 
+                # Add weights to init params for final model # MODIFIED
+                final_init_params = final_params.copy()
+                if calculated_weight_final is not None:
+                     if model_class == LGBMClassifier:
+                          final_init_params['class_weight'] = {0: 1, 1: calculated_weight_final}
+                     elif model_class == CatBoostClassifier:
+                          final_init_params['class_weights'] = [1, calculated_weight_final]
+                     elif model_class == XGBClassifier:
+                          final_init_params['scale_pos_weight'] = calculated_weight_final
+
+                final_model = model_class(**final_init_params) # Instantiate with final weights
+
                 try:
                     # Check for empty train_val data
                     if X_train_val.shape[0] == 0 or X_test.shape[0] == 0:
@@ -1375,18 +1391,21 @@ class Evaluator:
                          continue
 
                     # Apply weights during final fit # Added
-                    fit_params_final = {}
+                    # Fit without extra params, weights are in the model object now
                     if isinstance(final_model, LGBMClassifier):
-                         if calculated_weight_final is not None:
-                              fit_params_final['class_weight'] = {0: 1, 1: calculated_weight_final}
-                         final_model.fit(X_train_val, y_train_val, **fit_params_final)
+                         # if calculated_weight_final is not None:
+                         #      fit_params_final['class_weight'] = {0: 1, 1: calculated_weight_final}
+                         # final_model.fit(X_train_val, y_train_val, **fit_params_final)
+                         final_model.fit(X_train_val, y_train_val)
                     elif isinstance(final_model, CatBoostClassifier):
-                         if calculated_weight_final is not None:
-                              fit_params_final['class_weights'] = [1, calculated_weight_final]
-                         final_model.fit(X_train_val, y_train_val, **fit_params_final)
+                         # if calculated_weight_final is not None:
+                         #      fit_params_final['class_weights'] = [1, calculated_weight_final]
+                         # final_model.fit(X_train_val, y_train_val, **fit_params_final)
+                         final_model.fit(X_train_val, y_train_val)
                     elif isinstance(final_model, XGBClassifier):
-                         if calculated_weight_final is not None:
-                              final_model.set_params(scale_pos_weight=calculated_weight_final)
+                         # Weight already set during init, no need for set_params
+                         # if calculated_weight_final is not None:
+                         #      final_model.set_params(scale_pos_weight=calculated_weight_final)
                          final_model.fit(X_train_val, y_train_val) # Fit after setting param
                     else: # Others without specific weight params
                          final_model.fit(X_train_val, y_train_val)
@@ -1508,19 +1527,25 @@ class Evaluator:
             try:
                 # --- Generate Validation (OOF) Predictions --- # Modified fit calls
                 print(f"    Training {model_name}-{feature_set} on train split for validation predictions...")
-                model_for_oof = model_class(**final_params)
-                fit_params_oof = {}
+                # model_for_oof = model_class(**final_params)
+                # Add weights to init params for OOF model # MODIFIED
+                init_params_oof = final_params.copy()
+                if calculated_weight_oof is not None:
+                    if model_class == LGBMClassifier:
+                         init_params_oof['class_weight'] = {0: 1, 1: calculated_weight_oof}
+                    elif model_class == CatBoostClassifier:
+                         init_params_oof['class_weights'] = [1, calculated_weight_oof]
+                    elif model_class == XGBClassifier:
+                         init_params_oof['scale_pos_weight'] = calculated_weight_oof
+
+                model_for_oof = model_class(**init_params_oof)
+
+                # Fit without extra params
                 if isinstance(model_for_oof, LGBMClassifier):
-                    if calculated_weight_oof is not None:
-                        fit_params_oof['class_weight'] = {0: 1, 1: calculated_weight_oof}
-                    model_for_oof.fit(X_train, y_train, **fit_params_oof)
+                    model_for_oof.fit(X_train, y_train)
                 elif isinstance(model_for_oof, CatBoostClassifier):
-                    if calculated_weight_oof is not None:
-                        fit_params_oof['class_weights'] = [1, calculated_weight_oof]
-                    model_for_oof.fit(X_train, y_train, **fit_params_oof)
+                    model_for_oof.fit(X_train, y_train)
                 elif isinstance(model_for_oof, XGBClassifier):
-                    if calculated_weight_oof is not None:
-                        model_for_oof.set_params(scale_pos_weight=calculated_weight_oof)
                     model_for_oof.fit(X_train, y_train)
                 else: # Others without specific weight params
                     model_for_oof.fit(X_train, y_train)
@@ -1531,19 +1556,25 @@ class Evaluator:
 
                 # --- Generate Test Predictions --- # Modified fit calls
                 print(f"    Training {model_name}-{feature_set} on train+val split for test predictions...")
-                model_for_test = model_class(**final_params)
-                fit_params_test = {}
+                # model_for_test = model_class(**final_params)
+                # Add weights to init params for test model # MODIFIED
+                init_params_test = final_params.copy()
+                if calculated_weight_test is not None:
+                     if model_class == LGBMClassifier:
+                          init_params_test['class_weight'] = {0: 1, 1: calculated_weight_test}
+                     elif model_class == CatBoostClassifier:
+                          init_params_test['class_weights'] = [1, calculated_weight_test]
+                     elif model_class == XGBClassifier:
+                          init_params_test['scale_pos_weight'] = calculated_weight_test
+
+                model_for_test = model_class(**init_params_test)
+
+                # Fit without extra params
                 if isinstance(model_for_test, LGBMClassifier):
-                    if calculated_weight_test is not None:
-                        fit_params_test['class_weight'] = {0: 1, 1: calculated_weight_test}
-                    model_for_test.fit(X_train_val, y_train_val, **fit_params_test)
+                    model_for_test.fit(X_train_val, y_train_val)
                 elif isinstance(model_for_test, CatBoostClassifier):
-                    if calculated_weight_test is not None:
-                        fit_params_test['class_weights'] = [1, calculated_weight_test]
-                    model_for_test.fit(X_train_val, y_train_val, **fit_params_test)
+                    model_for_test.fit(X_train_val, y_train_val)
                 elif isinstance(model_for_test, XGBClassifier):
-                    if calculated_weight_test is not None:
-                        model_for_test.set_params(scale_pos_weight=calculated_weight_test)
                     model_for_test.fit(X_train_val, y_train_val)
                 else: # Others without specific weight params
                     model_for_test.fit(X_train_val, y_train_val)
