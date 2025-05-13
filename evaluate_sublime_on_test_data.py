@@ -22,9 +22,12 @@ import time
 import matplotlib.pyplot as plt
 import gc
 import sys # Import sys for sys.exit
+import scipy.sparse as sp # Added for sparse matrix operations
 
 # Add necessary imports from main and model/graph_learner
 from main import Experiment, GCL, FGP_learner, MLP_learner, ATT_learner, GNN_learner, normalize, symmetrize, sparse_mx_to_torch_sparse_tensor, torch_sparse_to_dgl_graph, dgl_graph_to_torch_sparse
+# Attempt to import from utils, assuming it's in the path or same directory structure
+from utils import knn_fast # sparse_mx_to_torch_sparse_tensor is already imported from main
 import dgl # Make sure dgl is imported
 from sklearn.linear_model import LogisticRegression # Add this import
 
@@ -48,10 +51,123 @@ def coerce_numeric(df_):
             #     df_[col] = df_[col].astype('category')
     return df_
 
-from main import Experiment  # Assuming main.py and Experiment class exist
+def _find_column_case_insensitive(df_columns, target_name_lower):
+    """Finds the actual column name in a list of columns, ignoring case."""
+    for col in df_columns:
+        if col.lower() == target_name_lower:
+            return col
+    return None
 
 # Suppress Optuna logging
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# --- New Anchor Graph Generation Function --- #
+def _generate_custom_anchor_graph(
+    node_features_tensor: torch.Tensor, 
+    cpf_identifiers_df: pd.DataFrame,   
+    id_column_name: str,               
+    k_knn: int,
+    sparse_output: bool,              
+    device: torch.device,
+    knn_threshold_type: str = 'none',
+    knn_std_dev_factor: float = 1.0,
+    relationship_csv_path: str = None,
+    relationship_cpf1_col: str = 'CPF',
+    relationship_cpf2_col: str = 'CPF_VINCULO',
+    relationship_weight: float = 1.0
+):
+    """Generates a new anchor graph based on provided features and relationship data."""
+    node_features_tensor = node_features_tensor.to(device)
+    n_total_samples = node_features_tensor.shape[0]
+
+    if len(cpf_identifiers_df) != n_total_samples:
+        raise ValueError(
+            f"Length of cpf_identifiers_df ({len(cpf_identifiers_df)}) "
+            f"does not match node_features_tensor rows ({n_total_samples})."
+        )
+
+    # 1. Create CPF to Index Mapping
+    actual_id_col = _find_column_case_insensitive(cpf_identifiers_df.columns, id_column_name.lower())
+    if not actual_id_col:
+        raise ValueError(f"ID column '{id_column_name}' not found in cpf_identifiers_df. Available: {cpf_identifiers_df.columns.tolist()}")
+    
+    cpf_to_index = {cpf: idx for idx, cpf in enumerate(cpf_identifiers_df[actual_id_col])}
+    print(f"Created ID-to-index mapping for {len(cpf_to_index)} unique IDs / {n_total_samples} total samples for new anchor graph.")
+
+    # 2. KNN Graph (Feature Similarity)
+    print(f"Constructing KNN graph for new anchor (k={k_knn}, sim=cosine, threshold={knn_threshold_type}) ...")
+    adj_knn_sparse = None
+    try:
+        if node_features_tensor.shape[1] == 0:
+            raise ValueError("Cannot compute KNN graph with zero features.")
+        
+        knn_rows, knn_cols, knn_vals = knn_fast(
+            node_features_tensor, k=k_knn, use_gpu=(device.type == 'cuda'),
+            knn_threshold_type=knn_threshold_type, knn_std_dev_factor=knn_std_dev_factor,
+            return_values=True
+        )
+        adj_knn_sparse = sp.csr_matrix(
+            (knn_vals.cpu().numpy(), (knn_rows.cpu().numpy(), knn_cols.cpu().numpy())),
+            shape=(n_total_samples, n_total_samples)
+        )
+        adj_knn_sparse = adj_knn_sparse.maximum(adj_knn_sparse.T) # Symmetrize
+        print(f"  KNN graph computed. Shape: {adj_knn_sparse.shape}, Non-zero entries: {adj_knn_sparse.nnz}")
+    except Exception as e:
+        print(f"Error during KNN graph construction: {e}. Using identity matrix for KNN part.")
+        adj_knn_sparse = sp.eye(n_total_samples, dtype=np.float32, format='csr')
+
+    # 3. Relationship Graph
+    adj_rel_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32)
+    if relationship_csv_path:
+        print(f"Constructing relationship graph from {relationship_csv_path}...")
+        try:
+            df_relationships = pd.read_csv(relationship_csv_path, sep='\t') 
+            
+            actual_rel_cpf1_col = _find_column_case_insensitive(df_relationships.columns, relationship_cpf1_col.lower())
+            actual_rel_cpf2_col = _find_column_case_insensitive(df_relationships.columns, relationship_cpf2_col.lower())
+
+            if not actual_rel_cpf1_col or not actual_rel_cpf2_col:
+                raise ValueError(f"Relationship CSV '{relationship_csv_path}' missing required columns '{relationship_cpf1_col}' or '{relationship_cpf2_col}'. Found: {df_relationships.columns.tolist()}")
+
+            rows, cols, data = [], [], []
+            valid_edges = 0
+            for _, row_rel in df_relationships.iterrows():
+                id1_val = row_rel[actual_rel_cpf1_col]
+                id2_val = row_rel[actual_rel_cpf2_col]
+                idx1 = cpf_to_index.get(id1_val)
+                idx2 = cpf_to_index.get(id2_val)
+                if idx1 is not None and idx2 is not None and idx1 != idx2:
+                    rows.extend([idx1, idx2])
+                    cols.extend([idx2, idx1])
+                    data.extend([relationship_weight, relationship_weight])
+                    valid_edges +=1
+            
+            if valid_edges > 0:
+                adj_rel_sparse = sp.csr_matrix((data, (rows, cols)), shape=(n_total_samples, n_total_samples), dtype=np.float32)
+                adj_rel_sparse.sum_duplicates()
+                print(f"  Relationship graph computed. Non-zero entries: {adj_rel_sparse.nnz}")
+            else:
+                print("  No valid relationship edges created.")
+        except Exception as e:
+            print(f"Error loading or processing relationship graph: {e}. Skipping relationship graph.")
+    
+    # 4. Combine Graphs
+    print("Combining KNN and Relationship graphs for new anchor...")
+    combined_graph_sparse = adj_knn_sparse.maximum(adj_rel_sparse)
+    # print(f"  Combined graph non-zero entries: {combined_graph_sparse.nnz}") # Optional: for debugging
+    
+    # Add self-loops with weight 1.0
+    combined_graph_sparse = combined_graph_sparse.maximum(sp.eye(n_total_samples, dtype=np.float32, format='csr'))
+    print(f"  Final combined graph + self-loops non-zero entries: {combined_graph_sparse.nnz}")
+
+    # 5. Convert to PyTorch Tensor (this is the raw_adj, normalization happens in SublimeHandler)
+    if sparse_output:
+        final_graph_tensor_raw = sparse_mx_to_torch_sparse_tensor(combined_graph_sparse)
+    else:
+        final_graph_tensor_raw = torch.FloatTensor(combined_graph_sparse.todense())
+    
+    return final_graph_tensor_raw.to(device)
+# --- End New Anchor Graph Generation Function --- #
 
 # --- Configuration Class ---
 class Config:
@@ -74,6 +190,24 @@ class Config:
         self.use_loaded_adj_for_extraction = args.use_loaded_adj_for_extraction
         self.extract_embeddings_only = args.extract_embeddings_only # Added
         self.class_weight_multiplier = args.class_weight_multiplier # Added
+
+        # --- New Anchor Graph Generation Config --- # Added
+        self.generate_new_anchor_adj_for_eval = args.generate_new_anchor_adj_for_eval
+        if self.generate_new_anchor_adj_for_eval:
+            self.anchor_adj_k_knn = args.anchor_adj_k_knn
+            self.anchor_adj_use_sparse_format = bool(args.anchor_adj_use_sparse_format)
+            self.anchor_adj_id_col_name = args.anchor_adj_id_col_name
+            self.anchor_adj_relationship_csv = args.anchor_adj_relationship_csv
+            self.anchor_adj_relationship_cpf1_col = args.anchor_adj_relationship_cpf1_col
+            self.anchor_adj_relationship_cpf2_col = args.anchor_adj_relationship_cpf2_col
+            self.anchor_adj_relationship_weight = args.anchor_adj_relationship_weight
+            self.anchor_adj_knn_threshold_type = args.anchor_adj_knn_threshold_type
+            self.anchor_adj_knn_std_dev_factor = args.anchor_adj_knn_std_dev_factor
+            # The main CSV for IDs will be self.neurolake_csv (already in Config)
+            print("New anchor graph generation for evaluation is ENABLED.")
+            if not self.neurolake_csv:
+                raise ValueError("neurolake_csv must be provided when generate_new_anchor_adj_for_eval is True for ID mapping.")
+        # --- End New Anchor Graph Generation Config --- #
 
         self.dataset_name = self._derive_dataset_name()
         self.test_dataset_name = self._derive_test_dataset_name()
@@ -436,10 +570,11 @@ class SublimeHandler:
         features_path = os.path.join(self.config.model_dir, 'features.pt')
         adj_path = os.path.join(self.config.model_dir, 'adjacency.pt')
 
-        if not all(os.path.exists(p) for p in [config_path, model_path, learner_path, features_path, adj_path]):
-            raise FileNotFoundError(f"One or more model files not found in {self.config.model_dir}. Expected config.txt, model.pt, graph_learner.pt, features.pt, adjacency.pt")
+        # Check for essential files for model loading itself
+        if not all(os.path.exists(p) for p in [config_path, model_path, learner_path, features_path]):
+            raise FileNotFoundError(f"One or more essential model files not found in {self.config.model_dir}. Expected config.txt, model.pt, graph_learner.pt, features.pt")
 
-        # 1. Read config.txt
+        # 1. Read config.txt (model's original training config)
         model_config = {}
         with open(config_path, 'r') as f:
             for line in f:
@@ -462,12 +597,69 @@ class SublimeHandler:
         # Store essential config items
         self.sparse = model_config.get('sparse', False) # Default to False if missing
 
-        # 2. Load Features and Adjacency Matrix first (needed for some learners)
+        # 2. Load Features (these are the features of the N nodes SUBLIME was trained on)
         self.features = torch.load(features_path, map_location=self.device)
 
-        adj_data = torch.load(adj_path, map_location=self.device)
-        if self.sparse:
-            if isinstance(adj_data, dict) and 'edges' in adj_data: # Saved DGL graph dictionary
+        adj_data = None # Will hold the raw adjacency data (tensor or dict)
+
+        # --- Potentially Generate New Anchor Adjacency --- # Added Block
+        if self.config.generate_new_anchor_adj_for_eval:
+            print("Attempting to generate a new anchor adjacency matrix for evaluation...")
+            if not self.config.neurolake_csv or not os.path.exists(self.config.neurolake_csv):
+                raise FileNotFoundError(
+                    f"Neurolake CSV for IDs ('{self.config.neurolake_csv}') not found or not specified, "
+                    f"but required for generating new anchor adjacency with ID mapping.")
+            
+            # Load the main neurolake_csv to get identifiers for the loaded self.features
+            # This CSV must correspond to the data that self.features was derived from.
+            try:
+                print(f"Loading ID mapping CSV: {self.config.neurolake_csv}")
+                # Only load, don't preprocess here as self.features are already preprocessed
+                cpf_identifiers_df = pd.read_csv(self.config.neurolake_csv, delimiter='\t')
+                if len(cpf_identifiers_df) != self.features.shape[0]:
+                    raise ValueError(
+                        f"Row count mismatch: neurolake_csv for IDs ({len(cpf_identifiers_df)} rows) "
+                        f"does not match loaded features.pt ({self.features.shape[0]} rows). "
+                        f"Ensure '{self.config.neurolake_csv}' is the correct file corresponding to the SUBLIME model's training data."
+                    )
+            except Exception as e:
+                raise RuntimeError(f"Failed to load or validate neurolake_csv for ID mapping ('{self.config.neurolake_csv}'): {e}")
+
+            adj_data = _generate_custom_anchor_graph(
+                node_features_tensor=self.features, 
+                cpf_identifiers_df=cpf_identifiers_df,
+                id_column_name=self.config.anchor_adj_id_col_name,
+                k_knn=self.config.anchor_adj_k_knn,
+                sparse_output=self.config.anchor_adj_use_sparse_format, # This will be the format of adj_data
+                device=self.device,
+                knn_threshold_type=self.config.anchor_adj_knn_threshold_type,
+                knn_std_dev_factor=self.config.anchor_adj_knn_std_dev_factor,
+                relationship_csv_path=self.config.anchor_adj_relationship_csv,
+                relationship_cpf1_col=self.config.anchor_adj_relationship_cpf1_col,
+                relationship_cpf2_col=self.config.anchor_adj_relationship_cpf2_col,
+                relationship_weight=self.config.anchor_adj_relationship_weight
+            )
+            print(f"New anchor adjacency matrix generated. Type: {type(adj_data)}, Sparse: {adj_data.is_sparse if isinstance(adj_data, torch.Tensor) else 'N/A'}")
+            # The self.sparse attribute will be set based on model_config later, 
+            # but the new adj_data format (dense/sparse tensor) must be compatible with subsequent processing.
+            # We will rely on the existing logic to handle adj_data correctly.
+            # The key is that if anchor_adj_use_sparse_format is true, adj_data is a sparse tensor.
+            # If false, adj_data is a dense tensor.
+
+        else:
+            # --- Load Adjacency from File (original logic) ---
+            if not os.path.exists(adj_path):
+                 raise FileNotFoundError(f"Adjacency file (adjacency.pt) not found in {self.config.model_dir} and not generating new one.")
+            print(f"Loading existing adjacency matrix from {adj_path}")
+            adj_data = torch.load(adj_path, map_location=self.device)
+        # --- End Adjacency Loading/Generation --- #
+
+        # Existing logic for processing adj_data (whether loaded or generated)
+        # self.sparse is read from model_config.txt. This determines how GCL model expects the graph.
+        # The adj_data (newly generated or loaded) must be processed to match this expectation.
+
+        if self.sparse: # self.sparse is from the SUBLIME model's original training config
+            if isinstance(adj_data, dict) and 'edges' in adj_data: # Saved DGL graph dictionary (from file only)
                  num_nodes = adj_data['num_nodes']
                  edges = adj_data['edges']
                  weights = adj_data.get('weights') # May not have weights
@@ -483,12 +675,12 @@ class SublimeHandler:
                  # Convert to DGL graph for model forward pass
                  self.adj = torch_sparse_to_dgl_graph(self.adj)
             else:
-                 raise TypeError(f"Unexpected sparse adjacency format loaded from {adj_path}: {type(adj_data)}")
+                 raise TypeError(f"Unexpected sparse adjacency format loaded/generated: {type(adj_data)}. Expected torch sparse tensor or DGL dict (from file). Ensure anchor_adj_use_sparse_format matches model's sparse training if generating.")
         else: # Dense
             if isinstance(adj_data, torch.Tensor) and not adj_data.is_sparse:
                  self.adj = normalize(adj_data, 'sym', self.sparse) # Normalize dense tensor
             else:
-                 raise TypeError(f"Expected dense tensor for adjacency, got {type(adj_data)} from {adj_path}")
+                 raise TypeError(f"Expected dense tensor for adjacency, got {type(adj_data)} from {adj_path if not self.config.generate_new_anchor_adj_for_eval else 'generated adj'}. Ensure anchor_adj_use_sparse_format is False if model trained dense.")
         self.adj = self.adj.to(self.device) # Ensure final adj is on device
 
         # 3. Instantiate Graph Learner
@@ -623,7 +815,31 @@ class SublimeHandler:
         cache_file_embeddings = None
         cache_file_classifications = None
         can_cache = self.config.cache_dir and dataset_tag
-        extraction_mode_tag = "_anchor" if self.config.use_loaded_adj_for_extraction else ""
+        
+        # --- Modified extraction_mode_tag for compatibility and specificity ---
+        extraction_mode_tag = "" # Default for learner mode or if other conditions not met
+
+        if self.config.use_loaded_adj_for_extraction:
+            if self.config.generate_new_anchor_adj_for_eval:
+                # New specific tag for newly generated anchor graphs during evaluation
+                rel_file_hash_part = ""
+                if self.config.anchor_adj_relationship_csv and os.path.exists(self.config.anchor_adj_relationship_csv):
+                    try:
+                        fname = os.path.basename(self.config.anchor_adj_relationship_csv)
+                        mtime = str(os.path.getmtime(self.config.anchor_adj_relationship_csv))[:5]
+                        # Sanitize filename part for cache key
+                        sanitized_fname = ''.join(c if c.isalnum() else '-' for c in fname.replace('.csv','').replace('.tsv',''))[:10]
+                        rel_file_hash_part = f"_rel_{sanitized_fname}_{mtime}"
+                    except Exception:
+                        rel_file_hash_part = "_rel_err" # Fallback if hashing fails
+                extraction_mode_tag = f"_anchor_gen_eval_k{self.config.anchor_adj_k_knn}{rel_file_hash_part}"
+            else:
+                # This is the case for existing caches using the original loaded anchor graph
+                # Reverts to the simple tag used before the generate_new_anchor_adj_for_eval feature
+                extraction_mode_tag = "_anchor" 
+        # If not self.config.use_loaded_adj_for_extraction, tag remains "" (empty string), 
+        # which was the behavior for learner-active mode.
+        # --- End Modified extraction_mode_tag ---
 
         if can_cache:
             cache_file_base_embeddings = f"sublime_embeddings_{self.config.model_name_tag}_{dataset_tag}{extraction_mode_tag}.npy"
@@ -2201,8 +2417,30 @@ if __name__ == "__main__":
     parser.add_argument('--k-neighbors', type=int, nargs='+', default=[], help='List of neighbor counts (k) for KNN features. Values <= 0 are ignored.')
     parser.add_argument('--data-fraction', type=float, default=1.0, help='Fraction of the input training/validation datasets to use (0 to 1).')
     parser.add_argument('--use-loaded-adj-for-extraction', action='store_true', help='Use the loaded adjacency matrix for embedding extraction')
-    parser.add_argument('--extract-embeddings-only', action='store_true', help='Calculate and cache embeddings, then exit without training downstream models.') # Added
-    parser.add_argument('--class-weight-multiplier', type=float, default=1.0, help='Multiplier for the weight of the positive class (class 1) during training. Default is 1 (no extra weight).') # Added
+    parser.add_argument('--extract-embeddings-only', action='store_true', help='Calculate and cache embeddings, then exit without training downstream models.')
+    parser.add_argument('--class-weight-multiplier', type=float, default=1.0, help='Multiplier for the weight of the positive class (class 1) during training. Default is 1 (no extra weight).')
+
+    anchor_group = parser.add_argument_group('New Anchor Graph Generation (for evaluation)')
+    anchor_group.add_argument('--generate-new-anchor-adj-for-eval', action='store_true',
+                               help='Generate a new anchor adjacency matrix for evaluation instead of using the one from model_dir.')
+    anchor_group.add_argument('--anchor-adj-k-knn', type=int, default=10,
+                               help='K for KNN when generating new anchor graph.')
+    anchor_group.add_argument('--anchor-adj-use-sparse-format', type=int, default=1,
+                               help='Use sparse format for the new anchor graph (1 for sparse, 0 for dense).')
+    anchor_group.add_argument('--anchor-adj-id-col-name', type=str, default='id',
+                               help="Name of the ID column in neurolake_csv for mapping relationships, e.g., 'id' or 'CPF'.")
+    anchor_group.add_argument('--anchor-adj-relationship-csv', type=str, default=None,
+                               help='Path to CSV file for relationship data for the new anchor graph.')
+    anchor_group.add_argument('--anchor-adj-relationship-cpf1-col', type=str, default='CPF',
+                               help='Name of the first ID column in the relationship CSV.')
+    anchor_group.add_argument('--anchor-adj-relationship-cpf2-col', type=str, default='CPF_VINCULO',
+                               help='Name of the second ID column in the relationship CSV.')
+    anchor_group.add_argument('--anchor-adj-relationship-weight', type=float, default=1.0,
+                               help='Weight for edges from the relationship data.')
+    anchor_group.add_argument('--anchor-adj-knn-threshold-type', type=str, default='none', choices=['none', 'median_k', 'std_dev_k'],
+                               help='Type of thresholding for KNN graph generation (none, median_k, std_dev_k).')
+    anchor_group.add_argument('--anchor-adj-knn-std-dev-factor', type=float, default=1.0,
+                               help='Factor (alpha) for std_dev_k threshold (mean - alpha*std_dev).')
 
     args = parser.parse_args()
 
