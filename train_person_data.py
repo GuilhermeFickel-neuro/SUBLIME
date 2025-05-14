@@ -19,14 +19,29 @@ from sklearn.model_selection import train_test_split # Import for validation spl
 # Add device selection
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# <<< INSERT START
+# Haversine distance function
+def haversine(lat1, lon1, lat2, lon2, earth_radius_km=6371):
+    """
+    Calculate the great circle distance between two points
+    on the earth (specified in decimal degrees)
+    """
+    # convert decimal degrees to radians
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+
+    # haversine formula
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    r = earth_radius_km
+    return c * r
+
 def find_column_case_insensitive(df_columns, target_name_lower):
     """Finds the actual column name in a list of columns, ignoring case."""
     for col in df_columns:
         if col.lower() == target_name_lower:
             return col
     return None
-# <<< INSERT END
 
 def _check_processed_data(data, dataset_name=""):
     """Internal helper to check processed data for issues."""
@@ -387,6 +402,20 @@ def load_person_data(args):
         raise ValueError(f"Main dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive).")
 
     all_cpfs_list = [df_main[actual_cpf_col_main]]
+    # Store coordinates along with CPFs
+    all_lat_list = []
+    all_lon_list = []
+
+    actual_lat_col_main = find_column_case_insensitive(df_main.columns, args.latitude_col.lower())
+    actual_lon_col_main = find_column_case_insensitive(df_main.columns, args.longitude_col.lower())
+
+    if args.use_geo_graph:
+        if actual_lat_col_main is None:
+            raise ValueError(f"Main dataset missing latitude column '{args.latitude_col}' for geo graph.")
+        if actual_lon_col_main is None:
+            raise ValueError(f"Main dataset missing longitude column '{args.longitude_col}' for geo graph.")
+        all_lat_list.append(df_main[actual_lat_col_main])
+        all_lon_list.append(df_main[actual_lon_col_main])
 
     # Reload annotated df briefly JUST to get CPF column if needed, then discard
     # df_annotated_temp_for_cpf = None # No longer needed
@@ -396,13 +425,35 @@ def load_person_data(args):
         if actual_cpf_col_annotated is None:
                 raise ValueError(f"Annotated dataset missing required identifier column '{cpf_col_target_name}' (case-insensitive) after potential modifications.")
         all_cpfs_list.append(df_annotated[actual_cpf_col_annotated]) # Append from existing df
-     
+
+        if args.use_geo_graph:
+            actual_lat_col_annotated = find_column_case_insensitive(df_annotated.columns, args.latitude_col.lower())
+            actual_lon_col_annotated = find_column_case_insensitive(df_annotated.columns, args.longitude_col.lower())
+            if actual_lat_col_annotated is None:
+                raise ValueError(f"Annotated dataset missing latitude column '{args.latitude_col}' for geo graph.")
+            if actual_lon_col_annotated is None:
+                raise ValueError(f"Annotated dataset missing longitude column '{args.longitude_col}' for geo graph.")
+            all_lat_list.append(df_annotated[actual_lat_col_annotated])
+            all_lon_list.append(df_annotated[actual_lon_col_annotated])
+
+
     combined_cpfs = pd.concat(all_cpfs_list, ignore_index=True)
     if len(combined_cpfs) != n_total_samples:
          raise ValueError(f"Length of combined CPFs ({len(combined_cpfs)}) does not match total samples ({n_total_samples}).")
 
     cpf_to_index = {cpf: idx for idx, cpf in enumerate(combined_cpfs)}
     print(f"Created CPF to index mapping for {len(cpf_to_index)} unique CPFs / {n_total_samples} total samples.")
+
+    # Combine coordinates if geo graph is used
+    combined_lat = None
+    combined_lon = None
+    if args.use_geo_graph:
+        combined_lat = pd.concat(all_lat_list, ignore_index=True).to_numpy()
+        combined_lon = pd.concat(all_lon_list, ignore_index=True).to_numpy()
+        if len(combined_lat) != n_total_samples or len(combined_lon) != n_total_samples:
+            raise ValueError("Length of combined lat/lon does not match total samples.")
+        print(f"Combined latitude and longitude for {n_total_samples} samples.")
+
     # Delete combined CPF series and original dataframes no longer needed
     del combined_cpfs, df_main # df_main is no longer needed after preprocessing and CPF extraction
     if 'df_annotated' in locals(): del df_annotated # Delete the potentially modified annotated df
@@ -609,16 +660,84 @@ def load_person_data(args):
         gc.collect()
         print(f"Relationship dataframe deleted. Memory usage: {get_memory_usage():.2f} GB")
 
-    # --- 8c. Combine Graphs ---
-    print("Combining KNN and Relationship graphs...")
+    # --- 8c. Geographical Proximity Graph ---
+    adj_geo_sparse = None
+    if args.use_geo_graph:
+        print(f"Constructing geographical proximity graph (radius={args.geo_radius_km} km, weight={args.geo_weight})...")
+        if combined_lat is None or combined_lon is None:
+            print("Warning: Latitude or Longitude data not available. Skipping geographical graph.")
+        else:
+            geo_rows, geo_cols, geo_data = [], [], []
+            valid_geo_edges = 0
+            # Potentially large number of pairs, consider optimization if slow
+            # For now, direct iteration for clarity
+            for i in range(n_total_samples):
+                for j in range(i + 1, n_total_samples): # Avoid self-loops and duplicate pairs
+                    # Check for NaN or invalid coordinates before distance calculation
+                    if pd.isna(combined_lat[i]) or pd.isna(combined_lon[i]) or \
+                       pd.isna(combined_lat[j]) or pd.isna(combined_lon[j]):
+                        continue
+
+                    distance = haversine(combined_lat[i], combined_lon[i], combined_lat[j], combined_lon[j])
+                    if distance <= args.geo_radius_km:
+                        current_geo_edge_weight = 0.0
+                        if args.geo_weight is None:
+                            # Dynamic weight: 2.0 at 0 distance, 0.5 at geo_radius_km distance.
+                            # args.geo_radius_km is validated to be > 0 if use_geo_graph is true.
+                            if distance == 0: # Avoid division by zero if radius is also effectively zero, though radius > 0 is validated
+                                current_geo_edge_weight = 2.0
+                            elif args.geo_radius_km > 0: # Ensure radius is positive for scaling
+                                current_geo_edge_weight = 2.0 - 1.5 * (distance / args.geo_radius_km)
+                                # Clamp to ensure it's within [0.5, 2.0] due to potential float precision with distance == geo_radius_km
+                                current_geo_edge_weight = max(0.5, min(2.0, current_geo_edge_weight))
+                            else: # Fallback, though geo_radius_km > 0 is validated
+                                current_geo_edge_weight = 0.5 # Smallest weight in range if radius is not usable
+                        else:
+                            # User provided a specific weight
+                            current_geo_edge_weight = args.geo_weight
+                        
+                        geo_rows.extend([i, j]) # Add edge in both directions for symmetry
+                        geo_cols.extend([j, i])
+                        geo_data.extend([current_geo_edge_weight, current_geo_edge_weight])
+                        valid_geo_edges += 1
+            
+            if valid_geo_edges > 0:
+                adj_geo_sparse = sp.csr_matrix((geo_data, (geo_rows, geo_cols)),
+                                               shape=(n_total_samples, n_total_samples), dtype=np.float32)
+                adj_geo_sparse.sum_duplicates() # Consolidate duplicate edges if any (shouldn't happen with j=i+1)
+                print(f"  Geographical proximity graph computed. Shape: {adj_geo_sparse.shape}, Non-zero entries: {adj_geo_sparse.nnz}")
+                print(f"  (Found {valid_geo_edges} valid geographical pairs within {args.geo_radius_km} km)")
+            else:
+                print(f"  No geographical proximity edges created within {args.geo_radius_km} km.")
+                adj_geo_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32) # Empty
+
+        # Clean up combined coordinates
+        del combined_lat, combined_lon
+        gc.collect()
+
+    # --- 8d. Combine Graphs ---
+    print("Combining KNN, Relationship, and Geographical graphs...")
+    
+    # Start with KNN graph
+    current_combined_graph = adj_knn_sparse
+    
+    # Combine with Relationship graph if it exists and has edges
     if adj_rel_sparse is not None and adj_rel_sparse.nnz > 0:
-        # Combine using maximum: Edges in either graph are kept.
-        # Relationship edges (value args.relationship_weight) or KNN similarities are kept based on max value.
-        initial_graph_sparse = adj_knn_sparse.maximum(adj_rel_sparse)
-        print(f"  Combined graph non-zero entries: {initial_graph_sparse.nnz} (using maximum)")
+        current_combined_graph = current_combined_graph.maximum(adj_rel_sparse)
+        print(f"  Combined with Relationship graph. Non-zero entries: {current_combined_graph.nnz}")
     else:
-        print("  Using only KNN graph as initial graph (no valid relationships found/created).")
-        initial_graph_sparse = adj_knn_sparse # Use only KNN graph
+        print("  No valid Relationship graph to combine or it was not specified.")
+        
+    # Combine with Geographical graph if it exists and has edges
+    if adj_geo_sparse is not None and adj_geo_sparse.nnz > 0:
+        current_combined_graph = current_combined_graph.maximum(adj_geo_sparse)
+        print(f"  Combined with Geographical graph. Non-zero entries: {current_combined_graph.nnz}")
+    else:
+        print("  No valid Geographical graph to combine or it was not specified.")
+
+    initial_graph_sparse = current_combined_graph
+    print(f"  Total non-zero entries after all combinations (before self-loops): {initial_graph_sparse.nnz}")
+
 
     # Add self-loops with weight 1.0 using maximum
     print("Adding self-loops (weight 1.0)...")
@@ -655,6 +774,8 @@ def load_person_data(args):
     del adj_knn_sparse # No longer needed after combination
     if adj_rel_sparse is not None:
         del adj_rel_sparse # No longer needed after combination
+    if adj_geo_sparse is not None: # Delete geo graph if it was created
+        del adj_geo_sparse
     del initial_graph_sparse # No longer needed after conversion to tensor
     gc.collect()
     print(f"Intermediate sparse matrices deleted. Memory: {get_memory_usage():.2f} GB")
@@ -693,10 +814,15 @@ def main():
         # n_clusters=5                 # Let parent handle default or set via command line
         # type_learner defaults to 'fgp' from parent
         # lr, hidden_dim etc. default from parent
+        # Defaults for geo graph (already set in main.py's create_parser, but good for explicitness if running this script directly)
+        use_geo_graph=0,
+        geo_weight=None, # Default to None for dynamic weighting
+        geo_radius_km=1.0,
+        latitude_col='LATITUDE',
+        longitude_col='LONGITUDE'
     )
 
     # Add arguments specific to this script OR override parent defaults forcefully
-    # parser.add_argument('-k', type=int, default=10, help='Override k value') # Example override
     parser.add_argument('-n_clusters', type=int, help='Number of clusters for clustering task') # Keep help text
 
 
@@ -712,6 +838,21 @@ def main():
     if not args.annotated_dataset and args.annotation_column:
         print("Warning: --annotation_column specified but --annotated_dataset is missing. The annotation column will be ignored.")
         args.annotation_column = None # Ensure it's None if no annotated dataset
+    
+    # --- Geo Graph Validation ---
+    if args.use_geo_graph:
+        if not hasattr(args, 'latitude_col') or not args.latitude_col:
+            parser.error("--use_geo_graph requires --latitude_col to be specified.")
+        if not hasattr(args, 'longitude_col') or not args.longitude_col:
+            parser.error("--use_geo_graph requires --longitude_col to be specified.")
+        if not hasattr(args, 'geo_radius_km') or args.geo_radius_km <= 0:
+            parser.error("--use_geo_graph requires --geo_radius_km to be a positive value.")
+        # Validation for geo_weight: if provided (not None), it could be any float.
+        # No specific warning if it's None, as that's for dynamic weighting.
+        # Optional: Add check for non-negativity if user provides a weight.
+        # if args.geo_weight is not None and args.geo_weight < 0:
+        #     parser.error("--geo_weight, if provided, must be non-negative.")
+
     # --- End Validation ---
 
 

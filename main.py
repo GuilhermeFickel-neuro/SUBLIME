@@ -2125,6 +2125,18 @@ def create_parser():
     parser.add_argument('-cleanup_every_n_chunks', type=int, default=5,
                      help='Call torch.cuda.empty_cache() every N chunks to free up memory (0 to disable)')
 
+    # Geographical graph arguments
+    parser.add_argument('--use_geo_graph', type=int, default=0,
+                        help='Whether to use geographical proximity for graph construction (0=disabled, 1=enabled)')
+    parser.add_argument('--geo_weight', type=float, default=None,
+                        help='Weight for edges created from geographical proximity. If not provided, weight is derived from distance (default: None for dynamic weight)')
+    parser.add_argument('--geo_radius_km', type=float, default=1.0,
+                        help='Maximum radius in kilometers to consider two points geographically connected (default: 1.0 km)')
+    parser.add_argument('--latitude_col', type=str, default='LATITUDE',
+                        help='Name of the latitude column in the input data (case-insensitive, default: LATITUDE)')
+    parser.add_argument('--longitude_col', type=str, default='LONGITUDE',
+                        help='Name of the longitude column in the input data (case-insensitive, default: LONGITUDE)')
+
     return parser
 
 if __name__ == '__main__':
