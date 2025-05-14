@@ -2240,7 +2240,8 @@ def main(args):
             return
 
     except Exception as e:
-        print(f"ERROR during SUBLIME Handling phase: {e}")
+        import logging
+        logging.error(f"ERROR during SUBLIME Handling phase: {e}", exc_info=True)
         sys.exit(1)
 
 
