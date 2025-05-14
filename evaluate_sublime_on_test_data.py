@@ -682,6 +682,9 @@ class SublimeHandler:
             else:
                 raise TypeError(f"For dense GCL model, {source_description} is {type(adj_data_raw)}. Expected dense torch.Tensor.")
         
+        if processed_adj is None:
+            raise RuntimeError(f"_process_and_set_adj: processed_adj is None before assignment to self.adj. adj_data_raw type: {type(adj_data_raw)}, source: {source_description}, expected_sparse: {expected_final_sparse_format}")
+
         self.adj = processed_adj.to(self.device)
         print(f"Adjacency matrix ({source_description}) processed and set. Type: {type(self.adj)}, Device: {self.adj.device}")
 
