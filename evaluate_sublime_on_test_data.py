@@ -86,13 +86,30 @@ def _generate_custom_anchor_graph(
             f"does not match node_features_tensor rows ({n_total_samples})."
         )
 
-    # 1. Create CPF to Index Mapping
-    actual_id_col = _find_column_case_insensitive(cpf_identifiers_df.columns, id_column_name.lower())
-    if not actual_id_col:
-        raise ValueError(f"ID column '{id_column_name}' not found in cpf_identifiers_df. Available: {cpf_identifiers_df.columns.tolist()}")
-    
-    cpf_to_index = {cpf: idx for idx, cpf in enumerate(cpf_identifiers_df[actual_id_col])}
-    print(f"Created ID-to-index mapping for {len(cpf_to_index)} unique IDs / {n_total_samples} total samples for new anchor graph.")
+    # 1. CPF to Index Mapping (conditionally for relationships) & Relationship Graph Setup
+    cpf_to_index = {}
+    actual_id_col_in_main_data = None 
+    can_attempt_relationship_graph = False # Flag to indicate if we can proceed with relationship graph logic
+
+    if relationship_csv_path:
+        print(f"Relationship CSV path provided: '{relationship_csv_path}'. "
+              f"Validating main data ID column '{id_column_name}' for mapping.")
+        actual_id_col_in_main_data = _find_column_case_insensitive(cpf_identifiers_df.columns, id_column_name.lower())
+        
+        if not actual_id_col_in_main_data:
+            print(f"Warning: Main data ID column '{id_column_name}' (for mapping relationships, from --anchor-adj-id-col-name) "
+                  f"not found in the evaluation dataset's columns: {cpf_identifiers_df.columns.tolist()}. "
+                  "Relationship graph construction will be SKIPPED. Anchor graph will be KNN-based only.")
+            # can_attempt_relationship_graph remains False
+        else:
+            # ID column found in main data, create mapping
+            cpf_to_index = {cpf: idx for idx, cpf in enumerate(cpf_identifiers_df[actual_id_col_in_main_data])}
+            print(f"Created ID-to-index mapping using column '{actual_id_col_in_main_data}' from main data for {len(cpf_to_index)} unique IDs. "
+                  "This mapping will be used if the relationship graph is built.")
+            can_attempt_relationship_graph = True # ID mapping successful, safe to attempt relationship graph construction
+    else:
+        print("No relationship_csv_path provided. Relationship graph construction will be SKIPPED. "
+              "Anchor graph will be KNN-based only (if KNN is enabled).")
 
     # 2. KNN Graph (Feature Similarity)
     print(f"Constructing KNN graph for new anchor (k={k_knn}, sim=cosine, threshold={knn_threshold_type}) ...")
@@ -116,40 +133,61 @@ def _generate_custom_anchor_graph(
         print(f"Error during KNN graph construction: {e}. Using identity matrix for KNN part.")
         adj_knn_sparse = sp.eye(n_total_samples, dtype=np.float32, format='csr')
 
-    # 3. Relationship Graph
-    adj_rel_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32)
-    if relationship_csv_path:
-        print(f"Constructing relationship graph from {relationship_csv_path}...")
+    # 3. Relationship Graph (Conditional Construction)
+    adj_rel_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32) # Initialize as empty
+
+    if can_attempt_relationship_graph: # True only if relationship_csv_path was given AND actual_id_col_in_main_data was found
+        print(f"Attempting to construct relationship graph from '{relationship_csv_path}'...")
         try:
-            df_relationships = pd.read_csv(relationship_csv_path, sep='\t') 
-            
-            actual_rel_cpf1_col = _find_column_case_insensitive(df_relationships.columns, relationship_cpf1_col.lower())
-            actual_rel_cpf2_col = _find_column_case_insensitive(df_relationships.columns, relationship_cpf2_col.lower())
+            # Explicitly check for file existence before pd.read_csv
+            if not os.path.exists(relationship_csv_path):
+                # This specific error was not caught before, leading to a generic exception.
+                raise FileNotFoundError(f"Relationship CSV file not found at '{relationship_csv_path}'")
 
-            if not actual_rel_cpf1_col or not actual_rel_cpf2_col:
-                raise ValueError(f"Relationship CSV '{relationship_csv_path}' missing required columns '{relationship_cpf1_col}' or '{relationship_cpf2_col}'. Found: {df_relationships.columns.tolist()}")
-
-            rows, cols, data = [], [], []
-            valid_edges = 0
-            for _, row_rel in df_relationships.iterrows():
-                id1_val = row_rel[actual_rel_cpf1_col]
-                id2_val = row_rel[actual_rel_cpf2_col]
-                idx1 = cpf_to_index.get(id1_val)
-                idx2 = cpf_to_index.get(id2_val)
-                if idx1 is not None and idx2 is not None and idx1 != idx2:
-                    rows.extend([idx1, idx2])
-                    cols.extend([idx2, idx1])
-                    data.extend([relationship_weight, relationship_weight])
-                    valid_edges +=1
+            df_relationships = pd.read_csv(relationship_csv_path, sep='\\t') 
             
-            if valid_edges > 0:
-                adj_rel_sparse = sp.csr_matrix((data, (rows, cols)), shape=(n_total_samples, n_total_samples), dtype=np.float32)
-                adj_rel_sparse.sum_duplicates()
-                print(f"  Relationship graph computed. Non-zero entries: {adj_rel_sparse.nnz}")
+            actual_rel_cpf1_col_in_rel_csv = _find_column_case_insensitive(df_relationships.columns, relationship_cpf1_col.lower())
+            actual_rel_cpf2_col_in_rel_csv = _find_column_case_insensitive(df_relationships.columns, relationship_cpf2_col.lower())
+
+            if not actual_rel_cpf1_col_in_rel_csv or not actual_rel_cpf2_col_in_rel_csv:
+                print(f"Warning: Relationship CSV '{relationship_csv_path}' is missing one or both required ID columns "
+                      f"(expected '{relationship_cpf1_col}', '{relationship_cpf2_col}'). "
+                      f"Found columns in CSV: {df_relationships.columns.tolist()}. "
+                      "Relationship graph construction SKIPPED.")
+                # adj_rel_sparse remains empty
             else:
-                print("  No valid relationship edges created.")
-        except Exception as e:
-            print(f"Error loading or processing relationship graph: {e}. Skipping relationship graph.")
+                # Proceed with building adj_rel_sparse using cpf_to_index
+                rows, cols, data = [], [], []
+                valid_edges = 0
+                for _, row_rel in df_relationships.iterrows():
+                    id1_val = row_rel[actual_rel_cpf1_col_in_rel_csv]
+                    id2_val = row_rel[actual_rel_cpf2_col_in_rel_csv]
+                    # cpf_to_index is guaranteed to be populated if can_attempt_relationship_graph is True
+                    idx1 = cpf_to_index.get(id1_val) 
+                    idx2 = cpf_to_index.get(id2_val)
+                    if idx1 is not None and idx2 is not None and idx1 != idx2:
+                        rows.extend([idx1, idx2])
+                        cols.extend([idx2, idx1])
+                        data.extend([relationship_weight, relationship_weight])
+                        valid_edges +=1
+                
+                if valid_edges > 0:
+                    adj_rel_sparse = sp.csr_matrix((data, (rows, cols)), shape=(n_total_samples, n_total_samples), dtype=np.float32)
+                    adj_rel_sparse.sum_duplicates()
+                    print(f"  Relationship graph computed from CSV. Non-zero entries: {adj_rel_sparse.nnz}")
+                else:
+                    print(f"  No valid relationship edges created from '{relationship_csv_path}' (e.g., no matching IDs found "
+                          "between main data and relationship CSV, or CSV was empty/no valid pairs).")
+        
+        except FileNotFoundError as fnf_error: # Catch FileNotFoundError explicitly
+            print(f"Warning: {fnf_error}. Relationship graph construction SKIPPED.")
+            # adj_rel_sparse remains empty
+        except Exception as e: # Catch other potential errors during relationship CSV processing
+            print(f"Warning: Unexpected error during processing of relationship CSV '{relationship_csv_path}': {str(e)[:200]}. " # Truncate long error messages
+                  "Relationship graph construction SKIPPED.")
+            # adj_rel_sparse remains empty
+    # If not can_attempt_relationship_graph, adj_rel_sparse is already an empty matrix, 
+    # and a message was printed during the ID mapping phase or because no relationship_csv_path was provided.
     
     # 4. Combine Graphs
     print("Combining KNN and Relationship graphs for new anchor...")
