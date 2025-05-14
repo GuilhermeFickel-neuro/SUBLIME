@@ -2174,6 +2174,21 @@ def main(args):
         sublime_handler.load_model()
         sublime_handler.build_faiss_index_if_needed()
 
+        if config.generate_new_anchor_adj_for_eval:
+            # Ensure data_manager has the necessary attributes populated
+            if hasattr(data_manager, 'X_neurolake') and data_manager.X_neurolake is not None and \
+               hasattr(data_manager, 'neurolake_df') and data_manager.neurolake_df is not None:
+                print("Calling generate_and_set_eval_anchor_graph for the main train/val dataset...")
+                sublime_handler.generate_and_set_eval_anchor_graph(
+                    data_manager.X_neurolake, 
+                    data_manager.neurolake_df   
+                )
+            else:
+                # This case should ideally not be reached if preprocessing was successful and generate_new_anchor_adj_for_eval is true.
+                # The script might fail later if adj is still None and use_loaded_adj_for_extraction is true.
+                print("WARNING: Skipping generate_and_set_eval_anchor_graph due to missing X_neurolake or neurolake_df from DataManager.")
+
+
         train_val_sublime_results = sublime_handler.extract_embeddings(
             data_manager.X_neurolake, dataset_tag=config.dataset_name
         )
