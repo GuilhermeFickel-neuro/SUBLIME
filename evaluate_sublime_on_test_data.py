@@ -191,23 +191,23 @@ class Config:
         self.extract_embeddings_only = args.extract_embeddings_only # Added
         self.class_weight_multiplier = args.class_weight_multiplier # Added
 
-        # --- New Anchor Graph Generation Config --- # Added
+        # --- New Anchor Graph Generation Config --- # Updated
         self.generate_new_anchor_adj_for_eval = args.generate_new_anchor_adj_for_eval
         if self.generate_new_anchor_adj_for_eval:
+            # self.sublime_model_original_ids_csv = args.sublime_model_original_ids_csv # Removed
             self.anchor_adj_k_knn = args.anchor_adj_k_knn
             self.anchor_adj_use_sparse_format = bool(args.anchor_adj_use_sparse_format)
-            self.anchor_adj_id_col_name = args.anchor_adj_id_col_name
+            self.anchor_adj_id_col_name = args.anchor_adj_id_col_name # This ID col is from the main eval data CSV (neurolake_csv)
             self.anchor_adj_relationship_csv = args.anchor_adj_relationship_csv
             self.anchor_adj_relationship_cpf1_col = args.anchor_adj_relationship_cpf1_col
             self.anchor_adj_relationship_cpf2_col = args.anchor_adj_relationship_cpf2_col
             self.anchor_adj_relationship_weight = args.anchor_adj_relationship_weight
             self.anchor_adj_knn_threshold_type = args.anchor_adj_knn_threshold_type
             self.anchor_adj_knn_std_dev_factor = args.anchor_adj_knn_std_dev_factor
-            # The main CSV for IDs will be self.neurolake_csv (already in Config)
-            print("New anchor graph generation for evaluation is ENABLED.")
-            if not self.neurolake_csv:
-                raise ValueError("neurolake_csv must be provided when generate_new_anchor_adj_for_eval is True for ID mapping.")
-        # --- End New Anchor Graph Generation Config --- #
+            print("New anchor graph generation for evaluation (using eval dataset features) is ENABLED.")
+            if not self.anchor_adj_id_col_name:
+                 raise ValueError("anchor_adj_id_col_name must be specified when generate_new_anchor_adj_for_eval is True.")
+        # --- End New Anchor Graph Generation Config ---
 
         self.dataset_name = self._derive_dataset_name()
         self.test_dataset_name = self._derive_test_dataset_name()
@@ -554,15 +554,17 @@ class SublimeHandler:
         self.device = config.device
         self.model = None
         self.graph_learner = None
-        self.features = None
-        self.adj = None
-        self.sparse = None
-        # self.experiment = None # Remove experiment instance variable, not needed for loading here
-        self.faiss_index = None
+        self.original_model_features = None # Features SUBLIME was trained on (from features.pt)
+        self.adj = None # Adjacency matrix to be used for extraction
+        self.current_extraction_features = None # Features corresponding to self.adj if it's newly generated from eval data
+        self.sparse = None # Sparsity of the original SUBLIME model (from its config.txt)
+        self.faiss_index = None # For original_model_features if graph_learner is used
         self.has_classification_head = False
 
     def load_model(self):
-        """Loads SUBLIME model components by reading config and files."""
+        """Loads SUBLIME model components (model, learner, original features). 
+        If not generating a new eval graph, loads the original adjacency.
+        Does NOT generate the custom eval graph here; that's a separate step."""
         print(f"Loading SUBLIME model from {self.config.model_dir}")
         config_path = os.path.join(self.config.model_dir, 'config.txt')
         model_path = os.path.join(self.config.model_dir, 'model.pt')
@@ -570,288 +572,219 @@ class SublimeHandler:
         features_path = os.path.join(self.config.model_dir, 'features.pt')
         adj_path = os.path.join(self.config.model_dir, 'adjacency.pt')
 
-        # Check for essential files for model loading itself
         if not all(os.path.exists(p) for p in [config_path, model_path, learner_path, features_path]):
             raise FileNotFoundError(f"One or more essential model files not found in {self.config.model_dir}. Expected config.txt, model.pt, graph_learner.pt, features.pt")
 
-        # 1. Read config.txt (model's original training config)
+        # 1. Read model's original training config.txt
         model_config = {}
         with open(config_path, 'r') as f:
             for line in f:
                 try:
                     key, value = line.strip().split(': ', 1)
-                    # Attempt to infer type (basic types only)
                     if value == 'True': model_config[key] = True
                     elif value == 'False': model_config[key] = False
                     elif value == 'None': model_config[key] = None
                     elif '.' in value:
                         try: model_config[key] = float(value)
-                        except ValueError: model_config[key] = value # Keep as string if float fails
+                        except ValueError: model_config[key] = value
                     else:
                         try: model_config[key] = int(value)
-                        except ValueError: model_config[key] = value # Keep as string if int fails
+                        except ValueError: model_config[key] = value
                 except ValueError:
                     print(f"Warning: Could not parse line in config.txt: {line.strip()}")
-                    continue # Skip malformed lines
+                    continue
+        self.sparse = model_config.get('sparse', False) # Sparsity of the loaded SUBLIME model
 
-        # Store essential config items
-        self.sparse = model_config.get('sparse', False) # Default to False if missing
+        # 2. Load Original Model Features (features.pt SUBLIME was trained on)
+        self.original_model_features = torch.load(features_path, map_location=self.device)
+        print(f"Loaded original SUBLIME model features (from features.pt): {self.original_model_features.shape}")
 
-        # 2. Load Features (these are the features of the N nodes SUBLIME was trained on)
-        self.features = torch.load(features_path, map_location=self.device)
-
-        adj_data = None # Will hold the raw adjacency data (tensor or dict)
-
-        # --- Potentially Generate New Anchor Adjacency --- # Added Block
-        if self.config.generate_new_anchor_adj_for_eval:
-            print("Attempting to generate a new anchor adjacency matrix for evaluation...")
-            if not self.config.neurolake_csv or not os.path.exists(self.config.neurolake_csv):
-                raise FileNotFoundError(
-                    f"Neurolake CSV for IDs ('{self.config.neurolake_csv}') not found or not specified, "
-                    f"but required for generating new anchor adjacency with ID mapping.")
-            
-            # Load the main neurolake_csv to get identifiers for the loaded self.features
-            # This CSV must correspond to the data that self.features was derived from.
-            try:
-                print(f"Loading ID mapping CSV: {self.config.neurolake_csv}")
-                # Only load, don't preprocess here as self.features are already preprocessed
-                cpf_identifiers_df = pd.read_csv(self.config.neurolake_csv, delimiter='\t')
-                if len(cpf_identifiers_df) != self.features.shape[0]:
-                    raise ValueError(
-                        f"Row count mismatch: neurolake_csv for IDs ({len(cpf_identifiers_df)} rows) "
-                        f"does not match loaded features.pt ({self.features.shape[0]} rows). "
-                        f"Ensure '{self.config.neurolake_csv}' is the correct file corresponding to the SUBLIME model's training data."
-                    )
-            except Exception as e:
-                raise RuntimeError(f"Failed to load or validate neurolake_csv for ID mapping ('{self.config.neurolake_csv}'): {e}")
-
-            adj_data = _generate_custom_anchor_graph(
-                node_features_tensor=self.features, 
-                cpf_identifiers_df=cpf_identifiers_df,
-                id_column_name=self.config.anchor_adj_id_col_name,
-                k_knn=self.config.anchor_adj_k_knn,
-                sparse_output=self.config.anchor_adj_use_sparse_format, # This will be the format of adj_data
-                device=self.device,
-                knn_threshold_type=self.config.anchor_adj_knn_threshold_type,
-                knn_std_dev_factor=self.config.anchor_adj_knn_std_dev_factor,
-                relationship_csv_path=self.config.anchor_adj_relationship_csv,
-                relationship_cpf1_col=self.config.anchor_adj_relationship_cpf1_col,
-                relationship_cpf2_col=self.config.anchor_adj_relationship_cpf2_col,
-                relationship_weight=self.config.anchor_adj_relationship_weight
-            )
-            print(f"New anchor adjacency matrix generated. Type: {type(adj_data)}, Sparse: {adj_data.is_sparse if isinstance(adj_data, torch.Tensor) else 'N/A'}")
-            # The self.sparse attribute will be set based on model_config later, 
-            # but the new adj_data format (dense/sparse tensor) must be compatible with subsequent processing.
-            # We will rely on the existing logic to handle adj_data correctly.
-            # The key is that if anchor_adj_use_sparse_format is true, adj_data is a sparse tensor.
-            # If false, adj_data is a dense tensor.
-
-        else:
-            # --- Load Adjacency from File (original logic) ---
+        # 3. Load Original Adjacency (if not generating a new one for eval)
+        # self.adj will be set here if using original, or later by generate_and_set_eval_anchor_graph
+        if not self.config.generate_new_anchor_adj_for_eval:
             if not os.path.exists(adj_path):
-                 raise FileNotFoundError(f"Adjacency file (adjacency.pt) not found in {self.config.model_dir} and not generating new one.")
-            print(f"Loading existing adjacency matrix from {adj_path}")
-            adj_data = torch.load(adj_path, map_location=self.device)
-        # --- End Adjacency Loading/Generation --- #
+                 raise FileNotFoundError(f"Original adjacency file (adjacency.pt) not found in {self.config.model_dir} and not generating new one for eval.")
+            print(f"Loading existing original adjacency matrix from {adj_path} to be used for extraction.")
+            adj_data_loaded = torch.load(adj_path, map_location=self.device)
+            self._process_and_set_adj(adj_data_loaded, "original SUBLIME model adj", self.sparse)
+        else:
+            print("Will generate a new anchor graph for evaluation later using current evaluation dataset's features.")
+            # self.adj will be set by generate_and_set_eval_anchor_graph
 
-        # Existing logic for processing adj_data (whether loaded or generated)
-        # self.sparse is read from model_config.txt. This determines how GCL model expects the graph.
-        # The adj_data (newly generated or loaded) must be processed to match this expectation.
-
-        if self.sparse: # self.sparse is from the SUBLIME model's original training config
-            if isinstance(adj_data, dict) and 'edges' in adj_data: # Saved DGL graph dictionary (from file only)
-                 num_nodes = adj_data['num_nodes']
-                 edges = adj_data['edges']
-                 weights = adj_data.get('weights') # May not have weights
-                 self.adj = dgl.graph(edges, num_nodes=num_nodes).to(self.device)
-                 if weights is not None:
-                      self.adj.edata['w'] = weights.to(self.device)
-                 # Normalize the loaded DGL graph (as done in original training)
-                 # self.adj = normalize(self.adj, 'sym', self.sparse) - REMOVED, assumed already normalized
-            elif isinstance(adj_data, torch.Tensor) and adj_data.is_sparse: # Saved torch sparse tensor
-                 # This was the format before DGL saving was explicit
-                 # Normalize directly
-                 self.adj = normalize(adj_data, 'sym', self.sparse)
-                 # Convert to DGL graph for model forward pass
-                 self.adj = torch_sparse_to_dgl_graph(self.adj)
-            else:
-                 raise TypeError(f"Unexpected sparse adjacency format loaded/generated: {type(adj_data)}. Expected torch sparse tensor or DGL dict (from file). Ensure anchor_adj_use_sparse_format matches model's sparse training if generating.")
-        else: # Dense
-            if isinstance(adj_data, torch.Tensor) and not adj_data.is_sparse:
-                 self.adj = normalize(adj_data, 'sym', self.sparse) # Normalize dense tensor
-            else:
-                 raise TypeError(f"Expected dense tensor for adjacency, got {type(adj_data)} from {adj_path if not self.config.generate_new_anchor_adj_for_eval else 'generated adj'}. Ensure anchor_adj_use_sparse_format is False if model trained dense.")
-        self.adj = self.adj.to(self.device) # Ensure final adj is on device
-
-        # 3. Instantiate Graph Learner
+        # 4. Instantiate and Load Graph Learner (operates on original_model_features)
         learner_type = model_config.get('type_learner', 'unknown')
+        feature_dim_for_learner = self.original_model_features.shape[1]
         k = model_config.get('k', 30)
         sim_func = model_config.get('sim_function', 'cosine')
         act_learner = model_config.get('activation_learner', 'relu')
 
         if learner_type == 'fgp':
-            # FGP needs the *initial* graph data, which isn't saved separately by default.
-            # Using the loaded 'adj' (which is the final bootstrapped one) might be incorrect.
-            # Let's assume for evaluation, we use the final saved 'adj' as the input if needed.
-            # Or better: FGP doesn't need initial_graph_data *after* being trained.
-            # It learns weights based on the structure it started with.
-            # For evaluation/inference, it just needs the feature dimension.
-            fgp_i = model_config.get('fgp_elu_alpha', 6) # Get 'i' param if saved
-            self.graph_learner = FGP_learner(
-                k=k, knn_metric=sim_func, i=fgp_i, sparse=self.sparse,
-                initial_graph_data=None # Don't pass initial graph for loading trained state
-            )
+            fgp_i = model_config.get('fgp_elu_alpha', 6) 
+            self.graph_learner = FGP_learner(k=k, knn_metric=sim_func, i=fgp_i, sparse=self.sparse, initial_graph_data=None)
         elif learner_type == 'mlp':
-            self.graph_learner = MLP_learner(
-                nlayers=2, # Assume 2 layers? Config doesn't save this explicitly
-                isize=model_config['feature_dim'], # Changed 'in_dim' to 'isize'
-                k=k, knn_metric=sim_func, i=6, # Use default 'i'?
-                sparse=self.sparse, act=act_learner, # Changed 'mlp_act' to 'act'
-                knn_threshold_type=model_config.get('knn_threshold_type', 'none'),
-                knn_std_dev_factor=model_config.get('knn_std_dev_factor', 1.0),
-                chunk_size=model_config.get('graph_learner_chunk_size', 100) # Use saved or default chunk size
-                # Removed offload_to_cpu and cleanup_every_n_chunks as they are not in the MLP_learner constructor
-            )
+            self.graph_learner = MLP_learner(nlayers=2, isize=feature_dim_for_learner, k=k, knn_metric=sim_func, i=6, sparse=self.sparse, act=act_learner, knn_threshold_type=model_config.get('knn_threshold_type', 'none'), knn_std_dev_factor=model_config.get('knn_std_dev_factor', 1.0), chunk_size=model_config.get('graph_learner_chunk_size', 100))
         elif learner_type == 'att':
-             self.graph_learner = ATT_learner(
-                 nlayers=2, # Assume 2?
-                 in_dim=model_config['feature_dim'], k=k, knn_metric=sim_func, i=6, # Default 'i'?
-                 sparse=self.sparse, mlp_act=act_learner
-             )
+             self.graph_learner = ATT_learner(nlayers=2, in_dim=feature_dim_for_learner, k=k, knn_metric=sim_func, i=6, sparse=self.sparse, mlp_act=act_learner)
         elif learner_type == 'gnn':
-             # GNN Learner needs the anchor_adj during *training*.
-             # For loading, it just needs to be instantiated correctly.
-             self.graph_learner = GNN_learner(
-                 nlayers=2, # Assume 2?
-                 in_dim=model_config['feature_dim'], k=k, knn_metric=sim_func, i=6, # Default 'i'?
-                 sparse=self.sparse, mlp_act=act_learner,
-                 anchor_adj=None # Don't pass anchor adj for loading trained state
-             )
+             self.graph_learner = GNN_learner(nlayers=2, in_dim=feature_dim_for_learner, k=k, knn_metric=sim_func, i=6, sparse=self.sparse, mlp_act=act_learner, anchor_adj=None)
         else:
             raise ValueError(f"Unsupported learner type found in config: {learner_type}")
-
         self.graph_learner.load_state_dict(torch.load(learner_path, map_location=self.device))
         self.graph_learner = self.graph_learner.to(self.device)
-        self.graph_learner.eval() # Set to eval mode
+        self.graph_learner.eval()
 
-        # 4. Instantiate GCL Model
+        # 5. Instantiate and Load GCL Model (dimensions based on original_model_features)
         gcl_params = {
             'nlayers': model_config.get('nlayers', 2),
-            'in_dim': model_config['feature_dim'],
-            'hidden_dim': model_config['hidden_dim'],
-            'emb_dim': model_config['emb_dim'],
-            'proj_dim': model_config['proj_dim'],
-            'dropout': model_config.get('dropout', 0.5),
-            'dropout_adj': model_config.get('dropout_adj', 0.5), # Note: config saves dropout_adj, GCL takes dropout_adj
-            'sparse': self.sparse,
+            'in_dim': self.original_model_features.shape[1], 
+            'hidden_dim': model_config['hidden_dim'], 'emb_dim': model_config['emb_dim'],
+            'proj_dim': model_config['proj_dim'], 'dropout': model_config.get('dropout', 0.5),
+            'dropout_adj': model_config.get('dropout_adj', 0.5),
+            'sparse': self.sparse, # GCL model uses sparsity of its original training
             'use_layer_norm': model_config.get('use_layer_norm', False),
             'use_residual': model_config.get('use_residual', False),
             'use_arcface': model_config.get('use_arcface', False),
             'use_classification_head': model_config.get('use_classification_head', False)
         }
-        # Add ArcFace specific params if used
         if gcl_params['use_arcface']:
-             gcl_params.update({
-                 'num_classes': model_config['num_classes'],
-                 'arcface_scale': model_config.get('arcface_scale', 30.0),
-                 'arcface_margin': model_config.get('arcface_margin', 0.5),
-                 'use_sampled_arcface': model_config.get('use_sampled_arcface', False),
-                 'arcface_num_samples': model_config.get('arcface_num_samples', None)
-             })
-        # Add Classification head specific params if used
+             gcl_params.update({'num_classes': model_config['num_classes'], 'arcface_scale': model_config.get('arcface_scale', 30.0), 'arcface_margin': model_config.get('arcface_margin', 0.5), 'use_sampled_arcface': model_config.get('use_sampled_arcface', False), 'arcface_num_samples': model_config.get('arcface_num_samples', None)})
         if gcl_params['use_classification_head']:
-             gcl_params.update({
-                 'classification_dropout': model_config.get('classification_dropout', 0.3),
-                 'classification_head_layers': model_config.get('classification_head_layers', 2)
-             })
-             self.has_classification_head = True # Set flag
-
+             gcl_params.update({'classification_dropout': model_config.get('classification_dropout', 0.3), 'classification_head_layers': model_config.get('classification_head_layers', 2)})
+             self.has_classification_head = True
+        
         self.model = GCL(**gcl_params)
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model = self.model.to(self.device)
-        self.model.eval() # Set to eval mode
-
-        print("SUBLIME model loaded successfully!")
+        self.model.eval()
+        print("SUBLIME model (GCL, GraphLearner, original_features) loaded successfully!")
         if self.has_classification_head: print("Model includes a binary classification head.")
 
-        # self.model, self.graph_learner, self.features, self.adj, self.sparse = self.experiment.load_model(input_dir=self.config.model_dir) # REMOVE THIS LINE
-        # print("SUBLIME model loaded successfully!")
-        # self.has_classification_head = hasattr(self.model, 'use_classification_head') and self.model.use_classification_head
-        # if self.has_classification_head: print("Model includes a binary classification head.")
-        # except FileNotFoundError as e:
-             # print(f"Error loading model: {e}. Ensure model files exist in {self.config.model_dir}")
-             # raise
-        # except Exception as e:
-             # print(f"An unexpected error occurred loading the model: {e}")
-             # raise # Keep raising other unexpected errors
+    def _process_and_set_adj(self, adj_data_raw, source_description, expected_final_sparse_format):
+        """Helper to process raw adjacency (tensor or dict) and set self.adj.
+        expected_final_sparse_format: bool, True if the GCL model expects a sparse DGL graph.
+        """
+        processed_adj = None
+        if expected_final_sparse_format: # GCL model expects a sparse DGL graph
+            if isinstance(adj_data_raw, dict) and 'edges' in adj_data_raw: # DGL dict from file
+                num_nodes = adj_data_raw['num_nodes']
+                edges = adj_data_raw['edges']
+                weights = adj_data_raw.get('weights')
+                processed_adj = dgl.graph(edges, num_nodes=num_nodes).to(self.device)
+                if weights is not None: processed_adj.edata['w'] = weights.to(self.device)
+            elif isinstance(adj_data_raw, torch.Tensor) and adj_data_raw.is_sparse: # Torch sparse tensor
+                temp_adj = normalize(adj_data_raw, 'sym', True) 
+                processed_adj = torch_sparse_to_dgl_graph(temp_adj)
+            else:
+                raise TypeError(f"For sparse GCL model, {source_description} is {type(adj_data_raw)}. Expected DGL dict or sparse torch.Tensor.")
+        else: # GCL model expects a dense tensor
+            if isinstance(adj_data_raw, torch.Tensor) and not adj_data_raw.is_sparse:
+                processed_adj = normalize(adj_data_raw, 'sym', False)
+            else:
+                raise TypeError(f"For dense GCL model, {source_description} is {type(adj_data_raw)}. Expected dense torch.Tensor.")
+        
+        self.adj = processed_adj.to(self.device)
+        print(f"Adjacency matrix ({source_description}) processed and set. Type: {type(self.adj)}, Device: {self.adj.device}")
+
+
+    def generate_and_set_eval_anchor_graph(self, eval_node_features_np, eval_node_ids_df):
+        """Generates a new anchor graph using evaluation data features and sets it for extraction."""
+        if not self.config.generate_new_anchor_adj_for_eval:
+            print("Skipping generation of new eval anchor graph as flag is False.")
+            return
+
+        print("Generating new anchor graph for evaluation using provided evaluation dataset features...")
+        eval_node_features_tensor = torch.from_numpy(eval_node_features_np.astype(np.float32)).to(self.device)
+        self.current_extraction_features = eval_node_features_tensor # Features for the new graph
+        print(f"Set current_extraction_features to eval data features: {self.current_extraction_features.shape}")
+
+        raw_new_adj = _generate_custom_anchor_graph(
+            node_features_tensor=self.current_extraction_features, 
+            cpf_identifiers_df=eval_node_ids_df,
+            id_column_name=self.config.anchor_adj_id_col_name,
+            k_knn=self.config.anchor_adj_k_knn,
+            sparse_output=self.config.anchor_adj_use_sparse_format, # Format of raw_new_adj
+            device=self.device,
+            knn_threshold_type=self.config.anchor_adj_knn_threshold_type,
+            knn_std_dev_factor=self.config.anchor_adj_knn_std_dev_factor,
+            relationship_csv_path=self.config.anchor_adj_relationship_csv,
+            relationship_cpf1_col=self.config.anchor_adj_relationship_cpf1_col,
+            relationship_cpf2_col=self.config.anchor_adj_relationship_cpf2_col,
+            relationship_weight=self.config.anchor_adj_relationship_weight
+        )
+        
+        # The newly generated graph's format (sparse/dense as per anchor_adj_use_sparse_format)
+        # must be processed into the format expected by the SUBLIME model (self.sparse).
+        # Example: if model is sparse (self.sparse=True), but new graph was made dense for some reason
+        # (anchor_adj_use_sparse_format=False), _process_and_set_adj needs to handle this.
+        # However, _generate_custom_anchor_graph produces raw tensor. _process_and_set_adj handles normalization & DGL conversion.
+        # The critical part is that the GCL model's `self.sparse` flag dictates the final format of `self.adj`.
+        
+        # Check for potential mismatch in expectation vs. generation config
+        if self.sparse != self.config.anchor_adj_use_sparse_format:
+            print(f"Warning: SUBLIME model's expected graph sparsity (self.sparse={self.sparse}) "
+                  f"differs from the new anchor graph's generation config (anchor_adj_use_sparse_format={self.config.anchor_adj_use_sparse_format}). "
+                  f"The _process_and_set_adj method will attempt to convert to the model's expected format, but ensure this is intended.")
+
+        self._process_and_set_adj(raw_new_adj, "newly generated eval anchor graph", self.sparse)
+        print(f"Successfully generated and set new anchor graph for evaluation. Final self.adj type: {type(self.adj)}")
+
 
     def build_faiss_index_if_needed(self):
-        """Builds FAISS index from loaded features for optimization."""
-        if self.features is None:
-             print("Cannot build FAISS index: Features not loaded.")
+        """Builds FAISS index from self.original_model_features for graph learner optimization."""
+        if self.original_model_features is None: 
+             print("Cannot build FAISS index: Original SUBLIME model features not loaded.")
              return
-
-        print("Building FAISS index for faster embedding extraction...")
+        print("Building FAISS index for SUBLIME's original features (for graph learner if used)...")
         try:
-            from utils import build_faiss_index # Assuming utils.py exists
-            k = getattr(self.graph_learner, 'k', 10) # Get k from graph learner if possible
-            self.faiss_index = build_faiss_index(self.features, k=k, use_gpu=torch.cuda.is_available())
-            print("FAISS index built successfully!")
-        except ImportError:
+            from utils import build_faiss_index 
+            k = getattr(self.graph_learner, 'k', 10) 
+            self.faiss_index = build_faiss_index(self.original_model_features, k=k, use_gpu=torch.cuda.is_available())
+            print("FAISS index built successfully for original_model_features!")
+        except ImportError: # pragma: no cover
             print("FAISS or utils.py not found. Skipping FAISS index optimization.")
             self.faiss_index = None
-        except Exception as e:
-            print(f"Failed to build FAISS index: {str(e)}. Continuing without index optimization.")
+        except Exception as e: # pragma: no cover
+            print(f"Failed to build FAISS index for original_model_features: {str(e)}. Continuing without index optimization.")
             self.faiss_index = None
 
-    def extract_embeddings(self, X, dataset_tag):
+    def extract_embeddings(self, X_new_points_np, dataset_tag): 
         """Extracts embeddings in batches, handles caching."""
         if self.model is None:
             raise RuntimeError("SUBLIME model not loaded. Call load_model() first.")
+        if self.adj is None and self.config.use_loaded_adj_for_extraction:
+             raise RuntimeError("Adjacency matrix (self.adj) is not set for anchor mode. Ensure it was loaded or generate_and_set_eval_anchor_graph was called.")
 
-        print(f"Extracting SUBLIME features for dataset tag: {dataset_tag}...")
+        print(f"Extracting SUBLIME features for dataset tag: {dataset_tag} using features of shape {X_new_points_np.shape}...")
 
-        # --- Caching Logic ---
         cache_file_embeddings = None
         cache_file_classifications = None
         can_cache = self.config.cache_dir and dataset_tag
         
-        # --- Modified extraction_mode_tag for compatibility and specificity ---
-        extraction_mode_tag = "" # Default for learner mode or if other conditions not met
-
+        extraction_mode_tag = ""
         if self.config.use_loaded_adj_for_extraction:
             if self.config.generate_new_anchor_adj_for_eval:
-                # New specific tag for newly generated anchor graphs during evaluation
                 rel_file_hash_part = ""
                 if self.config.anchor_adj_relationship_csv and os.path.exists(self.config.anchor_adj_relationship_csv):
                     try:
                         fname = os.path.basename(self.config.anchor_adj_relationship_csv)
                         mtime = str(os.path.getmtime(self.config.anchor_adj_relationship_csv))[:5]
-                        # Sanitize filename part for cache key
                         sanitized_fname = ''.join(c if c.isalnum() else '-' for c in fname.replace('.csv','').replace('.tsv',''))[:10]
                         rel_file_hash_part = f"_rel_{sanitized_fname}_{mtime}"
-                    except Exception:
-                        rel_file_hash_part = "_rel_err" # Fallback if hashing fails
-                extraction_mode_tag = f"_anchor_gen_eval_k{self.config.anchor_adj_k_knn}{rel_file_hash_part}"
+                    except Exception: rel_file_hash_part = "_rel_err"
+                extraction_mode_tag = f"_anchor_evalset_k{self.config.anchor_adj_k_knn}{rel_file_hash_part}"
             else:
-                # This is the case for existing caches using the original loaded anchor graph
-                # Reverts to the simple tag used before the generate_new_anchor_adj_for_eval feature
-                extraction_mode_tag = "_anchor" 
-        # If not self.config.use_loaded_adj_for_extraction, tag remains "" (empty string), 
-        # which was the behavior for learner-active mode.
-        # --- End Modified extraction_mode_tag ---
+                extraction_mode_tag = "_anchor_orig_loaded" 
+        else:
+            extraction_mode_tag = "_learner_active"
+
 
         if can_cache:
             cache_file_base_embeddings = f"sublime_embeddings_{self.config.model_name_tag}_{dataset_tag}{extraction_mode_tag}.npy"
             cache_file_embeddings = os.path.join(self.config.cache_dir, cache_file_base_embeddings)
-
             if os.path.exists(cache_file_embeddings):
                 print(f"Loading cached embeddings from {cache_file_embeddings}")
                 loaded_embeddings = np.load(cache_file_embeddings)
-                if len(loaded_embeddings.shape) == 1: # Ensure 2D
-                    loaded_embeddings = loaded_embeddings.reshape(-1, 1)
-
-                # Check for cached classification results
+                if len(loaded_embeddings.shape) == 1: loaded_embeddings = loaded_embeddings.reshape(-1, 1)
                 loaded_classification_probs = None
                 if self.has_classification_head:
                      cache_file_base_classifications = f"sublime_classifications_{self.config.model_name_tag}_{dataset_tag}{extraction_mode_tag}.npy"
@@ -859,148 +792,143 @@ class SublimeHandler:
                      if os.path.exists(cache_file_classifications):
                           print(f"Loading cached classification results from {cache_file_classifications}")
                           class_results = np.load(cache_file_classifications)
-                          if class_results.shape[1] >= 1:
-                               loaded_classification_probs = class_results[:, 0]
-                          else:
-                               print("Warning: Classification cache file has unexpected shape.")
-                     else:
-                          print("Classification cache file not found.")
-
+                          if class_results.ndim > 0 and class_results.shape[0] > 0 :
+                            if class_results.ndim == 1: loaded_classification_probs = class_results
+                            elif class_results.shape[1] >= 1: loaded_classification_probs = class_results[:, 0]
+                            else: print("Warning: Classification cache file has unexpected shape (cols).")
+                          else: print("Warning: Classification cache file is empty or has unexpected shape (rows/dim).")
+                     else: print("Classification cache file not found.")
                 print(f"Cached embeddings shape: {loaded_embeddings.shape}")
                 return {'embeddings': loaded_embeddings, 'classification_probs': loaded_classification_probs}
-            else:
-                print(f"Cache file not found at {cache_file_embeddings}. Extracting embeddings...")
-        else:
-            print("Caching disabled or dataset_tag not provided.")
+            else: print(f"Cache file not found: {cache_file_embeddings}. Extracting embeddings...")
+        else: print("Caching disabled or dataset_tag not provided.")
             
-        # --- Extraction Logic ---
-        num_batches = (len(X) + self.config.batch_size - 1) // self.config.batch_size
+        num_batches = (len(X_new_points_np) + self.config.batch_size - 1) // self.config.batch_size
         all_embeddings = []
         all_class_probs = [] if self.has_classification_head else None
         
         self.model.eval()
         if self.graph_learner: self.graph_learner.eval()
 
-        with torch.no_grad(): # Disable gradient calculation
+        with torch.no_grad():
             for i in tqdm(range(num_batches), desc=f"Extracting {dataset_tag}", unit="batch"):
                 start_idx = i * self.config.batch_size
-                end_idx = min((i + 1) * self.config.batch_size, len(X))
-                batch_X = X[start_idx:end_idx] # These are the preprocessed neurolake features for the current dataset
+                end_idx = min((i + 1) * self.config.batch_size, len(X_new_points_np))
+                batch_X_new_points_sub_np = X_new_points_np[start_idx:end_idx]
+                batch_X_new_points_tensor = torch.FloatTensor(batch_X_new_points_sub_np).to(self.device)
 
-                # Convert batch_X to tensor on the correct device once per batch
-                batch_X_tensor = torch.FloatTensor(batch_X).to(self.device)
-
-                for j in range(len(batch_X_tensor)):
-                    point_tensor = batch_X_tensor[j].unsqueeze(0) # Process one point at a time
+                for j in range(len(batch_X_new_points_tensor)):
+                    point_tensor = batch_X_new_points_tensor[j].unsqueeze(0) # This is a preprocessed new person's features
 
                     try:
-                        # --- Replicate Experiment.process_new_point logic ---
-                        # 1. Find most similar point in loaded features (self.features)
-                        # This is needed regardless of the adj used, to know *which* embedding to extract.
-                        normalized_features = F.normalize(self.features, p=2, dim=1)
-                        normalized_point = F.normalize(point_tensor, p=2, dim=1)
-                        similarities = torch.mm(normalized_point, normalized_features.t())
+                        # Determine which set of features to use for comparison and as input to GCL
+                        # And which adjacency to use
+                        features_for_gcl_input_and_comparison = None
+                        adj_for_gcl_input = None
+                        
+                        if self.config.use_loaded_adj_for_extraction:
+                            if self.config.generate_new_anchor_adj_for_eval and self.current_extraction_features is not None:
+                                # Mode 1A: Newly generated anchor graph from EVALUATION data
+                                features_for_gcl_input_and_comparison = self.current_extraction_features # Eval data features
+                                adj_for_gcl_input = self.adj # Newly generated graph based on eval data features
+                            else:
+                                # Mode 1B: Original SUBLIME model's loaded anchor graph
+                                features_for_gcl_input_and_comparison = self.original_model_features # SUBLIME's original training features
+                                adj_for_gcl_input = self.adj # Original loaded graph
+                        else:
+                            # Mode 2: Graph learner active (operates on original_model_features)
+                            features_for_gcl_input_and_comparison = self.original_model_features 
+                            # adj_for_gcl_input will be learned by graph_learner dynamically below
+
+                        if features_for_gcl_input_and_comparison is None:
+                            raise RuntimeError("features_for_gcl_input_and_comparison is None. Logic error.")
+                        if adj_for_gcl_input is None and self.config.use_loaded_adj_for_extraction:
+                             raise RuntimeError("adj_for_gcl_input is None in anchor mode. Adj not set.")
+
+                        # 1. Find most similar point in features_for_gcl_input_and_comparison
+                        # The point_tensor (new person) is compared against the feature set corresponding to the active graph.
+                        normalized_comparison_features = F.normalize(features_for_gcl_input_and_comparison, p=2, dim=1)
+                        normalized_point = F.normalize(point_tensor, p=2, dim=1) # point_tensor is from X_new_points_np
+                        
+                        # Ensure point_tensor and normalized_comparison_features have compatible dimensions for mm
+                        if point_tensor.shape[1] != features_for_gcl_input_and_comparison.shape[1]:
+                            raise ValueError(f"Dimension mismatch: point_tensor ({point_tensor.shape[1]}) vs features_for_gcl_input_and_comparison ({features_for_gcl_input_and_comparison.shape[1]}). Ensure GCL model's in_dim and input point features align.")
+
+                        similarities = torch.mm(normalized_point, normalized_comparison_features.t())
                         replace_idx = torch.argmax(similarities).item()
 
-                        # --- Decide which features and adjacency to use ---
+                        # Features and Adjacency that actually go into GCL.forward()
+                        final_features_for_gcl_model = None
+                        final_adj_for_gcl_model = None
+
                         if self.config.use_loaded_adj_for_extraction:
-                            # Mode 1: Use original features and loaded adjacency
-                            features_to_use = self.features
-                            adj_to_use = self.adj
-                            
+                            # Anchor graph mode: GCL sees the features corresponding to self.adj
+                            final_features_for_gcl_model = features_for_gcl_input_and_comparison 
+                            final_adj_for_gcl_model = adj_for_gcl_input
                         else:
-                            # Mode 2 (Original): Use modified features and learned adjacency
-                            # 2. Create modified features (temporarily replace the point)
-                            modified_features = self.features.clone()
-                            modified_features[replace_idx] = point_tensor
+                            # Graph learner mode: GCL sees modified original features and newly learned adj
+                            # Here, features_for_gcl_input_and_comparison IS self.original_model_features
+                            modified_features_for_learner = features_for_gcl_input_and_comparison.clone()
+                            modified_features_for_learner[replace_idx] = point_tensor 
                             
-                            # 3. Generate new adjacency using the graph learner
-                            new_adj = self.graph_learner(modified_features, faiss_index=self.faiss_index)
-                            if not self.sparse:
-                                if not isinstance(new_adj, torch.Tensor):
-                                    print(f"Warning: Dense graph learner output type is {type(new_adj)}, expected Tensor. Normalization might fail.")
-                                else:
-                                    new_adj = symmetrize(new_adj)
-                                    new_adj = normalize(new_adj, 'sym', self.sparse)
-                            # else: Sparse DGL graph handled by GCL forward
-
-                            features_to_use = modified_features
-                            adj_to_use = new_adj
-                            view_type = 'learner' # Use 'learner' view
-
-                        # 4. Run the model forward pass with the selected features and adjacency
+                            new_learned_adj = self.graph_learner(modified_features_for_learner, faiss_index=self.faiss_index)
+                            if not self.sparse: 
+                                if isinstance(new_learned_adj, torch.Tensor):
+                                    new_learned_adj = symmetrize(new_learned_adj)
+                                    new_learned_adj = normalize(new_learned_adj, 'sym', self.sparse)
+                                else: print(f"Warning: Dense graph learner output type {type(new_learned_adj)}.")
+                            
+                            final_features_for_gcl_model = modified_features_for_learner
+                            final_adj_for_gcl_model = new_learned_adj
+                        
                         if self.has_classification_head:
-                            _, embedding, _, classification_output = self.model(
-                                features_to_use, adj_to_use, include_features=True
-                            )
-                            if classification_output is not None:
-                                # Classification output corresponds to nodes in features_to_use.
-                                # We extract the one corresponding to the most similar original node.
-                                classification_prob_tensor = torch.sigmoid(classification_output[replace_idx])
-                                classification_prob = classification_prob_tensor.item()
-                            else:
-                                classification_prob = None
+                            _, embedding, _, classification_output = self.model(final_features_for_gcl_model, final_adj_for_gcl_model, include_features=True)
+                            classification_prob = torch.sigmoid(classification_output[replace_idx]).item() if classification_output is not None else None
                         else:
-                            _, embedding = self.model(features_to_use, adj_to_use)
+                            _, embedding = self.model(final_features_for_gcl_model, final_adj_for_gcl_model)
                             classification_prob = None
-                        # --- End Modified Logic ---
-
-                        # Extract the embedding for the *replaced* index
-                        # Embedding tensor corresponds to nodes in features_to_use.
-                        # We extract the one corresponding to the most similar original node.
+                        
                         embedding_tensor = embedding[replace_idx].detach()
-
-                        # Check type before calling .cpu() or .numpy()
-                        # embedding_raw = result_dict['embedding_vector'] # Old way
-                        # Use the extracted embedding_tensor
                         if isinstance(embedding_tensor, torch.Tensor):
                             embedding_vector = embedding_tensor.cpu().numpy().flatten()
-                        else:
-                            # This case should ideally not happen if model returns tensor
-                            raise TypeError(f"Unexpected type for extracted embedding: {type(embedding_tensor)}")
+                        else: raise TypeError(f"Unexpected type for extracted embedding: {type(embedding_tensor)}")
                         all_embeddings.append(embedding_vector)
 
-                        # Check type for classification probability as well
-                        # if self.has_classification_head and 'classification_probability' in result_dict: # Old way
                         if self.has_classification_head and classification_prob is not None:
-                             # prob_raw = result_dict['classification_probability'] # Old way
-                             # classification_prob is already a float scalar from .item() above
                              if isinstance(classification_prob, (int, float, np.number)):
                                  all_class_probs.append(float(classification_prob))
-                             else:
-                                 # Should not happen if .item() was used correctly
-                                 raise TypeError(f"Unexpected type for classification_probability: {type(classification_prob)}")
-
+                             else: raise TypeError(f"Unexpected type for classification_probability: {type(classification_prob)}")
                     except Exception as e:
-                        print(f"Error processing point {start_idx + j}: {str(e)}")
+                        print(f"Error processing point {start_idx + j} (new point features shape: {point_tensor.shape}): {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+
 
         embeddings_array = np.array(all_embeddings, dtype=np.float32)
-        classification_probs_array = np.array(all_class_probs, dtype=np.float32) if self.has_classification_head else None
+        classification_probs_array = np.array(all_class_probs, dtype=np.float32) if self.has_classification_head and all_class_probs else None
 
-        if embeddings_array.shape[0] != X.shape[0]:
-             print(f"WARNING: Expected {X.shape[0]} embeddings but got {embeddings_array.shape[0]}!")
-        
-        # --- Normalization ---
+        if embeddings_array.shape[0] != X_new_points_np.shape[0] and embeddings_array.shape[0] > 0 : 
+             print(f"WARNING: Expected {X_new_points_np.shape[0]} embeddings but got {embeddings_array.shape[0]}!")
+        elif embeddings_array.shape[0] == 0 and X_new_points_np.shape[0] > 0:
+            print(f"CRITICAL WARNING: No embeddings extracted for {X_new_points_np.shape[0]} points. Returning empty. Check errors.")
+            return {'embeddings': np.array([], dtype=np.float32).reshape(0,0), 'classification_probs': None}
+
         print("L2 Normalizing SUBLIME embeddings...")
-        norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
-        # Avoid division by zero for zero vectors
-        norms[norms == 0] = 1e-10 
-        embeddings_array = embeddings_array / norms
-        print(f"Normalization complete. Final embeddings shape: {embeddings_array.shape}")
+        if embeddings_array.shape[0] > 0: 
+            norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
+            norms[norms == 0] = 1e-10 
+            embeddings_array = embeddings_array / norms
+            print(f"Normalization complete. Final embeddings shape: {embeddings_array.shape}")
+        else:
+            print("Skipping normalization as no embeddings were extracted.")
 
-        # --- Save to Cache ---
         if can_cache:
-            # Use the correctly tagged filenames defined earlier
-            if cache_file_embeddings:
+            if cache_file_embeddings: 
                 print(f"Saving embeddings to cache: {cache_file_embeddings}")
                 np.save(cache_file_embeddings, embeddings_array)
-            if self.has_classification_head and classification_probs_array is not None:
-                # Use the correctly tagged classification filename defined earlier
-                if cache_file_classifications:
-                    # Save probabilities and maybe predictions if needed (currently just probs)
-                    # For simplicity, just saving probabilities for now
-                    np.save(cache_file_classifications, classification_probs_array.reshape(-1, 1)) # Save as Nx1 array
-                    print(f"Saving classification probabilities to cache: {cache_file_classifications}")
+            if self.has_classification_head and classification_probs_array is not None and cache_file_classifications:
+                np.save(cache_file_classifications, classification_probs_array.reshape(-1, 1) if classification_probs_array.ndim == 1 else classification_probs_array)
+                print(f"Saving classification probabilities to cache: {cache_file_classifications}")
 
         return {'embeddings': embeddings_array, 'classification_probs': classification_probs_array}
 
@@ -2422,9 +2350,9 @@ if __name__ == "__main__":
 
     anchor_group = parser.add_argument_group('New Anchor Graph Generation (for evaluation)')
     anchor_group.add_argument('--generate-new-anchor-adj-for-eval', action='store_true',
-                               help='Generate a new anchor adjacency matrix for evaluation instead of using the one from model_dir.')
+                               help='Generate a new anchor adjacency matrix for evaluation (using current eval dataset features) instead of using the one from model_dir.')
     anchor_group.add_argument('--anchor-adj-k-knn', type=int, default=10,
-                               help='K for KNN when generating new anchor graph.')
+                               help='K for KNN when generating new anchor graph from evaluation dataset features.')
     anchor_group.add_argument('--anchor-adj-use-sparse-format', type=int, default=1,
                                help='Use sparse format for the new anchor graph (1 for sparse, 0 for dense).')
     anchor_group.add_argument('--anchor-adj-id-col-name', type=str, default='id',
