@@ -711,7 +711,11 @@ class SublimeHandler:
             relationship_cpf2_col=self.config.anchor_adj_relationship_cpf2_col,
             relationship_weight=self.config.anchor_adj_relationship_weight
         )
-        
+
+        if raw_new_adj is None:
+            raise RuntimeError("_generate_custom_anchor_graph returned None, cannot proceed to process and set adjacency.")
+        print(f"_generate_custom_anchor_graph returned: type={type(raw_new_adj)}, sparse={raw_new_adj.is_sparse if isinstance(raw_new_adj, torch.Tensor) else 'N/A (not a tensor)'}")
+
         # The newly generated graph's format (sparse/dense as per anchor_adj_use_sparse_format)
         # must be processed into the format expected by the SUBLIME model (self.sparse).
         # Example: if model is sparse (self.sparse=True), but new graph was made dense for some reason
