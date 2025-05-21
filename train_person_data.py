@@ -82,7 +82,7 @@ def _check_processed_data(data, dataset_name=""):
 
     return True, data # Return True indicating success
 
-def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_column=None):
+def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_column=None, args=None):
     """
     Preprocess main and optional annotated dataframes using a single transformer.
     Transformer is fitted ONLY on df_main if not loaded.
@@ -92,6 +92,7 @@ def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_co
         df_annotated: Optional annotated Pandas DataFrame.
         output_dir: Directory to save/load the transformation model (data_transformer.joblib).
         target_column: Name of the target column in df_annotated (if provided).
+        args: Arguments from the script, used for drop_columns_file.
 
     Returns:
         Tuple: (
@@ -107,6 +108,34 @@ def preprocess_mixed_data(df_main, df_annotated=None, output_dir=None, target_co
     os.makedirs(output_dir, exist_ok=True)
     transformer_path = os.path.join(output_dir, 'data_transformer.joblib')
     preprocessor = None
+
+    # --- 0. Drop columns based on drop_columns_file ---
+    if args and hasattr(args, 'drop_columns_file') and args.drop_columns_file:
+        if os.path.exists(args.drop_columns_file):
+            try:
+                df_drop_cols = pd.read_csv(args.drop_columns_file)
+                if 'col' in df_drop_cols.columns:
+                    cols_to_drop = df_drop_cols['col'].tolist()
+                    
+                    original_main_cols = df_main.columns.tolist()
+                    df_main = df_main.drop(columns=cols_to_drop, errors='ignore')
+                    dropped_main_cols = list(set(original_main_cols) - set(df_main.columns.tolist()))
+                    if dropped_main_cols:
+                        print(f"Dropped columns from main data: {dropped_main_cols}")
+
+                    if df_annotated is not None:
+                        original_annotated_cols = df_annotated.columns.tolist()
+                        df_annotated = df_annotated.drop(columns=cols_to_drop, errors='ignore')
+                        dropped_annotated_cols = list(set(original_annotated_cols) - set(df_annotated.columns.tolist()))
+                        if dropped_annotated_cols:
+                            print(f"Dropped columns from annotated data: {dropped_annotated_cols}")
+                else:
+                    print(f"Warning: Column 'col' not found in {args.drop_columns_file}. No columns dropped.")
+            except Exception as e:
+                print(f"Error reading or processing {args.drop_columns_file}: {e}. No columns dropped.")
+        else:
+            print(f"Warning: drop_columns_file '{args.drop_columns_file}' not found. No columns dropped.")
+    # --- End Drop columns ---
 
     # Assume the annotated dataframe has the same relevant columns for transformation
     categorical_cols = df_main.select_dtypes(include=['object', 'category']).columns.tolist()
@@ -376,7 +405,7 @@ def load_person_data(args):
     # === 3. Preprocess Data ===
     # Pass both dataframes, preprocessor handles fitting/loading and transforming
     processed_main, processed_annotated, preprocessor = preprocess_mixed_data(
-        df_main, df_annotated, output_dir=args.output_dir, target_column=target_column
+        df_main, df_annotated, output_dir=args.output_dir, target_column=target_column, args=args
     )
 
     # === 4. Combine Features ===
