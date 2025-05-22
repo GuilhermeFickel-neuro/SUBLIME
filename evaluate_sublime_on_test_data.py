@@ -949,16 +949,27 @@ class SublimeHandler:
                         # If include_features=False: (projection, embedding_h)
                         # We consistently want embedding_h for downstream tasks.
                         if self.has_classification_head:
-                            model_outputs = self.model(gcl_input_features_final, gcl_input_adj_final, include_features=True)
-                            embedding_tensor = model_outputs[2][replace_idx].detach() # embedding_h
-                            classification_output_payload = model_outputs[3]
+                            # When include_features=True, GCL.forward returns (z, embedding_h, arcface_output, cls_output)
+                            model_outputs = self.model(gcl_input_features_final, gcl_input_adj_final, include_features=True) # Removed aux_output
+                            if model_outputs is None: 
+                                raise RuntimeError(
+                                    f"GCL model returned None. Mode: {'CLS head, include_feat=T'}. "
+                                    f"Inputs: features.shape={gcl_input_features_final.shape}, adj type={type(gcl_input_adj_final)}"
+                                )
+                            embedding_tensor = model_outputs[1][replace_idx].detach() # Corrected index: embedding_h is at index 1
+                            classification_output_payload = model_outputs[3] # cls_output is at index 3
                             if classification_output_payload is not None:
                                 classification_prob = torch.sigmoid(classification_output_payload[replace_idx]).item()
                             else:
                                 print(f"Warning: Model has_classification_head=True but classification_output is None.")
                                 classification_prob = None # Should not happen with correct model setup
                         else:
-                            model_outputs = self.model(gcl_input_features_final, gcl_input_adj_final, include_features=False)
+                            model_outputs = self.model(gcl_input_features_final, gcl_input_adj_final, include_features=False) # aux_output defaults to False
+                            if model_outputs is None: # Added check for robustness
+                                raise RuntimeError(
+                                    f"GCL model returned None. Mode: {'No CLS head, aux=F (default), include_feat=F'}. "
+                                    f"Inputs: features.shape={gcl_input_features_final.shape}, adj type={type(gcl_input_adj_final)}"
+                                )
                             embedding_tensor = model_outputs[1][replace_idx].detach() # embedding_h
                             classification_prob = None
                         
