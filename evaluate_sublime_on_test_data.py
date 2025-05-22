@@ -805,8 +805,21 @@ class SublimeHandler:
         
         extraction_mode_tag = ""
         # Determine extraction mode for caching and logging
-        is_graph_learner_mode = not self.config.use_loaded_adj_for_extraction
-        is_new_anchor_mode_for_eval = self.config.generate_new_anchor_adj_for_eval if not is_graph_learner_mode else False
+        # Priority:
+        # 1. New Anchor for Eval (if --generate-new-anchor-adj-for-eval is True)
+        # 2. Original Loaded Anchor (if --use-loaded-adj-for-extraction is True and #1 is False)
+        # 3. Graph Learner (if neither #1 nor #2 are True)
+
+        if self.config.generate_new_anchor_adj_for_eval:
+            determined_mode_for_embedding_extraction = "new_anchor_eval"
+        elif self.config.use_loaded_adj_for_extraction:
+            determined_mode_for_embedding_extraction = "original_anchor_loaded"
+        else:
+            determined_mode_for_embedding_extraction = "graph_learner_active"
+
+        is_graph_learner_mode = (determined_mode_for_embedding_extraction == "graph_learner_active")
+        is_new_anchor_mode_for_eval = (determined_mode_for_embedding_extraction == "new_anchor_eval")
+        # The third mode (original_anchor_loaded) is implicitly handled by the subsequent if/elif/else for extraction_mode_tag
 
         if is_graph_learner_mode:
             extraction_mode_tag = "_learner_active"
@@ -822,7 +835,7 @@ class SublimeHandler:
                 except Exception: rel_file_hash_part = "_rel_err"
             extraction_mode_tag = f"_anchor_evalset_k{self.config.anchor_adj_k_knn}{rel_file_hash_part}"
             print("Embedding extraction mode: New Anchor Graph from Evaluation Data")
-        else: # Original loaded anchor graph
+        else: # Original loaded anchor
             extraction_mode_tag = "_anchor_orig_loaded"
             print("Embedding extraction mode: Original Loaded Anchor Graph")
 
