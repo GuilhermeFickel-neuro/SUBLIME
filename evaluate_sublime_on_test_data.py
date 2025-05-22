@@ -796,8 +796,6 @@ class SublimeHandler:
         """Extracts embeddings in batches, handles caching."""
         if self.model is None:
             raise RuntimeError("SUBLIME model not loaded. Call load_model() first.")
-        if self.adj is None and self.config.use_loaded_adj_for_extraction:
-             raise RuntimeError("Adjacency matrix (self.adj) is not set for anchor mode. Ensure it was loaded or generate_and_set_eval_anchor_graph was called.")
 
         print(f"Extracting SUBLIME features for dataset tag: {dataset_tag} using features of shape {X_new_points_np.shape}...")
 
@@ -806,22 +804,27 @@ class SublimeHandler:
         can_cache = self.config.cache_dir and dataset_tag
         
         extraction_mode_tag = ""
-        if self.config.use_loaded_adj_for_extraction:
-            if self.config.generate_new_anchor_adj_for_eval:
-                rel_file_hash_part = ""
-                if self.config.anchor_adj_relationship_csv and os.path.exists(self.config.anchor_adj_relationship_csv):
-                    try:
-                        fname = os.path.basename(self.config.anchor_adj_relationship_csv)
-                        mtime = str(os.path.getmtime(self.config.anchor_adj_relationship_csv))[:5]
-                        sanitized_fname = ''.join(c if c.isalnum() else '-' for c in fname.replace('.csv','').replace('.tsv',''))[:10]
-                        rel_file_hash_part = f"_rel_{sanitized_fname}_{mtime}"
-                    except Exception: rel_file_hash_part = "_rel_err"
-                extraction_mode_tag = f"_anchor_evalset_k{self.config.anchor_adj_k_knn}{rel_file_hash_part}"
-            else:
-                extraction_mode_tag = "_anchor_orig_loaded" 
-        else:
-            extraction_mode_tag = "_learner_active"
+        # Determine extraction mode for caching and logging
+        is_graph_learner_mode = not self.config.use_loaded_adj_for_extraction
+        is_new_anchor_mode_for_eval = self.config.generate_new_anchor_adj_for_eval if not is_graph_learner_mode else False
 
+        if is_graph_learner_mode:
+            extraction_mode_tag = "_learner_active"
+            print("Embedding extraction mode: Graph Learner Active")
+        elif is_new_anchor_mode_for_eval:
+            rel_file_hash_part = ""
+            if self.config.anchor_adj_relationship_csv and os.path.exists(self.config.anchor_adj_relationship_csv):
+                try:
+                    fname = os.path.basename(self.config.anchor_adj_relationship_csv)
+                    mtime = str(os.path.getmtime(self.config.anchor_adj_relationship_csv))[:5]
+                    sanitized_fname = ''.join(c if c.isalnum() else '-' for c in fname.replace('.csv','').replace('.tsv',''))[:10]
+                    rel_file_hash_part = f"_rel_{sanitized_fname}_{mtime}"
+                except Exception: rel_file_hash_part = "_rel_err"
+            extraction_mode_tag = f"_anchor_evalset_k{self.config.anchor_adj_k_knn}{rel_file_hash_part}"
+            print("Embedding extraction mode: New Anchor Graph from Evaluation Data")
+        else: # Original loaded anchor graph
+            extraction_mode_tag = "_anchor_orig_loaded"
+            print("Embedding extraction mode: Original Loaded Anchor Graph")
 
         if can_cache:
             cache_file_base_embeddings = f"sublime_embeddings_{self.config.model_name_tag}_{dataset_tag}{extraction_mode_tag}.npy"
@@ -847,10 +850,26 @@ class SublimeHandler:
                 return {'embeddings': loaded_embeddings, 'classification_probs': loaded_classification_probs}
             else: print(f"Cache file not found: {cache_file_embeddings}. Extracting embeddings...")
         else: print("Caching disabled or dataset_tag not provided.")
+
+        # Pre-checks for required attributes based on mode
+        if is_graph_learner_mode:
+            if self.original_model_features is None:
+                raise RuntimeError("original_model_features is None for graph learner mode.")
+            if self.graph_learner is None:
+                raise RuntimeError("graph_learner is None for graph learner mode.")
+        else: # Anchor modes
+            if self.adj is None:
+                raise RuntimeError("Adjacency matrix (self.adj) is not set for anchor mode.")
+            if is_new_anchor_mode_for_eval: # New anchor from eval data
+                if self.current_extraction_features is None:
+                    raise RuntimeError("current_extraction_features is None for new anchor graph mode (eval data).")
+            else: # Original loaded anchor
+                if self.original_model_features is None:
+                    raise RuntimeError("original_model_features is None for original loaded anchor graph mode.")
             
         num_batches = (len(X_new_points_np) + self.config.batch_size - 1) // self.config.batch_size
-        all_embeddings = []
-        all_class_probs = [] if self.has_classification_head else None
+        all_embeddings_list = []
+        all_class_probs_list = [] if self.has_classification_head else None
         
         self.model.eval()
         if self.graph_learner: self.graph_learner.eval()
@@ -863,97 +882,111 @@ class SublimeHandler:
                 batch_X_new_points_tensor = torch.FloatTensor(batch_X_new_points_sub_np).to(self.device)
 
                 for j in range(len(batch_X_new_points_tensor)):
-                    point_tensor = batch_X_new_points_tensor[j].unsqueeze(0) # This is a preprocessed new person's features
+                    point_tensor = batch_X_new_points_tensor[j].unsqueeze(0) # Preprocessed new person's features
 
                     try:
-                        # Determine which set of features to use for comparison and as input to GCL
-                        # And which adjacency to use
-                        features_for_gcl_input_and_comparison = None
-                        adj_for_gcl_input = None
+                        features_for_similarity_search = None
+                        gcl_input_features_final = None
+                        gcl_input_adj_final = None
+
+                        # Determine features for similarity search and initial GCL inputs
+                        if is_graph_learner_mode:
+                            features_for_similarity_search = self.original_model_features
+                        elif is_new_anchor_mode_for_eval: # New anchor from eval data
+                            features_for_similarity_search = self.current_extraction_features
+                            gcl_input_features_final = self.current_extraction_features
+                            gcl_input_adj_final = self.adj
+                        else: # Original loaded anchor
+                            features_for_similarity_search = self.original_model_features
+                            gcl_input_features_final = self.original_model_features
+                            gcl_input_adj_final = self.adj
                         
-                        if self.config.use_loaded_adj_for_extraction:
-                            if self.config.generate_new_anchor_adj_for_eval and self.current_extraction_features is not None:
-                                # Mode 1A: Newly generated anchor graph from EVALUATION data
-                                features_for_gcl_input_and_comparison = self.current_extraction_features # Eval data features
-                                adj_for_gcl_input = self.adj # Newly generated graph based on eval data features
-                            else:
-                                # Mode 1B: Original SUBLIME model's loaded anchor graph
-                                features_for_gcl_input_and_comparison = self.original_model_features # SUBLIME's original training features
-                                adj_for_gcl_input = self.adj # Original loaded graph
-                        else:
-                            # Mode 2: Graph learner active (operates on original_model_features)
-                            features_for_gcl_input_and_comparison = self.original_model_features 
-                            # adj_for_gcl_input will be learned by graph_learner dynamically below
+                        # Validate feature dimensions for similarity search
+                        if point_tensor.shape[1] != features_for_similarity_search.shape[1]:
+                            raise ValueError(
+                                f"Dimension mismatch for similarity search: point_tensor ({point_tensor.shape[1]}) vs "
+                                f"features_for_similarity_search ({features_for_similarity_search.shape[1]}). "
+                                "Ensure GCL model's in_dim and input point features align."
+                            )
 
-                        if features_for_gcl_input_and_comparison is None:
-                            raise RuntimeError("features_for_gcl_input_and_comparison is None. Logic error.")
-                        if adj_for_gcl_input is None and self.config.use_loaded_adj_for_extraction:
-                             raise RuntimeError("adj_for_gcl_input is None in anchor mode. Adj not set.")
-
-                        # 1. Find most similar point in features_for_gcl_input_and_comparison
-                        # The point_tensor (new person) is compared against the feature set corresponding to the active graph.
-                        normalized_comparison_features = F.normalize(features_for_gcl_input_and_comparison, p=2, dim=1)
-                        normalized_point = F.normalize(point_tensor, p=2, dim=1) # point_tensor is from X_new_points_np
-                        
-                        # Ensure point_tensor and normalized_comparison_features have compatible dimensions for mm
-                        if point_tensor.shape[1] != features_for_gcl_input_and_comparison.shape[1]:
-                            raise ValueError(f"Dimension mismatch: point_tensor ({point_tensor.shape[1]}) vs features_for_gcl_input_and_comparison ({features_for_gcl_input_and_comparison.shape[1]}). Ensure GCL model's in_dim and input point features align.")
-
+                        # 1. Find most similar point in features_for_similarity_search
+                        normalized_comparison_features = F.normalize(features_for_similarity_search, p=2, dim=1)
+                        normalized_point = F.normalize(point_tensor, p=2, dim=1)
                         similarities = torch.mm(normalized_point, normalized_comparison_features.t())
                         replace_idx = torch.argmax(similarities).item()
 
-                        # Features and Adjacency that actually go into GCL.forward()
-                        final_features_for_gcl_model = None
-                        final_adj_for_gcl_model = None
-
-                        if self.config.use_loaded_adj_for_extraction:
-                            # Anchor graph mode: GCL sees the features corresponding to self.adj
-                            final_features_for_gcl_model = features_for_gcl_input_and_comparison 
-                            final_adj_for_gcl_model = adj_for_gcl_input
-                        else:
-                            # Graph learner mode: GCL sees modified original features and newly learned adj
-                            # Here, features_for_gcl_input_and_comparison IS self.original_model_features
-                            modified_features_for_learner = features_for_gcl_input_and_comparison.clone()
-                            modified_features_for_learner[replace_idx] = point_tensor 
+                        # 2. If graph learner mode, dynamically compute GCL inputs
+                        if is_graph_learner_mode:
+                            gcl_input_features_final = self.original_model_features.clone()
+                            gcl_input_features_final[replace_idx] = point_tensor
                             
-                            new_learned_adj = self.graph_learner(modified_features_for_learner, faiss_index=self.faiss_index)
-                            if not self.sparse: 
-                                if isinstance(new_learned_adj, torch.Tensor):
-                                    new_learned_adj = symmetrize(new_learned_adj)
-                                    new_learned_adj = normalize(new_learned_adj, 'sym', self.sparse)
-                                else: print(f"Warning: Dense graph learner output type {type(new_learned_adj)}.")
+                            # self.graph_learner is initialized with self.sparse (from GCL model config)
+                            # It outputs DGL graph if sparse, or dense tensor if not sparse.
+                            learned_adj_output = self.graph_learner(gcl_input_features_final, faiss_index=self.faiss_index)
                             
-                            final_features_for_gcl_model = modified_features_for_learner
-                            final_adj_for_gcl_model = new_learned_adj
+                            if self.sparse: # GCL model expects DGL graph
+                                gcl_input_adj_final = learned_adj_output
+                                if not isinstance(gcl_input_adj_final, dgl.DGLGraph):
+                                     # This safeguard might be hit if learner config/output is unexpected
+                                     print(f"Warning: Sparse GCL expects DGL graph, but graph learner output type is {type(gcl_input_adj_final)}. Using as is, but may cause errors.")
+                            else: # GCL model expects dense tensor
+                                if isinstance(learned_adj_output, torch.Tensor) and not learned_adj_output.is_sparse:
+                                    adj_symmetrized = symmetrize(learned_adj_output)
+                                    gcl_input_adj_final = normalize(adj_symmetrized, 'sym', False) # self.sparse is False
+                                else:
+                                    raise TypeError(f"Dense GCL expects dense tensor, but graph learner output type is {type(learned_adj_output)} (expected non-sparse torch.Tensor).")
                         
+                        # Ensure GCL inputs are determined
+                        if gcl_input_features_final is None or gcl_input_adj_final is None:
+                            raise RuntimeError("GCL input features or adjacency not determined correctly before GCL call.")
+
+                        # 3. GCL forward pass and extract embedding (h) and classification probability
+                        embedding_tensor = None
+                        classification_prob = None
+
+                        # GCL model's forward method returns:
+                        # If include_features=True:  (features, projection, embedding_h, classification_output)
+                        # If include_features=False: (projection, embedding_h)
+                        # We consistently want embedding_h for downstream tasks.
                         if self.has_classification_head:
-                            _, embedding, _, classification_output = self.model(final_features_for_gcl_model, final_adj_for_gcl_model, include_features=True)
-                            classification_prob = torch.sigmoid(classification_output[replace_idx]).item() if classification_output is not None else None
+                            model_outputs = self.model(gcl_input_features_final, gcl_input_adj_final, include_features=True)
+                            embedding_tensor = model_outputs[2][replace_idx].detach() # embedding_h
+                            classification_output_payload = model_outputs[3]
+                            if classification_output_payload is not None:
+                                classification_prob = torch.sigmoid(classification_output_payload[replace_idx]).item()
+                            else:
+                                print(f"Warning: Model has_classification_head=True but classification_output is None.")
+                                classification_prob = None # Should not happen with correct model setup
                         else:
-                            _, embedding = self.model(final_features_for_gcl_model, final_adj_for_gcl_model)
+                            model_outputs = self.model(gcl_input_features_final, gcl_input_adj_final, include_features=False)
+                            embedding_tensor = model_outputs[1][replace_idx].detach() # embedding_h
                             classification_prob = None
                         
-                        embedding_tensor = embedding[replace_idx].detach()
                         if isinstance(embedding_tensor, torch.Tensor):
                             embedding_vector = embedding_tensor.cpu().numpy().flatten()
-                        else: raise TypeError(f"Unexpected type for extracted embedding: {type(embedding_tensor)}")
-                        all_embeddings.append(embedding_vector)
+                        else: 
+                            raise TypeError(f"Unexpected type for extracted embedding_tensor: {type(embedding_tensor)}")
+                        all_embeddings_list.append(embedding_vector)
 
                         if self.has_classification_head and classification_prob is not None:
                              if isinstance(classification_prob, (int, float, np.number)):
-                                 all_class_probs.append(float(classification_prob))
-                             else: raise TypeError(f"Unexpected type for classification_probability: {type(classification_prob)}")
+                                 all_class_probs_list.append(float(classification_prob))
+                             else: 
+                                 raise TypeError(f"Unexpected type for classification_probability: {type(classification_prob)}")
                     except Exception as e:
                         print(f"Error processing point {start_idx + j} (new point features shape: {point_tensor.shape}): {str(e)}")
                         import traceback
                         traceback.print_exc()
+                        # Optionally, append NaNs or skip point, but current code continues and might lead to shape mismatch later.
+                        # For robustness, consider how to handle per-point errors if they shouldn't halt everything.
+                        # For now, it will likely lead to fewer embeddings than expected if errors occur.
 
 
-        embeddings_array = np.array(all_embeddings, dtype=np.float32)
-        classification_probs_array = np.array(all_class_probs, dtype=np.float32) if self.has_classification_head and all_class_probs else None
+        embeddings_array = np.array(all_embeddings_list, dtype=np.float32)
+        classification_probs_array = np.array(all_class_probs_list, dtype=np.float32) if self.has_classification_head and all_class_probs_list else None
 
         if embeddings_array.shape[0] != X_new_points_np.shape[0] and embeddings_array.shape[0] > 0 : 
-             print(f"WARNING: Expected {X_new_points_np.shape[0]} embeddings but got {embeddings_array.shape[0]}!")
+             print(f"WARNING: Expected {X_new_points_np.shape[0]} embeddings but got {embeddings_array.shape[0]}! This might be due to errors during extraction.")
         elif embeddings_array.shape[0] == 0 and X_new_points_np.shape[0] > 0:
             print(f"CRITICAL WARNING: No embeddings extracted for {X_new_points_np.shape[0]} points. Returning empty. Check errors.")
             return {'embeddings': np.array([], dtype=np.float32).reshape(0,0), 'classification_probs': None}
@@ -972,7 +1005,9 @@ class SublimeHandler:
                 print(f"Saving embeddings to cache: {cache_file_embeddings}")
                 np.save(cache_file_embeddings, embeddings_array)
             if self.has_classification_head and classification_probs_array is not None and cache_file_classifications:
-                np.save(cache_file_classifications, classification_probs_array.reshape(-1, 1) if classification_probs_array.ndim == 1 else classification_probs_array)
+                # Ensure classification_probs_array is 2D for saving if it's 1D
+                probs_to_save = classification_probs_array.reshape(-1, 1) if classification_probs_array.ndim == 1 else classification_probs_array
+                np.save(cache_file_classifications, probs_to_save)
                 print(f"Saving classification probabilities to cache: {cache_file_classifications}")
 
         return {'embeddings': embeddings_array, 'classification_probs': classification_probs_array}
