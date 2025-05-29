@@ -2128,14 +2128,18 @@ def create_parser():
     # Geographical graph arguments
     parser.add_argument('--use_geo_graph', type=int, default=0,
                         help='Whether to use geographical proximity for graph construction (0=disabled, 1=enabled)')
-    parser.add_argument('--geo_weight', type=float, default=None,
-                        help='Weight for edges created from geographical proximity. If not provided, weight is derived from distance (default: None for dynamic weight)')
-    parser.add_argument('--geo_radius_km', type=float, default=1.0,
-                        help='Maximum radius in kilometers to consider two points geographically connected (default: 1.0 km)')
     parser.add_argument('--latitude_col', type=str, default='LATITUDE',
                         help='Name of the latitude column in the input data (case-insensitive, default: LATITUDE)')
     parser.add_argument('--longitude_col', type=str, default='LONGITUDE',
                         help='Name of the longitude column in the input data (case-insensitive, default: LONGITUDE)')
+    
+    # Geographical graph k-nearest neighbors arguments
+    parser.add_argument('--geo_k', type=int, default=10,
+                        help='Number of nearest geographical neighbors to connect per node (default: 10)')
+    parser.add_argument('--geo_max_weight', type=float, default=1.0,
+                        help='Maximum weight value for the closest geographical neighbor (default: 1.0)')
+    parser.add_argument('--geo_min_weight', type=float, default=0.1,
+                        help='Minimum weight value for the furthest geographical neighbor within k (default: 0.1)')
 
     return parser
 
