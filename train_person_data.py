@@ -692,54 +692,112 @@ def load_person_data(args):
     # --- 8c. Geographical Proximity Graph ---
     adj_geo_sparse = None
     if args.use_geo_graph:
-        print(f"Constructing geographical proximity graph (radius={args.geo_radius_km} km, weight={args.geo_weight})...")
+        # K-nearest neighbors geographical graph with normalization
+        print(f"Constructing geographical k-NN graph (k={args.geo_k}, max_weight={args.geo_max_weight}, min_weight={args.geo_min_weight})...")
         if combined_lat is None or combined_lon is None:
             print("Warning: Latitude or Longitude data not available. Skipping geographical graph.")
         else:
-            geo_rows, geo_cols, geo_data = [], [], []
-            valid_geo_edges = 0
-            # Potentially large number of pairs, consider optimization if slow
-            # For now, direct iteration for clarity
-            for i in range(n_total_samples):
-                for j in range(i + 1, n_total_samples): # Avoid self-loops and duplicate pairs
-                    # Check for NaN or invalid coordinates before distance calculation
-                    if pd.isna(combined_lat[i]) or pd.isna(combined_lon[i]) or \
-                       pd.isna(combined_lat[j]) or pd.isna(combined_lon[j]):
-                        continue
-
-                    distance = haversine(combined_lat[i], combined_lon[i], combined_lat[j], combined_lon[j])
-                    if distance <= args.geo_radius_km:
-                        current_geo_edge_weight = 0.0
-                        if args.geo_weight is None:
-                            # Dynamic weight: 2.0 at 0 distance, 0.5 at geo_radius_km distance.
-                            # args.geo_radius_km is validated to be > 0 if use_geo_graph is true.
-                            if distance == 0: # Avoid division by zero if radius is also effectively zero, though radius > 0 is validated
-                                current_geo_edge_weight = 2.0
-                            elif args.geo_radius_km > 0: # Ensure radius is positive for scaling
-                                current_geo_edge_weight = 2.0 - 1.5 * (distance / args.geo_radius_km)
-                                # Clamp to ensure it's within [0.5, 2.0] due to potential float precision with distance == geo_radius_km
-                                current_geo_edge_weight = max(0.5, min(2.0, current_geo_edge_weight))
-                            else: # Fallback, though geo_radius_km > 0 is validated
-                                current_geo_edge_weight = 0.5 # Smallest weight in range if radius is not usable
-                        else:
-                            # User provided a specific weight
-                            current_geo_edge_weight = args.geo_weight
-                        
-                        geo_rows.extend([i, j]) # Add edge in both directions for symmetry
-                        geo_cols.extend([j, i])
-                        geo_data.extend([current_geo_edge_weight, current_geo_edge_weight])
-                        valid_geo_edges += 1
+            # Filter out samples with invalid coordinates
+            valid_coord_mask = ~(pd.isna(combined_lat) | pd.isna(combined_lon))
+            valid_indices = np.where(valid_coord_mask)[0]
+            n_valid = len(valid_indices)
             
-            if valid_geo_edges > 0:
-                adj_geo_sparse = sp.csr_matrix((geo_data, (geo_rows, geo_cols)),
-                                               shape=(n_total_samples, n_total_samples), dtype=np.float32)
-                adj_geo_sparse.sum_duplicates() # Consolidate duplicate edges if any (shouldn't happen with j=i+1)
-                print(f"  Geographical proximity graph computed. Shape: {adj_geo_sparse.shape}, Non-zero entries: {adj_geo_sparse.nnz}")
-                print(f"  (Found {valid_geo_edges} valid geographical pairs within {args.geo_radius_km} km)")
+            if n_valid < 2:
+                print(f"Warning: Not enough valid geographical coordinates ({n_valid} < 2). Skipping geographical graph.")
+                adj_geo_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32)
             else:
-                print(f"  No geographical proximity edges created within {args.geo_radius_km} km.")
-                adj_geo_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32) # Empty
-
+                print(f"  Found {n_valid} samples with valid coordinates out of {n_total_samples} total samples.")
+                
+                # Extract valid coordinates
+                valid_lat = combined_lat[valid_indices]
+                valid_lon = combined_lon[valid_indices]
+                
+                # Efficient batch distance computation
+                # Pre-compute all pairwise distances for valid samples
+                print("  Computing pairwise geographical distances...")
+                
+                # For memory efficiency with large datasets, process in chunks
+                chunk_size = min(1000, n_valid)  # Process up to 1000 samples at a time
+                geo_rows, geo_cols, geo_data = [], [], []
+                
+                for i_start in range(0, n_valid, chunk_size):
+                    i_end = min(i_start + chunk_size, n_valid)
+                    chunk_indices = range(i_start, i_end)
+                    
+                    # Compute distances from this chunk to all valid samples
+                    distances_chunk = np.zeros((len(chunk_indices), n_valid))
+                    
+                    for i_local, i_global in enumerate(chunk_indices):
+                        # Vectorized distance computation
+                        distances_chunk[i_local, :] = haversine(
+                            valid_lat[i_global], valid_lon[i_global],
+                            valid_lat, valid_lon
+                        )
+                    
+                    # Process each node in the chunk
+                    for i_local, i_global in enumerate(chunk_indices):
+                        # Get distances for this node
+                        distances = distances_chunk[i_local, :]
+                        
+                        # Set distance to self as infinity to exclude it
+                        distances[i_global] = np.inf
+                        
+                        # Find k nearest neighbors
+                        k_actual = min(args.geo_k, n_valid - 1)  # Can't have more neighbors than available
+                        nearest_indices = np.argpartition(distances, k_actual)[:k_actual]
+                        nearest_distances = distances[nearest_indices]
+                        
+                        # Sort the k neighbors by distance
+                        sorted_idx = np.argsort(nearest_distances)
+                        nearest_indices = nearest_indices[sorted_idx]
+                        nearest_distances = nearest_distances[sorted_idx]
+                        
+                        # Normalize weights: closest gets geo_max_weight, furthest gets geo_min_weight
+                        if len(nearest_indices) > 0:
+                            min_dist = nearest_distances[0]
+                            max_dist = nearest_distances[-1]
+                            
+                            # Map back to original indices
+                            original_i = valid_indices[i_global]
+                            
+                            for j_local, dist in zip(nearest_indices, nearest_distances):
+                                original_j = valid_indices[j_local]
+                                
+                                # Calculate normalized weight
+                                if max_dist > min_dist and len(nearest_indices) > 1:
+                                    # Linear interpolation from max_weight to min_weight
+                                    weight_ratio = (dist - min_dist) / (max_dist - min_dist)
+                                    weight = args.geo_max_weight - weight_ratio * (args.geo_max_weight - args.geo_min_weight)
+                                else:
+                                    # All neighbors at same distance or only one neighbor
+                                    weight = args.geo_max_weight
+                                
+                                # Add symmetric edges
+                                geo_rows.extend([original_i, original_j])
+                                geo_cols.extend([original_j, original_i])
+                                geo_data.extend([weight, weight])
+                    
+                    if i_end % 5000 == 0 or i_end == n_valid:
+                        print(f"    Processed {i_end}/{n_valid} nodes...")
+                
+                # Create sparse matrix
+                if len(geo_rows) > 0:
+                    adj_geo_sparse = sp.csr_matrix((geo_data, (geo_rows, geo_cols)),
+                                                   shape=(n_total_samples, n_total_samples), dtype=np.float32)
+                    adj_geo_sparse.sum_duplicates()  # Remove duplicate edges
+                    
+                    # Calculate statistics
+                    degrees = np.array((adj_geo_sparse > 0).sum(axis=1)).flatten()
+                    valid_degrees = degrees[valid_indices]
+                    
+                    print(f"  Geographical k-NN graph computed. Shape: {adj_geo_sparse.shape}, Non-zero entries: {adj_geo_sparse.nnz}")
+                    print(f"  Average degree (for nodes with coordinates): {np.mean(valid_degrees):.2f}")
+                    print(f"  Min/Max degree: {np.min(valid_degrees)}/{np.max(valid_degrees)}")
+                    print(f"  Edge weight range: [{np.min(geo_data):.4f}, {np.max(geo_data):.4f}]")
+                else:
+                    print(f"  No geographical edges created.")
+                    adj_geo_sparse = sp.csr_matrix((n_total_samples, n_total_samples), dtype=np.float32)
+        
         # Clean up combined coordinates
         del combined_lat, combined_lon
         gc.collect()
@@ -843,12 +901,14 @@ def main():
         # n_clusters=5                 # Let parent handle default or set via command line
         # type_learner defaults to 'fgp' from parent
         # lr, hidden_dim etc. default from parent
-        # Defaults for geo graph (already set in main.py's create_parser, but good for explicitness if running this script directly)
+        # Defaults for geo graph
         use_geo_graph=0,
-        geo_weight=None, # Default to None for dynamic weighting
-        geo_radius_km=1.0,
         latitude_col='LATITUDE',
-        longitude_col='LONGITUDE'
+        longitude_col='LONGITUDE',
+        # Geo graph k-NN defaults
+        geo_k=10,
+        geo_max_weight=1.0,
+        geo_min_weight=0.1
     )
 
     # Add arguments specific to this script OR override parent defaults forcefully
@@ -874,13 +934,16 @@ def main():
             parser.error("--use_geo_graph requires --latitude_col to be specified.")
         if not hasattr(args, 'longitude_col') or not args.longitude_col:
             parser.error("--use_geo_graph requires --longitude_col to be specified.")
-        if not hasattr(args, 'geo_radius_km') or args.geo_radius_km <= 0:
-            parser.error("--use_geo_graph requires --geo_radius_km to be a positive value.")
-        # Validation for geo_weight: if provided (not None), it could be any float.
-        # No specific warning if it's None, as that's for dynamic weighting.
-        # Optional: Add check for non-negativity if user provides a weight.
-        # if args.geo_weight is not None and args.geo_weight < 0:
-        #     parser.error("--geo_weight, if provided, must be non-negative.")
+        
+        # K-NN mode validation
+        if not hasattr(args, 'geo_k') or args.geo_k <= 0:
+            parser.error("--use_geo_graph requires --geo_k to be a positive integer.")
+        if not hasattr(args, 'geo_max_weight') or args.geo_max_weight <= 0:
+            parser.error("--use_geo_graph requires --geo_max_weight to be positive.")
+        if not hasattr(args, 'geo_min_weight') or args.geo_min_weight < 0:
+            parser.error("--use_geo_graph requires --geo_min_weight to be non-negative.")
+        if args.geo_min_weight >= args.geo_max_weight:
+            parser.error("--geo_min_weight must be less than --geo_max_weight.")
 
     # --- End Validation ---
 
