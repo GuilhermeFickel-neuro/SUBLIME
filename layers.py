@@ -1,9 +1,63 @@
 import dgl.function as fn
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 EOS = 1e-10
 
+
+class ArcFaceLayer(nn.Module):
+    def __init__(self, in_features, out_features, scale=30.0, margin=0.5, easy_margin=False):
+        """
+        ArcFace layer for adding angular margin to improve feature discriminability
+        
+        Args:
+            in_features: Size of input features
+            out_features: Number of classes (rows in dataset)
+            scale: Scale factor for cosine values (s in the paper)
+            margin: Angular margin to enforce separation (m in the paper)
+            easy_margin: Use the "easy margin" version
+        """
+        super(ArcFaceLayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale = scale
+        self.margin = margin
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        self.easy_margin = easy_margin
+        self.cos_m = torch.cos(torch.tensor(margin))
+        self.sin_m = torch.sin(torch.tensor(margin))
+        self.th = torch.cos(torch.tensor(math.pi - margin))
+        self.mm = torch.sin(torch.tensor(math.pi - margin)) * margin
+        nn.init.xavier_uniform_(self.weight)
+    
+    def forward(self, input, label=None):
+        # Normalize embeddings and weights
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        
+        # For inference mode (no labels)
+        if label is None:
+            return cosine * self.scale
+        
+        # For training with labels
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        
+        # One-hot encoding for labels
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        # Apply angular margin for target classes only
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.scale
+        
+        return output
 
 class GCNConv_dense(nn.Module):
     def __init__(self, input_size, output_size):

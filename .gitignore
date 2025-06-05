@@ -1,0 +1,7 @@
+.vscode
+/memory-bank
+.rooignore
+*.csv
+*.png
+__pycache__/
+data/

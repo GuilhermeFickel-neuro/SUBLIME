@@ -2,6 +2,8 @@ import copy
 import math
 
 import torch
+import torch.nn as nn 
+import torch.nn.functional as F
 
 from graph_learners import *
 from layers import GCNConv_dense, GCNConv_dgl, SparseDropout
@@ -9,22 +11,37 @@ from torch.nn import Sequential, Linear, ReLU
 
 # GCN for evaluation.
 class GCN(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout, dropout_adj, Adj, sparse):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout, dropout_adj, Adj, sparse, use_layer_norm=False, use_residual=False):
         super(GCN, self).__init__()
         self.layers = nn.ModuleList()
+        self.use_layer_norm = use_layer_norm
+        self.use_residual = use_residual
+        self.dropout = dropout # Store dropout rate
 
-        if sparse:
-            self.layers.append(GCNConv_dgl(in_channels, hidden_channels))
-            for _ in range(num_layers - 2):
-                self.layers.append(GCNConv_dgl(hidden_channels, hidden_channels))
-            self.layers.append(GCNConv_dgl(hidden_channels, out_channels))
+        if use_layer_norm:
+            self.norm_layers = nn.ModuleList()
+        if use_residual and in_channels != hidden_channels:
+            # Projection layer for the first residual connection if dimensions don't match
+            self.input_proj = nn.Linear(in_channels, hidden_channels)
         else:
-            self.layers.append(GCNConv_dense(in_channels, hidden_channels))
-            for i in range(num_layers - 2):
-                self.layers.append(GCNConv_dense(hidden_channels, hidden_channels))
-            self.layers.append(GCNConv_dense(hidden_channels, out_channels))
+            self.input_proj = None
 
-        self.dropout = dropout
+        LayerClass = GCNConv_dgl if sparse else GCNConv_dense
+
+        # Input layer
+        self.layers.append(LayerClass(in_channels, hidden_channels))
+        if use_layer_norm:
+            self.norm_layers.append(nn.LayerNorm(hidden_channels))
+
+        # Hidden layers
+        for _ in range(num_layers - 2):
+            self.layers.append(LayerClass(hidden_channels, hidden_channels))
+            if use_layer_norm:
+                self.norm_layers.append(nn.LayerNorm(hidden_channels))
+
+        # Output layer
+        self.layers.append(LayerClass(hidden_channels, out_channels))
+
         self.dropout_adj_p = dropout_adj
         self.Adj = Adj
         self.Adj.requires_grad = False
@@ -36,50 +53,91 @@ class GCN(nn.Module):
             self.dropout_adj = nn.Dropout(p=dropout_adj)
 
     def forward(self, x):
-
         if self.sparse:
             Adj = copy.deepcopy(self.Adj)
             Adj.edata['w'] = F.dropout(Adj.edata['w'], p=self.dropout_adj_p, training=self.training)
         else:
             Adj = self.dropout_adj(self.Adj)
 
+        h_prev = x # Store input for first potential residual connection
+
         for i, conv in enumerate(self.layers[:-1]):
-            x = conv(x, Adj)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
+            h = conv(x, Adj)
+
+            # Apply residual connection before normalization/activation
+            if self.use_residual:
+                if i == 0 and self.input_proj is not None:
+                    # Project input for the first layer's residual connection
+                    residual = self.input_proj(h_prev)
+                elif i > 0 or self.input_proj is None:
+                     # For hidden layers or if input_proj wasn't needed
+                    residual = h_prev
+                else: # Should not happen based on logic, but for safety
+                    residual = 0
+
+                # Add residual before norm/activation
+                h = h + residual
+                h_prev = h # Update h_prev for the next layer's residual
+
+            # Apply LayerNorm if enabled
+            if self.use_layer_norm:
+                h = self.norm_layers[i](h)
+
+            # Activation and Dropout
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+            x = h # Update x for the next iteration
+
+        # Output layer (no norm, residual, activation, or dropout typically)
         x = self.layers[-1](x, Adj)
         return x
 
 class GraphEncoder(nn.Module):
-    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse):
-
+    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse, use_layer_norm=False, use_residual=False):
         super(GraphEncoder, self).__init__()
         self.dropout = dropout
         self.dropout_adj_p = dropout_adj
         self.sparse = sparse
+        self.use_layer_norm = use_layer_norm
+        self.use_residual = use_residual
 
         self.gnn_encoder_layers = nn.ModuleList()
-        if sparse:
-            self.gnn_encoder_layers.append(GCNConv_dgl(in_dim, hidden_dim))
-            for _ in range(nlayers - 2):
-                self.gnn_encoder_layers.append(GCNConv_dgl(hidden_dim, hidden_dim))
-            self.gnn_encoder_layers.append(GCNConv_dgl(hidden_dim, emb_dim))
+        if use_layer_norm:
+            self.norm_layers = nn.ModuleList()
+        if use_residual and in_dim != hidden_dim:
+            # Projection layer for the first residual connection
+            self.input_proj = nn.Linear(in_dim, hidden_dim)
         else:
-            self.gnn_encoder_layers.append(GCNConv_dense(in_dim, hidden_dim))
-            for _ in range(nlayers - 2):
-                self.gnn_encoder_layers.append(GCNConv_dense(hidden_dim, hidden_dim))
-            self.gnn_encoder_layers.append(GCNConv_dense(hidden_dim, emb_dim))
+             self.input_proj = None
 
+
+        LayerClass = GCNConv_dgl if sparse else GCNConv_dense
+
+        # Input layer
+        self.gnn_encoder_layers.append(LayerClass(in_dim, hidden_dim))
+        if use_layer_norm:
+            self.norm_layers.append(nn.LayerNorm(hidden_dim))
+
+        # Hidden layers
+        for _ in range(nlayers - 2):
+            self.gnn_encoder_layers.append(LayerClass(hidden_dim, hidden_dim))
+            if use_layer_norm:
+                self.norm_layers.append(nn.LayerNorm(hidden_dim))
+
+        # Embedding layer (output layer of the encoder part)
+        self.gnn_encoder_layers.append(LayerClass(hidden_dim, emb_dim))
+
+        # Adjacency dropout
         if self.sparse:
             self.dropout_adj = SparseDropout(dprob=dropout_adj)
         else:
             self.dropout_adj = nn.Dropout(p=dropout_adj)
 
+        # Projection head (remains the same)
         self.proj_head = Sequential(Linear(emb_dim, proj_dim), ReLU(inplace=True),
                                            Linear(proj_dim, proj_dim))
 
-    def forward(self,x, Adj_, branch=None):
-
+    def forward(self, x, Adj_, branch=None):
         if self.sparse:
             if branch == 'anchor':
                 Adj = copy.deepcopy(Adj_)
@@ -89,23 +147,142 @@ class GraphEncoder(nn.Module):
         else:
             Adj = self.dropout_adj(Adj_)
 
-        for conv in self.gnn_encoder_layers[:-1]:
-            x = conv(x, Adj)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.gnn_encoder_layers[-1](x, Adj)
-        z = self.proj_head(x)
-        return z, x
+        h_prev = x # Store input for first potential residual connection
+
+        # Process through GNN layers (excluding the final embedding layer)
+        for i, conv in enumerate(self.gnn_encoder_layers[:-1]):
+            h = conv(x, Adj)
+
+            # Apply residual connection
+            if self.use_residual:
+                if i == 0 and self.input_proj is not None:
+                    residual = self.input_proj(h_prev)
+                elif i > 0 or self.input_proj is None:
+                    residual = h_prev
+                else: # Should not happen
+                    residual = 0
+
+                h = h + residual # Add residual before norm/activation
+
+            # Apply LayerNorm if enabled
+            if self.use_layer_norm:
+                h = self.norm_layers[i](h)
+
+            # Activation and Dropout
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+
+            # Update x and h_prev for the next iteration
+            x = h
+            if self.use_residual: # Only need h_prev if using residuals
+                h_prev = h
+
+
+        # Final embedding layer (no norm, residual, activation, or dropout)
+        embedding = self.gnn_encoder_layers[-1](x, Adj)
+
+        # Projection head
+        z = self.proj_head(embedding)
+        return z, embedding
 
 class GCL(nn.Module):
-    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse):
+    def __init__(self, nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse,
+                 use_layer_norm=False, use_residual=False, # <-- Pass flags here
+                 use_arcface=False, num_classes=None, arcface_scale=30.0, arcface_margin=0.5,
+                 use_sampled_arcface=False, arcface_num_samples=None,
+                 # Add classification head parameters
+                 use_classification_head=False, classification_dropout=0.3,
+                 classification_head_layers=2): # <-- Added new parameter
         super(GCL, self).__init__()
 
-        self.encoder = GraphEncoder(nlayers, in_dim, hidden_dim, emb_dim, proj_dim, dropout, dropout_adj, sparse)
+        # Pass the flags to the GraphEncoder
+        self.encoder = GraphEncoder(nlayers, in_dim, hidden_dim, emb_dim, proj_dim,
+                                    dropout, dropout_adj, sparse,
+                                    use_layer_norm=use_layer_norm, use_residual=use_residual)
+        self.use_arcface = use_arcface
+        self.use_sampled_arcface = use_sampled_arcface
+        self.use_classification_head = use_classification_head
+        self.classification_head_layers = classification_head_layers # Store the number of layers
 
-    def forward(self, x, Adj_, branch=None):
+        # Add ArcFace layer if specified
+        if use_arcface and num_classes is not None:
+            if use_sampled_arcface and arcface_num_samples is not None:
+                # Use the memory-efficient sampled ArcFace implementation
+                from sampled_arcface import SampledArcFaceLayer
+                self.sampled_arcface = True
+                self.arcface = SampledArcFaceLayer(
+                    in_features=emb_dim,
+                    max_classes=num_classes,
+                    num_samples=arcface_num_samples,
+                    scale=arcface_scale,
+                    margin=arcface_margin
+                )
+                print(f"Using Fixed Sampled ArcFace with {arcface_num_samples}/{num_classes} classes")
+            else:
+                # Use the standard ArcFace implementation
+                from layers import ArcFaceLayer
+                self.sampled_arcface = False
+                self.arcface = ArcFaceLayer(emb_dim, num_classes, scale=arcface_scale, margin=arcface_margin)
+
+        # Add MLP classification head if specified
+        if use_classification_head:
+            self.classification_dropout = nn.Dropout(classification_dropout)
+            
+            mlp_layers = []
+            if classification_head_layers == 1:
+                # Direct linear layer if only 1 layer requested
+                mlp_layers.append(nn.Linear(emb_dim, 1))
+            else:
+                # Input layer
+                mlp_layers.append(nn.Linear(emb_dim, hidden_dim))
+                mlp_layers.append(nn.ReLU())
+                mlp_layers.append(self.classification_dropout)
+                
+                # Hidden layers
+                for _ in range(classification_head_layers - 2):
+                    mlp_layers.append(nn.Linear(hidden_dim, hidden_dim))
+                    mlp_layers.append(nn.ReLU())
+                    mlp_layers.append(self.classification_dropout)
+                    
+                # Output layer
+                mlp_layers.append(nn.Linear(hidden_dim, 1))
+                
+            self.classification_head = nn.Sequential(*mlp_layers)
+            print(f"Using {classification_head_layers}-layer MLP classification head for binary classification")
+
+    def forward(self, x, Adj_, branch=None, labels=None, include_features=False):
         z, embedding = self.encoder(x, Adj_, branch)
-        return z, embedding
+
+        # Return values to collect
+        outputs = [z, embedding]
+
+        # Include ArcFace outputs if using it with labels
+        if self.use_arcface and hasattr(self, 'arcface') and labels is not None:
+            if hasattr(self, 'sampled_arcface') and self.sampled_arcface:
+                arcface_output, _ = self.arcface(embedding, labels)
+            else:
+                arcface_output = self.arcface(embedding, labels)
+            outputs.append(arcface_output)
+        else:
+            outputs.append(None)  # No ArcFace output
+
+        # Include classification head outputs if using it
+        if self.use_classification_head:
+            # No dropout here, it's inside the MLP now
+            cls_output = self.classification_head(embedding)
+            outputs.append(cls_output)
+        else:
+            outputs.append(None)  # No classification output
+
+        # Return only what's needed based on the calling context
+        if include_features:
+            return tuple(outputs)
+        elif len(outputs) == 4 and (outputs[2] is not None or outputs[3] is not None):
+            # If we have ArcFace or classification outputs, return all
+            return tuple(outputs)
+        else:
+            # Basic case: just return z and embedding
+            return z, embedding
 
     @staticmethod
     def calc_loss(x, x_aug, temperature=0.2, sym=True):

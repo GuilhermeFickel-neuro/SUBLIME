@@ -30,7 +30,7 @@ def sample_mask(idx, l):
     """Create mask."""
     mask = np.zeros(l)
     mask[idx] = 1
-    return np.array(mask, dtype=np.bool)
+    return np.array(mask, dtype=bool)
 
 
 def load_citation_network(dataset_str, sparse=None):
@@ -95,4 +95,87 @@ def load_citation_network(dataset_str, sparse=None):
 
 
 def load_data(args):
+    """
+    Load data from a file.
+    
+    Args:
+        args: Arguments containing dataset path and other parameters
+        
+    Returns:
+        Tuple of (features, nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj)
+        For annotated datasets, the binary label is expected to be in the last column of the dataset
+    """
+    # For standard citation networks
+    if args.dataset in ['cora', 'citeseer', 'pubmed']:
+        return load_citation_network(args.dataset, args.sparse)
+        
+    # Check if we're loading a CSV file
+    if args.dataset and args.dataset.endswith('.csv'):
+        # Load from CSV file
+        import pandas as pd
+        import numpy as np
+        from sklearn.model_selection import train_test_split
+        
+        # Read the CSV file
+        try:
+            data = pd.read_csv(args.dataset)
+        except Exception as e:
+            print(f"Error loading {args.dataset}: {str(e)}")
+            raise
+            
+        # Check if this is the annotated dataset (with binary labels)
+        if hasattr(args, 'annotated_dataset') and args.dataset == args.annotated_dataset:
+            if args.annotation_column in data.columns:
+                # Use the specified column as the binary target
+                target_column = args.annotation_column
+            else:
+                # Assume the last column is the binary target
+                target_column = data.columns[-1]
+                print(f"Warning: annotation_column '{args.annotation_column}' not found, using last column '{target_column}' as binary target")
+                
+            # Extract features and binary labels
+            features = data.drop(columns=[target_column]).values.astype('float32')
+            binary_labels = data[target_column].values.astype('int')
+            
+            # Ensure binary labels are 0 and 1
+            unique_labels = np.unique(binary_labels)
+            if len(unique_labels) > 2:
+                raise ValueError(f"Binary labels should have at most 2 classes, found {len(unique_labels)}: {unique_labels}")
+            if not set(unique_labels).issubset({0, 1}):
+                print(f"Warning: Converting labels {unique_labels} to 0 and 1")
+                # Map the smallest value to 0 and largest to 1
+                label_map = {unique_labels[0]: 0, unique_labels[-1]: 1}
+                binary_labels = np.array([label_map[lbl] for lbl in binary_labels])
+            
+            # Append binary labels as the last column of features for downstream processing
+            features = np.column_stack((features, binary_labels))
+            
+            # For annotated data, no need for masks or adjacency matrix
+            # We'll return placeholders that will be ignored
+            nfeats = features.shape[1] - 1  # Subtract 1 for the appended label
+            labels = None
+            nclasses = 2  # Binary classification
+            train_mask = val_mask = test_mask = None
+            adj = None if not args.sparse else torch.sparse.FloatTensor(2, 2)
+            
+            return torch.FloatTensor(features), nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj
+        
+        # Regular dataset (not annotated)
+        features = data.values.astype('float32')
+        nfeats = features.shape[1]
+        
+        # For self-supervised learning, we don't use explicit labels
+        # but can set them to row indices for use with ArcFace if needed
+        labels = torch.arange(features.shape[0])
+        nclasses = features.shape[0]  # Each node is its own class for contrastive learning
+        
+        # For regular CSV data, we don't need masks
+        train_mask = val_mask = test_mask = None
+        
+        # For regular CSV data with structure inference, we don't use a predefined adjacency
+        adj = None if not args.sparse else torch.sparse.FloatTensor(2, 2)
+        
+        return torch.FloatTensor(features), nfeats, labels, nclasses, train_mask, val_mask, test_mask, adj
+    
+    # Fall back to citation network loading if not using CSV
     return load_citation_network(args.dataset, args.sparse)
